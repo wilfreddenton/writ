@@ -7,6 +7,8 @@
 //! the last line. One off-by-one here misplaces everything below it, so the pure
 //! prefix-sum + visible-range functions are unit-tested independent of any GPU.
 
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use parley::{Affinity, Cursor, Selection};
@@ -19,10 +21,70 @@ use crate::diff::DiffState;
 use crate::editor::EditorTheme;
 use crate::render::build_line_render;
 use crate::segment_map::SegmentMap;
-use crate::text_engine::{TextEngine, peniko_color, peniko_color_alpha};
+use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
 
 /// A screen-space rectangle (device px), already offset by padding + scroll.
 pub type ScreenRect = (f64, f64, f64, f64);
+
+/// Content hash identifying a laid-out line. Two lines with the same key produce
+/// byte-identical Parley layouts, so a cache can skip re-shaping.
+fn line_key(
+    text: &str,
+    scale: f32,
+    font_size: f32,
+    line_height: f32,
+    max_advance: f32,
+    runs: &[StyleRun],
+) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    scale.to_bits().hash(&mut h);
+    font_size.to_bits().hash(&mut h);
+    line_height.to_bits().hash(&mut h);
+    max_advance.to_bits().hash(&mut h);
+    for r in runs {
+        r.range.start.hash(&mut h);
+        r.range.end.hash(&mut h);
+        for c in r.color.components {
+            c.to_bits().hash(&mut h);
+        }
+        (r.bold, r.italic, r.mono, r.underline, r.strikethrough).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Persistent per-line Parley layout cache (owned by the shell, reused across
+/// rebuilds). Avoids re-shaping unchanged lines every keystroke; entries not
+/// touched in a frame are swept so it stays bounded to the current document.
+#[derive(Default)]
+pub struct LineCache {
+    map: HashMap<u64, parley::Layout<Brush>>,
+    used: HashSet<u64>,
+}
+
+impl LineCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn begin(&mut self) {
+        self.used.clear();
+    }
+
+    fn get_or_build(
+        &mut self,
+        key: u64,
+        build: impl FnOnce() -> parley::Layout<Brush>,
+    ) -> parley::Layout<Brush> {
+        self.used.insert(key);
+        self.map.entry(key).or_insert_with(build).clone()
+    }
+
+    fn sweep(&mut self) {
+        let used = &self.used;
+        self.map.retain(|k, _| used.contains(k));
+    }
+}
 
 /// Inline git-diff decorations for one real line (added-line bg + word ranges).
 #[derive(Default)]
@@ -153,6 +215,7 @@ impl DocLayout {
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         engine: &mut TextEngine,
+        cache: &mut LineCache,
         snapshot: &RenderSnapshot,
         theme: &EditorTheme,
         diff: Option<&DiffState>,
@@ -168,6 +231,7 @@ impl DocLayout {
         let fg = peniko_color(theme.foreground);
         let max_advance = (device_width - 2.0 * pad_x * scale).max(1.0);
         let n = snapshot.line_count();
+        cache.begin();
         let mut layouts = Vec::with_capacity(n);
         let mut maps = Vec::with_capacity(n);
         let mut line_ranges = Vec::with_capacity(n);
@@ -192,15 +256,25 @@ impl DocLayout {
             let gh: f32 = line_ghosts.iter().map(|g| g.height).sum();
 
             let lr = build_line_render(snapshot, i, theme, base_font_size, cursor_offset);
-            let layout = engine.build_line(
+            let key = line_key(
                 &lr.text,
                 scale,
                 lr.font_size,
                 line_height,
-                fg,
-                Some(max_advance),
+                max_advance,
                 &lr.runs,
             );
+            let layout = cache.get_or_build(key, || {
+                engine.build_line(
+                    &lr.text,
+                    scale,
+                    lr.font_size,
+                    line_height,
+                    fg,
+                    Some(max_advance),
+                    &lr.runs,
+                )
+            });
             let range = snapshot.line_markers(i).range;
             // Inline diff: map added word ranges (line-relative buffer bytes) through
             // this line's segment map into display ranges.
@@ -235,6 +309,7 @@ impl DocLayout {
             ghosts.push(line_ghosts);
             ghost_height.push(gh);
         }
+        cache.sweep();
         let diff_colors = DiffColors {
             added_bg: peniko_color_alpha(theme.green, 0.05),
             added_inline: peniko_color_alpha(theme.green, 0.25),
@@ -591,6 +666,7 @@ mod tests {
         let snapshot = buffer.render_snapshot();
         let doc = DocLayout::build(
             &mut engine,
+            &mut LineCache::new(),
             &snapshot,
             &theme,
             None,
@@ -632,6 +708,7 @@ mod tests {
         let snapshot = buf.render_snapshot();
         let doc = DocLayout::build(
             &mut engine,
+            &mut LineCache::new(),
             &snapshot,
             &theme,
             Some(&diff),
@@ -653,5 +730,44 @@ mod tests {
         // A click in the ghost block is inert → maps to the real line start (offset 0).
         let ghost_mid = doc.tops[0] + doc.ghost_height[0] * 0.5;
         assert_eq!(doc.hit_test(50.0, ghost_mid), Some(0));
+    }
+
+    /// The layout cache reuses unchanged lines: a warm rebuild (cache populated)
+    /// skips Parley shaping and is faster than the cold one. Also exercises that a
+    /// bounded set of entries survives (one per distinct line content).
+    #[test]
+    fn line_cache_reuses_and_speeds_up() {
+        use crate::buffer::Buffer;
+        use std::time::Instant;
+        let mut engine = TextEngine::new();
+        let mut cache = LineCache::new();
+        let theme = EditorTheme::dracula();
+        // Distinct lines so each is a unique cache entry (the real scenario).
+        let text: String = (0..400)
+            .map(|i| format!("Line {i}: the quick brown fox jumps over the lazy dog.\n"))
+            .collect();
+        let mut buffer: Buffer = text.parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+        let build = |engine: &mut TextEngine, cache: &mut LineCache| {
+            DocLayout::build(
+                engine, cache, &snapshot, &theme, None, 0, 1000.0, 1.0, 24.0, 24.0, 48.0, 18.0, 1.5,
+            )
+        };
+        let t0 = Instant::now();
+        let _ = build(&mut engine, &mut cache);
+        let cold = t0.elapsed();
+        let t1 = Instant::now();
+        let _ = build(&mut engine, &mut cache);
+        let warm = t1.elapsed();
+        println!("[cache] cold={cold:?} warm={warm:?}");
+        assert_eq!(
+            cache.map.len(),
+            401,
+            "one entry per distinct line (+trailing)"
+        );
+        assert!(
+            warm < cold,
+            "warm rebuild ({warm:?}) should beat cold ({cold:?})"
+        );
     }
 }

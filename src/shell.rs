@@ -35,7 +35,7 @@ use crate::buffer::Buffer;
 use crate::chrome::{BarRect, StatusInfo, draw_status_bar, draw_title_bar};
 use crate::config::Config;
 use crate::core::Editor;
-use crate::doc_layout::DocLayout;
+use crate::doc_layout::{DocLayout, LineCache};
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
 use crate::marker::MarkerKind;
@@ -139,6 +139,7 @@ struct App {
     state: Option<ActiveSurface>,
     scene: Scene,
     text_engine: TextEngine,
+    line_cache: LineCache,
     theme: EditorTheme,
     editor: Editor,
     doc: Option<DocLayout>,
@@ -155,6 +156,7 @@ impl App {
             state: None,
             scene: Scene::new(),
             text_engine: TextEngine::new(),
+            line_cache: LineCache::new(),
             theme: EditorTheme::dracula(),
             editor,
             doc: None,
@@ -245,6 +247,7 @@ fn apply_key(
 /// so it borrows only these fields, not all of `self` (the surface stays borrowed).
 fn refresh_doc(
     engine: &mut TextEngine,
+    cache: &mut LineCache,
     editor: &mut Editor,
     theme: &EditorTheme,
     doc: &mut Option<DocLayout>,
@@ -253,7 +256,7 @@ fn refresh_doc(
     editor_h: f32,
 ) {
     let prev_scroll = doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
-    let mut new_doc = rebuild_doc(engine, editor, theme, device_width, scale);
+    let mut new_doc = rebuild_doc(engine, cache, editor, theme, device_width, scale);
     new_doc.scroll_y = prev_scroll;
     new_doc.scroll_to(editor.cursor_position(), editor_h);
     *doc = Some(new_doc);
@@ -263,6 +266,7 @@ fn refresh_doc(
 /// the fields it needs, leaving the caller's `&mut self.state` borrow intact.
 fn rebuild_doc(
     engine: &mut TextEngine,
+    cache: &mut LineCache,
     editor: &mut Editor,
     theme: &EditorTheme,
     device_width: f32,
@@ -274,6 +278,7 @@ fn rebuild_doc(
     let snapshot = editor.state.buffer.render_snapshot();
     let mut doc = DocLayout::build(
         engine,
+        cache,
         &snapshot,
         theme,
         diff.as_ref(),
@@ -329,6 +334,7 @@ impl ApplicationHandler for App {
         let scale = window.scale_factor() as f32;
         let doc = rebuild_doc(
             &mut self.text_engine,
+            &mut self.line_cache,
             &mut self.editor,
             &self.theme,
             size.width as f32,
@@ -356,6 +362,7 @@ impl ApplicationHandler for App {
                 );
                 let doc = rebuild_doc(
                     &mut self.text_engine,
+                    &mut self.line_cache,
                     &mut self.editor,
                     &self.theme,
                     size.width as f32,
@@ -392,6 +399,7 @@ impl ApplicationHandler for App {
                     let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
                         &mut self.text_engine,
+                        &mut self.line_cache,
                         &mut self.editor,
                         &self.theme,
                         &mut self.doc,
@@ -415,6 +423,7 @@ impl ApplicationHandler for App {
                     let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
                         &mut self.text_engine,
+                        &mut self.line_cache,
                         &mut self.editor,
                         &self.theme,
                         &mut self.doc,
@@ -441,6 +450,7 @@ impl ApplicationHandler for App {
                     let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
                         &mut self.text_engine,
+                        &mut self.line_cache,
                         &mut self.editor,
                         &self.theme,
                         &mut self.doc,
@@ -464,6 +474,7 @@ impl ApplicationHandler for App {
                     let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
                         &mut self.text_engine,
+                        &mut self.line_cache,
                         &mut self.editor,
                         &self.theme,
                         &mut self.doc,
@@ -618,6 +629,7 @@ impl ApplicationHandler for App {
             let (_, editor_h) = chrome_metrics(state.scale, state.surface.config.height as f32);
             refresh_doc(
                 &mut self.text_engine,
+                &mut self.line_cache,
                 &mut self.editor,
                 &self.theme,
                 &mut self.doc,
@@ -739,7 +751,15 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         editor.set_head_base(&base);
     }
     let (content_top, editor_h) = chrome_metrics(1.0, height as f32);
-    let mut doc = rebuild_doc(&mut engine, &mut editor, &theme, width as f32, 1.0);
+    let mut cache = LineCache::new();
+    let mut doc = rebuild_doc(
+        &mut engine,
+        &mut cache,
+        &mut editor,
+        &theme,
+        width as f32,
+        1.0,
+    );
     doc.scroll_by(scroll_y, editor_h);
     let mut scene = Scene::new();
     let clip = Rect::new(
