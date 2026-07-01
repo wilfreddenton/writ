@@ -24,7 +24,7 @@ use crate::inline::{
     GitHubContext, NakedUrl, RawGitHubMatch, StyledRegion, github_refs_to_styled_regions,
     naked_urls_to_styled_regions,
 };
-use crate::render::build_line_render;
+use crate::render::{LineRender, build_line_render};
 use crate::segment_map::SegmentMap;
 use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
 
@@ -105,6 +105,61 @@ impl LineCache {
         key: u64,
         build: impl FnOnce() -> parley::Layout<Brush>,
     ) -> parley::Layout<Brush> {
+        self.used.insert(key);
+        self.map.entry(key).or_insert_with(build).clone()
+    }
+
+    fn sweep(&mut self) {
+        let used = &self.used;
+        self.map.retain(|k, _| used.contains(k));
+    }
+}
+
+/// Key for the per-line render cache. Within one buffer `version`, line `line_idx`
+/// has fixed text + tree context, so its `LineRender` depends only on whether the
+/// cursor sits on it (`cursor_key` = the offset when on-line, else a sentinel — an
+/// off-line render is cursor-independent). Lines carrying GitHub `extra_regions`
+/// bypass the cache (those can change without a version bump, on validation).
+fn render_key(version: u64, line_idx: usize, cursor_key: usize) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    version.hash(&mut h);
+    line_idx.hash(&mut h);
+    cursor_key.hash(&mut h);
+    h.finish()
+}
+
+/// The cursor's contribution to a line's render: the offset if the cursor is on the
+/// line (markers/regions there stay revealed), else a sentinel. Matches the on-line
+/// test in `build_line_render`.
+fn cursor_key_for(range: &Range<usize>, cursor: usize) -> usize {
+    let on = if range.start == range.end {
+        cursor == range.start
+    } else {
+        cursor >= range.start && cursor <= range.end
+    };
+    if on { cursor } else { usize::MAX }
+}
+
+/// Persistent per-line `LineRender` cache (shell-owned, reused across rebuilds).
+/// Skips the tree-sitter style queries + segment-map build for lines whose render
+/// is unchanged — so cursor moves, scroll, and async-validation rebuilds (which
+/// don't bump the buffer version) recompute only the handful of lines that changed.
+#[derive(Default)]
+pub struct RenderCache {
+    map: HashMap<u64, LineRender>,
+    used: HashSet<u64>,
+}
+
+impl RenderCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn begin(&mut self) {
+        self.used.clear();
+    }
+
+    fn get_or_build(&mut self, key: u64, build: impl FnOnce() -> LineRender) -> LineRender {
         self.used.insert(key);
         self.map.entry(key).or_insert_with(build).clone()
     }
@@ -245,6 +300,8 @@ impl DocLayout {
     pub fn build(
         engine: &mut TextEngine,
         cache: &mut LineCache,
+        render_cache: &mut RenderCache,
+        version: u64,
         snapshot: &RenderSnapshot,
         theme: &EditorTheme,
         diff: Option<&DiffState>,
@@ -262,6 +319,7 @@ impl DocLayout {
         let max_advance = (device_width - 2.0 * pad_x * scale).max(1.0);
         let n = snapshot.line_count();
         cache.begin();
+        render_cache.begin();
         let mut layouts = Vec::with_capacity(n);
         let mut maps = Vec::with_capacity(n);
         let mut line_ranges = Vec::with_capacity(n);
@@ -286,7 +344,18 @@ impl DocLayout {
             let gh: f32 = line_ghosts.iter().map(|g| g.height).sum();
 
             let extra = github.map(|g| g.extra_regions(i)).unwrap_or_default();
-            let lr = build_line_render(snapshot, i, theme, base_font_size, cursor_offset, &extra);
+            // Reuse the cached render when nothing about this line changed. Lines with
+            // GitHub extra regions bypass the cache (validation can change them without
+            // a version bump); all others key on (version, line, cursor-on-line).
+            let lr = if extra.is_empty() {
+                let range = snapshot.line_byte_range(i);
+                let key = render_key(version, i, cursor_key_for(&range, cursor_offset));
+                render_cache.get_or_build(key, || {
+                    build_line_render(snapshot, i, theme, base_font_size, cursor_offset, &[])
+                })
+            } else {
+                build_line_render(snapshot, i, theme, base_font_size, cursor_offset, &extra)
+            };
             let key = line_key(
                 &lr.text,
                 scale,
@@ -341,6 +410,7 @@ impl DocLayout {
             ghost_height.push(gh);
         }
         cache.sweep();
+        render_cache.sweep();
         let diff_colors = DiffColors {
             added_bg: peniko_color_alpha(theme.green, 0.05),
             added_inline: peniko_color_alpha(theme.green, 0.25),
@@ -698,6 +768,8 @@ mod tests {
         let doc = DocLayout::build(
             &mut engine,
             &mut LineCache::new(),
+            &mut RenderCache::new(),
+            0,
             &snapshot,
             &theme,
             None,
@@ -741,6 +813,8 @@ mod tests {
         let doc = DocLayout::build(
             &mut engine,
             &mut LineCache::new(),
+            &mut RenderCache::new(),
+            0,
             &snapshot,
             &theme,
             Some(&diff),
@@ -783,8 +857,8 @@ mod tests {
         let snapshot = buffer.render_snapshot();
         let build = |engine: &mut TextEngine, cache: &mut LineCache| {
             DocLayout::build(
-                engine, cache, &snapshot, &theme, None, None, 0, 1000.0, 1.0, 24.0, 24.0, 48.0,
-                18.0, 1.5,
+                engine, cache, &mut RenderCache::new(), 0, &snapshot, &theme, None, None, 0, 1000.0,
+                1.0, 24.0, 24.0, 48.0, 18.0, 1.5,
             )
         };
         let t0 = Instant::now();
@@ -802,6 +876,45 @@ mod tests {
         assert!(
             warm < cold,
             "warm rebuild ({warm:?}) should beat cold ({cold:?})"
+        );
+    }
+
+    /// The render cache must recompute the cursor's line (marker reveal is
+    /// cursor-dependent) while reusing others — the "don't serve a stale cursor
+    /// line" correctness catch. Two builds share one RenderCache at the same buffer
+    /// version but different cursor positions; the heading's `# ` hides/reveals.
+    #[test]
+    fn render_cache_recomputes_cursor_line() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let mut line_cache = LineCache::new();
+        let mut render_cache = RenderCache::new();
+        // "# Title\n" then a body line. Heading content "Title" starts at buffer 2.
+        let mut buffer: Buffer = "# Title\nbody line two\n".parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+        let build =
+            |engine: &mut TextEngine, lc: &mut LineCache, rc: &mut RenderCache, cursor: usize| {
+                DocLayout::build(
+                    engine, lc, rc, 7, &snapshot, &theme, None, None, cursor, 1200.0, 1.0, 24.0,
+                    24.0, 48.0, 18.0, 1.5,
+                )
+            };
+
+        // Cursor on the body line (offset 10) → heading `# ` is hidden.
+        let doc_off = build(&mut engine, &mut line_cache, &mut render_cache, 10);
+        assert_eq!(
+            doc_off.line_map(0).unwrap().buffer_to_display(2),
+            0,
+            "with cursor off the heading, `# ` is hidden so content starts at display 0"
+        );
+
+        // Same cache + version, cursor now on the heading (offset 0) → `# ` revealed.
+        let doc_on = build(&mut engine, &mut line_cache, &mut render_cache, 0);
+        assert_eq!(
+            doc_on.line_map(0).unwrap().buffer_to_display(2),
+            2,
+            "cursor on the heading must recompute it (not serve the stale hidden render)"
         );
     }
 }

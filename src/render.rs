@@ -18,6 +18,7 @@ use crate::segment_map::{SegmentMap, Special};
 use crate::text_engine::{StyleRun, peniko_color};
 
 /// Fully-resolved styling for one line, ready to hand to `TextEngine::build_line`.
+#[derive(Clone)]
 pub struct LineRender {
     pub text: String,
     pub font_size: f32,

@@ -38,7 +38,7 @@ use crate::buffer::Buffer;
 use crate::chrome::{BarRect, StatusInfo, draw_panel, draw_status_bar, draw_title_bar};
 use crate::config::Config;
 use crate::core::{AutocompleteState, AutocompleteSuggestion, AutocompleteTrigger, Editor};
-use crate::doc_layout::{DocLayout, GithubRenderData, LineCache, ScreenRect};
+use crate::doc_layout::{DocLayout, GithubRenderData, LineCache, RenderCache, ScreenRect};
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
 use crate::github::{
@@ -176,6 +176,7 @@ struct App {
     scene: Scene,
     text_engine: TextEngine,
     line_cache: LineCache,
+    render_cache: RenderCache,
     theme: EditorTheme,
     editor: Editor,
     doc: Option<DocLayout>,
@@ -209,6 +210,7 @@ impl App {
             scene: Scene::new(),
             text_engine: TextEngine::new(),
             line_cache: LineCache::new(),
+            render_cache: RenderCache::new(),
             theme: EditorTheme::dracula(),
             editor,
             doc: None,
@@ -354,6 +356,7 @@ fn apply_key(
 fn refresh_doc(
     engine: &mut TextEngine,
     cache: &mut LineCache,
+    render_cache: &mut RenderCache,
     editor: &mut Editor,
     theme: &EditorTheme,
     doc: &mut Option<DocLayout>,
@@ -365,7 +368,7 @@ fn refresh_doc(
     // spawning see the current buffer. Whole-buffer scan; cheap enough for now.
     editor.refresh_detection();
     let prev_scroll = doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
-    let mut new_doc = rebuild_doc(engine, cache, editor, theme, device_width, scale);
+    let mut new_doc = rebuild_doc(engine, cache, render_cache, editor, theme, device_width, scale);
     new_doc.scroll_y = prev_scroll;
     new_doc.scroll_to(editor.cursor_position(), editor_h);
     *doc = Some(new_doc);
@@ -376,12 +379,14 @@ fn refresh_doc(
 fn rebuild_doc(
     engine: &mut TextEngine,
     cache: &mut LineCache,
+    render_cache: &mut RenderCache,
     editor: &mut Editor,
     theme: &EditorTheme,
     device_width: f32,
     scale: f32,
 ) -> DocLayout {
     let cursor_offset = editor.cursor_position();
+    let version = editor.state.buffer.version();
     // Clone the diff before borrowing the buffer mutably for the snapshot.
     let diff = editor.diff_state().cloned();
     let snapshot = editor.state.buffer.render_snapshot();
@@ -396,6 +401,8 @@ fn rebuild_doc(
     let mut doc = DocLayout::build(
         engine,
         cache,
+        render_cache,
+        version,
         &snapshot,
         theme,
         diff.as_ref(),
@@ -797,6 +804,7 @@ impl ApplicationHandler<WritEvent> for App {
                     let mut new_doc = rebuild_doc(
                         &mut self.text_engine,
                         &mut self.line_cache,
+                        &mut self.render_cache,
                         &mut self.editor,
                         &self.theme,
                         w,
@@ -850,6 +858,7 @@ impl ApplicationHandler<WritEvent> for App {
         let doc = rebuild_doc(
             &mut self.text_engine,
             &mut self.line_cache,
+            &mut self.render_cache,
             &mut self.editor,
             &self.theme,
             size.width as f32,
@@ -880,6 +889,7 @@ impl ApplicationHandler<WritEvent> for App {
                 let doc = rebuild_doc(
                     &mut self.text_engine,
                     &mut self.line_cache,
+                    &mut self.render_cache,
                     &mut self.editor,
                     &self.theme,
                     size.width as f32,
@@ -919,6 +929,7 @@ impl ApplicationHandler<WritEvent> for App {
                     refresh_doc(
                         &mut self.text_engine,
                         &mut self.line_cache,
+                        &mut self.render_cache,
                         &mut self.editor,
                         &self.theme,
                         &mut self.doc,
@@ -945,6 +956,7 @@ impl ApplicationHandler<WritEvent> for App {
                         refresh_doc(
                             &mut self.text_engine,
                             &mut self.line_cache,
+                            &mut self.render_cache,
                             &mut self.editor,
                             &self.theme,
                             &mut self.doc,
@@ -992,6 +1004,7 @@ impl ApplicationHandler<WritEvent> for App {
                         refresh_doc(
                             &mut self.text_engine,
                             &mut self.line_cache,
+                            &mut self.render_cache,
                             &mut self.editor,
                             &self.theme,
                             &mut self.doc,
@@ -1014,6 +1027,7 @@ impl ApplicationHandler<WritEvent> for App {
                     refresh_doc(
                         &mut self.text_engine,
                         &mut self.line_cache,
+                        &mut self.render_cache,
                         &mut self.editor,
                         &self.theme,
                         &mut self.doc,
@@ -1072,6 +1086,7 @@ impl ApplicationHandler<WritEvent> for App {
                             refresh_doc(
                                 &mut self.text_engine,
                                 &mut self.line_cache,
+                                &mut self.render_cache,
                                 &mut self.editor,
                                 &self.theme,
                                 &mut self.doc,
@@ -1092,6 +1107,7 @@ impl ApplicationHandler<WritEvent> for App {
                     refresh_doc(
                         &mut self.text_engine,
                         &mut self.line_cache,
+                        &mut self.render_cache,
                         &mut self.editor,
                         &self.theme,
                         &mut self.doc,
@@ -1295,6 +1311,7 @@ impl ApplicationHandler<WritEvent> for App {
             refresh_doc(
                 &mut self.text_engine,
                 &mut self.line_cache,
+                &mut self.render_cache,
                 &mut self.editor,
                 &self.theme,
                 &mut self.doc,
@@ -1506,9 +1523,11 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     }
     let (content_top, editor_h) = chrome_metrics(1.0, height as f32);
     let mut cache = LineCache::new();
+    let mut render_cache = RenderCache::new();
     let mut doc = rebuild_doc(
         &mut engine,
         &mut cache,
+        &mut render_cache,
         &mut editor,
         &theme,
         width as f32,

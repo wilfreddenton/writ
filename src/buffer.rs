@@ -76,7 +76,7 @@ impl RenderSnapshot {
         self.line_count
     }
 
-    fn line_byte_range(&self, line_idx: usize) -> Range<usize> {
+    pub fn line_byte_range(&self, line_idx: usize) -> Range<usize> {
         compute_line_byte_range(&self.rope, line_idx)
     }
 
