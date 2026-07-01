@@ -44,6 +44,7 @@ pub mod marker;
 pub mod parser;
 pub mod paste;
 pub mod render;
+pub mod segment_map;
 pub mod shell;
 pub mod status_bar;
 pub mod text_engine;

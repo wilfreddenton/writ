@@ -106,11 +106,13 @@ fn rebuild_doc(
     device_width: f32,
     scale: f32,
 ) -> DocLayout {
+    let cursor_offset = editor.cursor_position();
     let snapshot = editor.state.buffer.render_snapshot();
     DocLayout::build(
         engine,
         &snapshot,
         theme,
+        cursor_offset,
         device_width,
         scale,
         PADDING,

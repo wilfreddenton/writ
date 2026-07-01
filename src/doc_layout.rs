@@ -13,6 +13,7 @@ use vello::peniko::Brush;
 use crate::buffer::RenderSnapshot;
 use crate::editor::EditorTheme;
 use crate::render::build_line_render;
+use crate::segment_map::SegmentMap;
 use crate::text_engine::{TextEngine, peniko_color};
 
 /// Prefix-sum tops for `heights`: `out[0] = pad_top`, `out[i+1] = out[i] +
@@ -30,6 +31,8 @@ fn compute_tops(heights: &[f32], pad_top: f32) -> Vec<f32> {
 
 pub struct DocLayout {
     layouts: Vec<parley::Layout<Brush>>,
+    /// Per-line display↔buffer maps, parallel to `layouts` (Phase 4 cursor/click).
+    maps: Vec<SegmentMap>,
     /// Top y of each line; length `layouts.len() + 1`. Device px.
     tops: Vec<f32>,
     pub scroll_y: f32,
@@ -46,6 +49,7 @@ impl DocLayout {
         engine: &mut TextEngine,
         snapshot: &RenderSnapshot,
         theme: &EditorTheme,
+        cursor_offset: usize,
         device_width: f32,
         scale: f32,
         pad_x: f32,
@@ -58,9 +62,10 @@ impl DocLayout {
         let max_advance = (device_width - 2.0 * pad_x * scale).max(1.0);
         let n = snapshot.line_count();
         let mut layouts = Vec::with_capacity(n);
+        let mut maps = Vec::with_capacity(n);
         let mut heights = Vec::with_capacity(n);
         for i in 0..n {
-            let lr = build_line_render(snapshot, i, theme, base_font_size);
+            let lr = build_line_render(snapshot, i, theme, base_font_size, cursor_offset);
             let layout = engine.build_line(
                 &lr.text,
                 scale,
@@ -72,15 +77,22 @@ impl DocLayout {
             );
             heights.push(layout.height());
             layouts.push(layout);
+            maps.push(lr.map);
         }
         Self {
             layouts,
+            maps,
             tops: compute_tops(&heights, pad_top * scale),
             scroll_y: 0.0,
             pad_top: pad_top * scale,
             pad_bottom: pad_bottom * scale,
             pad_x: pad_x * scale,
         }
+    }
+
+    /// The display↔buffer map for a line (Phase 4 cursor/click math).
+    pub fn line_map(&self, line: usize) -> Option<&SegmentMap> {
+        self.maps.get(line)
     }
 
     pub fn line_count(&self) -> usize {
@@ -153,6 +165,10 @@ mod tests {
     fn fixture(heights: &[f32], pad_top: f32, pad_bottom: f32) -> DocLayout {
         DocLayout {
             layouts: heights.iter().map(|_| parley::Layout::new()).collect(),
+            maps: heights
+                .iter()
+                .map(|_| SegmentMap::identity("", 0).1)
+                .collect(),
             tops: compute_tops(heights, pad_top),
             scroll_y: 0.0,
             pad_top,
