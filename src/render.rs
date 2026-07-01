@@ -12,6 +12,7 @@
 
 use crate::buffer::RenderSnapshot;
 use crate::editor::EditorTheme;
+use crate::marker::MarkerKind;
 use crate::segment_map::{SegmentMap, Special};
 use crate::text_engine::{StyleRun, peniko_color};
 
@@ -80,6 +81,36 @@ pub fn build_line_render(
             && mr.end <= line_end
         {
             specials.push(Special::Hidden(mr));
+        }
+        // Prefix markers render as bullets / blockquote bars (always on — they're
+        // structural), substituting `- `→`• `, `> `→`▎ `. Indent whitespace and
+        // ordered-list numbers stay literal; checkbox stays as `[ ]`/`[x]`.
+        // On a task item the checkbox is the marker, so suppress the list bullet.
+        let has_checkbox = markers
+            .markers
+            .iter()
+            .any(|m| matches!(m.kind, MarkerKind::Checkbox { .. }));
+        for marker in &markers.markers {
+            let sub = match &marker.kind {
+                // Task item: hide the `- ` so the checkbox is the marker.
+                MarkerKind::ListItem { ordered: false, .. } if has_checkbox => Some(""),
+                MarkerKind::ListItem {
+                    ordered: false,
+                    unordered_marker,
+                    ..
+                } => Some(unordered_marker.as_ref().map_or("• ", |m| m.bullet())),
+                MarkerKind::BlockQuote => Some("▎ "),
+                _ => None,
+            };
+            if let Some(display) = sub
+                && marker.range.start >= line_start
+                && marker.range.end <= line_end
+            {
+                specials.push(Special::Collapsed {
+                    buffer: marker.range.clone(),
+                    display: display.to_string(),
+                });
+            }
         }
         for region in &inline {
             let cursor_inside =
