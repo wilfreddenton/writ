@@ -3,9 +3,8 @@
 //! Uses GitHub's GraphQL API for search/autocomplete and validation.
 
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::inline::GitHubRef;
 
@@ -223,7 +222,7 @@ pub enum ValidationResult {
 /// Cache for GitHub reference validation results.
 #[derive(Debug, Clone)]
 pub struct GitHubValidationCache {
-    cache: Rc<RefCell<HashMap<GitHubRef, ValidationState>>>,
+    cache: Arc<Mutex<HashMap<GitHubRef, ValidationState>>>,
 }
 
 impl Default for GitHubValidationCache {
@@ -235,43 +234,46 @@ impl Default for GitHubValidationCache {
 impl GitHubValidationCache {
     pub fn new() -> Self {
         Self {
-            cache: Rc::new(RefCell::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn get(&self, ref_: &GitHubRef) -> Option<ValidationState> {
-        self.cache.borrow().get(ref_).cloned()
+        self.cache.lock().unwrap().get(ref_).cloned()
     }
 
     pub fn mark_pending(&self, ref_: GitHubRef) {
         self.cache
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(ref_, ValidationState::Pending);
     }
 
     /// Set validation result as valid with optional detailed data.
     pub fn set_valid(&self, ref_: GitHubRef, data: Option<ValidatedRefData>) {
         self.cache
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(ref_, ValidationState::Valid(data));
     }
 
     /// Set validation result as invalid.
     pub fn set_invalid(&self, ref_: GitHubRef) {
         self.cache
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(ref_, ValidationState::Invalid);
     }
 
     pub fn is_valid(&self, ref_: &GitHubRef) -> bool {
         matches!(
-            self.cache.borrow().get(ref_),
+            self.cache.lock().unwrap().get(ref_),
             Some(ValidationState::Valid(_))
         )
     }
 
     pub fn clear(&self) {
-        self.cache.borrow_mut().clear();
+        self.cache.lock().unwrap().clear();
     }
 }
 
@@ -282,52 +284,52 @@ impl GitHubValidationCache {
 /// Cache for issue/PR autocomplete results.
 #[derive(Clone, Default)]
 pub struct IssueCache {
-    cache: Rc<RefCell<HashMap<String, Vec<IssueOrPr>>>>,
+    cache: Arc<Mutex<HashMap<String, Vec<IssueOrPr>>>>,
 }
 
 impl IssueCache {
     pub fn new() -> Self {
         Self {
-            cache: Rc::new(RefCell::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<IssueOrPr>> {
-        self.cache.borrow().get(key).cloned()
+        self.cache.lock().unwrap().get(key).cloned()
     }
 
     pub fn set(&self, key: String, issues: Vec<IssueOrPr>) {
-        self.cache.borrow_mut().insert(key, issues);
+        self.cache.lock().unwrap().insert(key, issues);
     }
 
     pub fn clear(&self) {
-        self.cache.borrow_mut().clear();
+        self.cache.lock().unwrap().clear();
     }
 }
 
 /// Cache for user autocomplete results.
 #[derive(Clone, Default)]
 pub struct UserCache {
-    cache: Rc<RefCell<HashMap<String, Vec<MentionableUser>>>>,
+    cache: Arc<Mutex<HashMap<String, Vec<MentionableUser>>>>,
 }
 
 impl UserCache {
     pub fn new() -> Self {
         Self {
-            cache: Rc::new(RefCell::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<MentionableUser>> {
-        self.cache.borrow().get(key).cloned()
+        self.cache.lock().unwrap().get(key).cloned()
     }
 
     pub fn set(&self, key: String, users: Vec<MentionableUser>) {
-        self.cache.borrow_mut().insert(key, users);
+        self.cache.lock().unwrap().insert(key, users);
     }
 
     pub fn clear(&self) {
-        self.cache.borrow_mut().clear();
+        self.cache.lock().unwrap().clear();
     }
 }
 
