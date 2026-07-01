@@ -43,5 +43,6 @@ pub mod parser;
 pub mod paste;
 pub mod shell;
 pub mod status_bar;
+pub mod text_engine;
 pub mod title_bar;
 pub mod window;
