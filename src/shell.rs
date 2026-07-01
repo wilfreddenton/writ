@@ -29,11 +29,15 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
+use winit::event_loop::ControlFlow;
+
 use crate::buffer::Buffer;
 use crate::chrome::{BarRect, StatusInfo, draw_status_bar, draw_title_bar};
+use crate::config::Config;
 use crate::core::Editor;
 use crate::doc_layout::DocLayout;
 use crate::editor::{Direction, EditorTheme};
+use crate::git::{detect_github_context, parse_github_repo_string};
 use crate::marker::MarkerKind;
 use crate::text_engine::{TextEngine, peniko_color};
 
@@ -144,7 +148,7 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(editor: Editor) -> Self {
         Self {
             context: RenderContext::new(),
             renderer: None,
@@ -152,7 +156,7 @@ impl App {
             scene: Scene::new(),
             text_engine: TextEngine::new(),
             theme: EditorTheme::dracula(),
-            editor: Editor::new(SAMPLE_DOC),
+            editor,
             doc: None,
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
@@ -603,6 +607,30 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+
+    /// Poll for external file edits (e.g. an agent writing the file) between events,
+    /// reloading + recomputing the diff live, and keep a slow poll timer running.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.editor.poll_file_changes()
+            && let Some(state) = self.state.as_ref()
+        {
+            let w = state.surface.config.width as f32;
+            let (_, editor_h) = chrome_metrics(state.scale, state.surface.config.height as f32);
+            refresh_doc(
+                &mut self.text_engine,
+                &mut self.editor,
+                &self.theme,
+                &mut self.doc,
+                w,
+                state.scale,
+                editor_h,
+            );
+            state.window.request_redraw();
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            std::time::Instant::now() + std::time::Duration::from_millis(200),
+        ));
+    }
 }
 
 /// Boot the shell: install the TLS provider, stand up a tokio runtime for HTTP/
@@ -630,10 +658,45 @@ pub fn run() -> Result<()> {
         return snapshot(&path, w, h, scroll);
     }
 
+    let editor = load_editor_from_cli();
     let event_loop = EventLoop::new()?;
-    let mut app = App::new();
+    let mut app = App::new(editor);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// Build the editor from CLI args: open the `--file`, set GitHub context, and start
+/// watching the file for external edits (the pivot use case — an agent edits the
+/// file, writ shows the live diff). With no args, falls back to the sample doc.
+fn load_editor_from_cli() -> Editor {
+    use clap::Parser;
+
+    // No args → sample document (dev/demo).
+    if std::env::args().len() <= 1 {
+        return Editor::new(SAMPLE_DOC);
+    }
+
+    let config = Config::parse();
+    let Some(path) = config.file.clone() else {
+        return Editor::new(SAMPLE_DOC);
+    };
+
+    let mut editor = Editor::open(&path);
+
+    // GitHub context for ref detection: explicit --github-repo, else auto-detect.
+    let context = config
+        .github_repo
+        .as_deref()
+        .and_then(parse_github_repo_string)
+        .or_else(|| detect_github_context(&path));
+    if let Some(ctx) = context {
+        editor.set_github_context(ctx);
+    }
+
+    if let Err(e) = editor.watch_file() {
+        eprintln!("[writ] file watch failed: {e}");
+    }
+    editor
 }
 
 /// Render a single frame of the document to an offscreen texture and write it to
@@ -654,7 +717,11 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
 
     let mut engine = TextEngine::new();
     let theme = EditorTheme::dracula();
-    let mut editor = Editor::new(SAMPLE_DOC);
+    // WRIT_SHELL_FILE opens a real file (with live HEAD diff); else the sample doc.
+    let mut editor = match std::env::var("WRIT_SHELL_FILE") {
+        Ok(p) => Editor::open(std::path::Path::new(&p)),
+        Err(_) => Editor::new(SAMPLE_DOC),
+    };
     // Place the caret mid-document so the snapshot exercises caret geometry.
     let env_usize = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
     editor.set_cursor(env_usize("WRIT_SHELL_CURSOR").unwrap_or(0));
