@@ -24,6 +24,12 @@ path = "src/main.rs"
 name = "writd"
 path = "src/writd.rs"
 
+# New Linebender-stack shell, built additively during the migration. Grows into
+# the walking skeleton; at phase 7 it replaces the gpui `writ` bin above.
+[[bin]]
+name = "writ-next"
+path = "src/bin/writ_next.rs"
+
 [dependencies]
 anyhow = "1"
 async-compat = "0.2"
@@ -32,6 +38,14 @@ futures = "0.3"
 imara-diff = "0.2"
 gix = { version = "0.84", default-features = false, features = ["sha1"] }
 gpui = "0.2"
+# --- gpui-replacement migration (Linebender stack); see MIGRATION-PLAN.md ---
+# Additive during phases 0-6; gpui is removed in phase 7. `wgpu` is NOT a direct
+# dep — we use `vello::wgpu` so there is a single wgpu in the tree.
+parley = "0.11"
+vello = "0.9"
+winit = "0.30"
+fontique = { version = "0.11", features = ["fontconfig-dlopen"] }
+pollster = "0.4"
 # Provides `application()` = `Application::with_platform(current_platform(..))`,
 # which gpui core no longer exposes directly. Pinned to the same rev as the patch.
 # The wayland/x11 features gate the Linux windowing backends (gpui_linux); without
