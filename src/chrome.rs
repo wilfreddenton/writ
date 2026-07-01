@@ -4,7 +4,7 @@
 //! them. CSD (custom window frame) and the async-blocked overlays are deferred.
 
 use vello::Scene;
-use vello::kurbo::{Affine, Line, Rect, Stroke};
+use vello::kurbo::{Affine, Line, Rect, RoundedRect, Stroke};
 use vello::peniko::{Color, Fill};
 
 use crate::editor::EditorTheme;
@@ -39,6 +39,21 @@ fn fill_rect(scene: &mut Scene, color: Color, r: &BarRect) {
         None,
         &Rect::new(r.x0, r.y0, r.x1, r.y1),
     );
+}
+
+/// Draw a floating overlay panel: a filled rounded rect with a border. Shared by
+/// the GitHub hover popover and the autocomplete dropdown.
+pub fn draw_panel(
+    scene: &mut Scene,
+    bg: Color,
+    border: Color,
+    rect: &Rect,
+    radius: f64,
+    stroke_w: f64,
+) {
+    let rr = RoundedRect::from_rect(*rect, radius);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, bg, None, &rr);
+    scene.stroke(&Stroke::new(stroke_w), Affine::IDENTITY, border, None, &rr);
 }
 
 fn hline(scene: &mut Scene, color: Color, x0: f64, x1: f64, y: f64, width: f64) {

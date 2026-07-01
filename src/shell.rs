@@ -32,16 +32,18 @@ use winit::window::{Window, WindowId};
 use winit::event_loop::ControlFlow;
 
 use crate::buffer::Buffer;
-use crate::chrome::{BarRect, StatusInfo, draw_status_bar, draw_title_bar};
+use crate::chrome::{BarRect, StatusInfo, draw_panel, draw_status_bar, draw_title_bar};
 use crate::config::Config;
 use crate::core::Editor;
-use crate::doc_layout::{DocLayout, GithubRenderData, LineCache};
+use crate::doc_layout::{DocLayout, GithubRenderData, LineCache, ScreenRect};
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
-use crate::github::{GitHubClient, ValidationResult};
-use crate::inline::GitHubRef;
+use crate::github::{
+    GitHubClient, IssueStatus, ValidatedRefData, ValidationResult, ValidationState,
+};
+use crate::inline::{GitHubContext, GitHubRef};
 use crate::marker::MarkerKind;
-use crate::text_engine::{TextEngine, peniko_color};
+use crate::text_engine::{StyleRun, TextEngine, peniko_color};
 
 const PADDING: f32 = 24.0;
 const FONT_SIZE: f32 = 18.0;
@@ -142,6 +144,13 @@ struct ActiveSurface {
     scale: f32,
 }
 
+/// A GitHub ref currently under the pointer, plus its on-screen caret rect (used to
+/// anchor the hover popover above/below it).
+struct HoverTarget {
+    reference: GitHubRef,
+    anchor: ScreenRect,
+}
+
 struct App {
     context: RenderContext,
     // One renderer suffices; keyed to the surface's device.
@@ -156,6 +165,8 @@ struct App {
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
     mouse_down: bool,
+    /// GitHub ref under the pointer, if any (drives the hover popover).
+    hovered: Option<HoverTarget>,
     /// Wakeup channel into the winit loop for finished tokio work.
     proxy: EventLoopProxy<WritEvent>,
     /// Handle to the process tokio runtime for spawning GitHub work.
@@ -181,6 +192,7 @@ impl App {
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             mouse_down: false,
+            hovered: None,
             proxy,
             runtime,
         }
@@ -375,6 +387,152 @@ fn rebuild_doc(
     doc
 }
 
+/// Find the GitHub ref (regular or naked-URL) under a screen point, with its
+/// on-screen anchor rect. Returns None when the pointer isn't over a detected ref.
+fn find_hover_target(editor: &Editor, doc: &DocLayout, x: f32, y: f32) -> Option<HoverTarget> {
+    let off = doc.hit_test(x, y)?;
+    hover_target_at_offset(editor, doc, off)
+}
+
+/// Find the GitHub ref whose byte range contains `off`, with its anchor rect.
+fn hover_target_at_offset(editor: &Editor, doc: &DocLayout, off: usize) -> Option<HoverTarget> {
+    let line = editor.state.buffer.byte_to_line(off);
+    if let Some(refs) = editor.github_refs_by_line().get(&line) {
+        for m in refs {
+            if m.byte_range.contains(&off) {
+                let anchor = doc.caret_rect(m.byte_range.start, 2.0)?;
+                return Some(HoverTarget {
+                    reference: m.reference.clone(),
+                    anchor,
+                });
+            }
+        }
+    }
+    if let Some(urls) = editor.naked_urls_by_line().get(&line) {
+        for u in urls {
+            if u.byte_range.contains(&off)
+                && let Some(r) = &u.github_ref
+            {
+                let anchor = doc.caret_rect(u.byte_range.start, 2.0)?;
+                return Some(HoverTarget {
+                    reference: r.clone(),
+                    anchor,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The colored text segments shown in a ref's hover popover, per validation state.
+fn hover_segments(
+    reference: &GitHubRef,
+    state: &Option<ValidationState>,
+    context: Option<&GitHubContext>,
+    theme: &EditorTheme,
+) -> Vec<(String, vello::peniko::Color)> {
+    match state {
+        Some(ValidationState::Valid(Some(ValidatedRefData::Issue(issue)))) => {
+            let status_color = match issue.status() {
+                IssueStatus::Open => theme.green,
+                IssueStatus::Draft => theme.comment,
+                IssueStatus::Merged | IssueStatus::Closed => theme.purple,
+                IssueStatus::ClosedNotPlanned => theme.red,
+            };
+            vec![
+                (format!("{} ", issue.symbol()), status_color),
+                (format!("#{} ", issue.number), theme.cyan),
+                (issue.title.clone(), theme.foreground),
+            ]
+        }
+        Some(ValidationState::Valid(Some(ValidatedRefData::User(user)))) => {
+            let mut v = vec![(format!("@{}", user.login), theme.cyan)];
+            if let Some(name) = &user.name {
+                v.push((format!("  {name}"), theme.comment));
+            }
+            v
+        }
+        Some(ValidationState::Valid(None)) => vec![
+            ("✓ ".to_string(), theme.green),
+            (reference.short_display(context), theme.cyan),
+        ],
+        Some(ValidationState::Invalid) => vec![
+            ("✗ ".to_string(), theme.red),
+            (reference.short_display(context), theme.cyan),
+        ],
+        Some(ValidationState::Pending) | None => vec![
+            ("… ".to_string(), theme.comment),
+            (reference.short_display(context), theme.cyan),
+        ],
+    }
+}
+
+/// Draw the GitHub ref hover popover: a bordered panel anchored below (or above,
+/// if space is tight) the hovered ref, showing its validated title/status.
+#[allow(clippy::too_many_arguments)]
+fn draw_hover_popover(
+    engine: &mut TextEngine,
+    scene: &mut Scene,
+    theme: &EditorTheme,
+    editor: &Editor,
+    target: &HoverTarget,
+    viewport_w: f32,
+    viewport_h: f32,
+    scale: f32,
+) {
+    let state = editor.github_validation_cache().get(&target.reference);
+    let segs = hover_segments(&target.reference, &state, editor.github_context(), theme);
+
+    let mut text = String::new();
+    let mut runs = Vec::new();
+    for (s, color) in &segs {
+        let start = text.len();
+        text.push_str(s);
+        runs.push(StyleRun::new(start..text.len(), peniko_color(*color)));
+    }
+
+    let font_size = 14.0;
+    // Cap the panel width (long issue titles) so it doesn't run off-screen.
+    let max_text = (viewport_w - 2.0 * PADDING * scale).min(480.0 * scale);
+    let layout = engine.build_line(
+        &text,
+        scale,
+        font_size,
+        1.3,
+        peniko_color(theme.foreground),
+        Some(max_text),
+        &runs,
+    );
+    let pad = 8.0 * scale;
+    let panel_w = layout.width() + pad * 2.0;
+    let panel_h = layout.height() + pad * 2.0;
+
+    let (ax0, ay0, _ax1, ay1) = target.anchor;
+    let gap = 4.0 * scale as f64;
+    let mut x = ax0;
+    if x as f32 + panel_w > viewport_w {
+        x = (viewport_w - panel_w) as f64;
+    }
+    x = x.max(0.0);
+    let below_y = ay1 + gap;
+    let y = if below_y as f32 + panel_h <= viewport_h {
+        below_y
+    } else {
+        (ay0 - gap - panel_h as f64).max(0.0)
+    };
+
+    let rect = Rect::new(x, y, x + panel_w as f64, y + panel_h as f64);
+    draw_panel(
+        scene,
+        peniko_color(theme.background),
+        peniko_color(theme.comment),
+        &rect,
+        6.0 * scale as f64,
+        scale as f64,
+    );
+    engine.draw_line(scene, &layout, (x as f32 + pad, y as f32 + pad));
+}
+
 impl ApplicationHandler<WritEvent> for App {
     /// A tokio task finished (validation/suggestion). Results are already in the
     /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
@@ -496,6 +654,7 @@ impl ApplicationHandler<WritEvent> for App {
                     let (_, editor_h) =
                         chrome_metrics(state.scale, state.surface.config.height as f32);
                     doc.scroll_by(dy, editor_h);
+                    self.hovered = None; // stored anchor goes stale on scroll
                     state.window.request_redraw();
                 }
             }
@@ -507,6 +666,7 @@ impl ApplicationHandler<WritEvent> for App {
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 if !text.is_empty() {
                     self.editor.insert_str(&text);
+                    self.hovered = None;
                     let w = state.surface.config.width as f32;
                     let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
@@ -525,26 +685,39 @@ impl ApplicationHandler<WritEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x as f32, position.y as f32);
-                if self.mouse_down
-                    && let Some(off) = self
+                if self.mouse_down {
+                    if let Some(off) = self
                         .doc
                         .as_ref()
                         .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
-                {
-                    self.editor.drag(off);
-                    let w = state.surface.config.width as f32;
-                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
-                    refresh_doc(
-                        &mut self.text_engine,
-                        &mut self.line_cache,
-                        &mut self.editor,
-                        &self.theme,
-                        &mut self.doc,
-                        w,
-                        state.scale,
-                        vh,
-                    );
-                    state.window.request_redraw();
+                    {
+                        self.editor.drag(off);
+                        let w = state.surface.config.width as f32;
+                        let (_, vh) =
+                            chrome_metrics(state.scale, state.surface.config.height as f32);
+                        refresh_doc(
+                            &mut self.text_engine,
+                            &mut self.line_cache,
+                            &mut self.editor,
+                            &self.theme,
+                            &mut self.doc,
+                            w,
+                            state.scale,
+                            vh,
+                        );
+                        state.window.request_redraw();
+                    }
+                } else {
+                    // Not dragging: update the hovered GitHub ref (popover source).
+                    let new = self.doc.as_ref().and_then(|d| {
+                        find_hover_target(&self.editor, d, self.mouse_pos.0, self.mouse_pos.1)
+                    });
+                    let changed = self.hovered.as_ref().map(|h| &h.reference)
+                        != new.as_ref().map(|h| &h.reference);
+                    self.hovered = new;
+                    if changed {
+                        state.window.request_redraw();
+                    }
                 }
             }
             WindowEvent::MouseInput {
@@ -583,6 +756,7 @@ impl ApplicationHandler<WritEvent> for App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if apply_key(&mut self.editor, self.modifiers, &event) {
+                    self.hovered = None;
                     let w = state.surface.config.width as f32;
                     let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
@@ -679,6 +853,20 @@ impl ApplicationHandler<WritEvent> for App {
                         &info,
                         state.scale,
                     );
+
+                    // GitHub ref hover popover, on top of everything (unclipped).
+                    if let Some(target) = self.hovered.as_ref() {
+                        draw_hover_popover(
+                            &mut self.text_engine,
+                            &mut self.scene,
+                            &self.theme,
+                            &self.editor,
+                            target,
+                            width,
+                            height,
+                            state.scale,
+                        );
+                    }
                 }
 
                 let dev = &self.context.devices[state.surface.dev_id];
@@ -993,6 +1181,25 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         &info,
         1.0,
     );
+
+    // Optional hover-popover golden image: WRIT_SHELL_HOVER=<byte offset> anchors the
+    // popover on the ref containing that offset.
+    if let Some(off) = std::env::var("WRIT_SHELL_HOVER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        && let Some(t) = hover_target_at_offset(&editor, &doc, off)
+    {
+        draw_hover_popover(
+            &mut engine,
+            &mut scene,
+            &theme,
+            &editor,
+            &t,
+            width as f32,
+            height as f32,
+            1.0,
+        );
+    }
 
     let target = device.create_texture(&TextureDescriptor {
         label: Some("snapshot_target"),
