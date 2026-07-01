@@ -27,7 +27,6 @@ path = "src/writd.rs"
 
 [dependencies]
 anyhow = "1"
-async-compat = "0.2"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
 imara-diff = "0.2"

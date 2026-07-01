@@ -2,7 +2,6 @@
 //!
 //! Uses GitHub's GraphQL API for search/autocomplete and validation.
 
-use async_compat::CompatExt;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -379,11 +378,10 @@ impl GitHubClient {
             .header("User-Agent", "writ")
             .json(&request)
             .send()
-            .compat()
             .await
             .ok()?;
 
-        let result: GraphQLResponse<T> = response.json().compat().await.ok()?;
+        let result: GraphQLResponse<T> = response.json().await.ok()?;
 
         if !result.errors.is_empty() {
             eprintln!(
