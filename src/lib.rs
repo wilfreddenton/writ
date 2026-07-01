@@ -28,6 +28,7 @@ pub use editor::{Direction, Editor, EditorAction, EditorConfig, EditorTheme};
 
 pub mod buffer;
 pub mod config;
+pub mod core;
 pub mod cursor;
 pub mod demo;
 pub mod diff;
