@@ -3,11 +3,10 @@ use std::time::Duration;
 
 use clap::Parser;
 use gpui::{
-    Application, Bounds, Entity, FocusHandle, Focusable, KeyBinding, Point, Rems, Size, Timer,
-    Window, WindowBounds, WindowDecorations, WindowOptions, div, prelude::*, px,
+    Bounds, Entity, FocusHandle, Focusable, KeyBinding, Point, Rems, Size, Window, WindowBounds,
+    WindowDecorations, WindowOptions, div, prelude::*, px,
 };
 use writ::{
-    agent_view::{AgentView, SubmitPrompt, ToggleChatPanel},
     buffer::Buffer,
     config::Config,
     demo::{DemoStep, DemoTiming, demo_script},
@@ -35,7 +34,7 @@ fn run_demo(editor: Entity<Editor>, cx: &mut gpui::App) {
 
     cx.spawn(async move |cx| {
         let run = |cx: &gpui::AsyncApp, action: EditorAction| {
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(wh) = cx.windows().first().copied() {
                     let _ = cx.update_window(wh, |_, window, cx| {
                         editor.update(cx, |editor, cx| editor.execute(&action, window, cx));
@@ -44,28 +43,34 @@ fn run_demo(editor: Entity<Editor>, cx: &mut gpui::App) {
             });
         };
 
-        Timer::after(Duration::from_millis(500)).await;
+        cx.background_executor()
+            .timer(Duration::from_millis(500))
+            .await;
 
         for step in script {
             match step {
                 DemoStep::Type(text) => {
                     for c in text.chars() {
                         run(cx, EditorAction::Type(c));
-                        Timer::after(timing.char_delay).await;
+                        cx.background_executor().timer(timing.char_delay).await;
                     }
                 }
                 DemoStep::Wait(ms) => {
-                    Timer::after(Duration::from_millis(ms)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(ms))
+                        .await;
                 }
                 DemoStep::Action(action) => {
                     run(cx, action);
-                    Timer::after(timing.key_delay).await;
+                    cx.background_executor().timer(timing.key_delay).await;
                 }
             }
         }
 
-        Timer::after(Duration::from_millis(500)).await;
-        let _ = cx.update(|cx| {
+        cx.background_executor()
+            .timer(Duration::from_millis(500))
+            .await;
+        cx.update(|cx| {
             if let Some(wh) = cx.windows().first().copied() {
                 let _ = cx.update_window(wh, |_, _, cx| {
                     editor.update(cx, |editor, _| editor.set_input_blocked(false));
@@ -78,12 +83,12 @@ fn run_demo(editor: Entity<Editor>, cx: &mut gpui::App) {
 
 pub struct Root {
     focus_handle: FocusHandle,
-    agent_view: Entity<AgentView>,
+    document_editor: Entity<Editor>,
     theme: EditorTheme,
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         window_shadow(self.theme.clone()).child(
             div()
                 .id("root")
@@ -100,16 +105,11 @@ impl Render for Root {
                 .on_action(|Quit, _, cx| {
                     cx.quit();
                 })
-                .on_action(cx.listener(|this, _: &ToggleChatPanel, _window, cx| {
-                    this.agent_view.update(cx, |view, cx| {
-                        view.toggle_chat_panel(cx);
-                    });
-                }))
                 .flex()
                 .flex_col()
                 .size_full()
                 .overflow_hidden()
-                .child(self.agent_view.clone()),
+                .child(self.document_editor.clone()),
         )
     }
 }
@@ -139,7 +139,7 @@ fn main() {
         load_file(&file_path)
     };
 
-    let app = Application::new().with_http_client(http::Client::new());
+    let app = gpui_platform::application().with_http_client(http::Client::new());
 
     app.run(move |cx| {
         cx.set_global(FileInfo {
@@ -155,14 +155,8 @@ fn main() {
             KeyBinding::new("ctrl-w", CloseWindow, None),
             KeyBinding::new("cmd-w", CloseWindow, None),
             KeyBinding::new("cmd-q", Quit, None),
-            // Toggle chat panel with Cmd+Shift+A (or Ctrl+Shift+A on Linux)
-            KeyBinding::new("cmd-shift-a", ToggleChatPanel, None),
-            KeyBinding::new("ctrl-shift-a", ToggleChatPanel, None),
-            // Submit prompt with Cmd+Enter (or Ctrl+Enter on Linux)
-            KeyBinding::new("cmd-enter", SubmitPrompt, None),
-            KeyBinding::new("ctrl-enter", SubmitPrompt, None),
         ]);
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _window_id| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -198,27 +192,9 @@ fn main() {
                 // Extract config before borrowing cx mutably
                 let github_repo = cli_config.github_repo.clone();
                 let github_token = cli_config.github_token.clone();
-                let agent_command = cli_config.agent.clone();
 
-                // Create the agent view (contains document editor + chat panel)
-                let agent_view = cx.new(|cx| AgentView::new(&content, editor_config, cx));
-
-                // Connect to agent if specified
-                if let Some(agent_cmd) = agent_command {
-                    let cwd = file_path
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    eprintln!("[writ] Connecting to agent: {}", agent_cmd);
-                    agent_view.update(cx, |view, cx| {
-                        view.connect_agent(agent_cmd, cwd, cx);
-                        // Show the chat panel when agent is connected
-                        view.set_chat_panel_visible(true, cx);
-                    });
-                }
-
-                // Get the document editor from the agent view for configuration
-                let document_editor = agent_view.read(cx).document_editor().clone();
+                // Create the document editor
+                let document_editor = cx.new(|cx| Editor::with_config(&content, editor_config, cx));
 
                 // Set up GitHub context for autolink detection
                 // Priority: CLI arg/env var > auto-detect from .git/config
@@ -254,7 +230,7 @@ fn main() {
                 });
 
                 // Focus the document editor so it receives keyboard input
-                document_editor.focus_handle(cx).focus(window);
+                document_editor.focus_handle(cx).focus(window, cx);
 
                 // Start demo if in demo mode
                 if demo_mode {
@@ -278,7 +254,7 @@ fn main() {
 
                     Root {
                         focus_handle: cx.focus_handle(),
-                        agent_view,
+                        document_editor,
                         theme,
                     }
                 })

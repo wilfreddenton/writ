@@ -16,7 +16,7 @@ use std::sync::mpsc;
 static NEXT_EDITOR_ID: AtomicUsize = AtomicUsize::new(0);
 
 use gpui::{
-    AnyElement, App, Context, Corner, CursorStyle, DragMoveEvent, Empty, FocusHandle, Focusable,
+    Anchor, AnyElement, App, Context, CursorStyle, DragMoveEvent, Empty, FocusHandle, Focusable,
     Hsla, IntoElement, KeyDownEvent, ListAlignment, ListState, ModifiersChangedEvent, MouseButton,
     ReadGlobal, Render, Rgba, TextRun, Window, anchored, div, font, list, point, prelude::*, px,
 };
@@ -42,6 +42,7 @@ use crate::title_bar::FileInfo;
 use crate::buffer::{Buffer, RenderSnapshot};
 use crate::cursor::{Cursor, Selection};
 use crate::diff::DiffState;
+use crate::git::head_blob_text;
 use crate::github::{GitHubClient, GitHubValidationCache, IssueOrPr, IssueStatus};
 use crate::inline::{
     GitHubContext, GitHubRef, NakedUrl, RawGitHubMatch, StyledRegion,
@@ -1315,6 +1316,18 @@ impl EditorState {
     }
 
     /// Toggle a checkbox on the given line, propagating to children and parents.
+    /// Byte offset of the checkbox marker (`[ ]` / `[x]` / `[X]`) within `line`,
+    /// given its checked state. `None` if the pattern isn't present in the text.
+    fn checkbox_byte_offset(&self, line: &LineMarkers, is_checked: bool) -> Option<usize> {
+        let line_text = self.buffer.slice_cow(line.range.clone());
+        let pattern = if is_checked { "[x]" } else { "[ ]" };
+        // Checked boxes may use an uppercase X.
+        let relative = line_text
+            .find(pattern)
+            .or_else(|| is_checked.then(|| line_text.find("[X]")).flatten())?;
+        Some(line.range.start + relative)
+    }
+
     pub fn toggle_checkbox_for_test(&mut self, line_number: usize) {
         let (is_checked, checkbox_byte_start) = {
             if line_number >= self.buffer.line_count() {
@@ -1326,23 +1339,9 @@ impl EditorState {
                 return;
             };
 
-            let line_text = self.buffer.slice_cow(line.range.clone());
-            let checkbox_pattern = if is_checked { "[x]" } else { "[ ]" };
-            let alt_pattern = if is_checked { "[X]" } else { "" };
-
-            let checkbox_offset = line_text.find(checkbox_pattern).or_else(|| {
-                if !alt_pattern.is_empty() {
-                    line_text.find(alt_pattern)
-                } else {
-                    None
-                }
-            });
-
-            let Some(relative_offset) = checkbox_offset else {
+            let Some(checkbox_byte_start) = self.checkbox_byte_offset(&line, is_checked) else {
                 return;
             };
-
-            let checkbox_byte_start = line.range.start + relative_offset;
             (is_checked, checkbox_byte_start)
         };
 
@@ -1370,7 +1369,7 @@ impl EditorState {
         }
 
         // Sort by offset descending so we can modify without invalidating earlier offsets
-        checkboxes_to_toggle.sort_by(|a, b| b.0.cmp(&a.0));
+        checkboxes_to_toggle.sort_by_key(|c| std::cmp::Reverse(c.0));
 
         // Toggle each checkbox
         for (offset, _currently_checked) in &checkboxes_to_toggle {
@@ -1459,20 +1458,7 @@ impl EditorState {
 
         if let Some(is_checked) = markers.checkbox() {
             // Current line has a checkbox - propagate from it
-            let line_text = self.buffer.slice_cow(markers.range.clone());
-            let checkbox_pattern = if is_checked { "[x]" } else { "[ ]" };
-            let alt_pattern = if is_checked { "[X]" } else { "" };
-
-            let checkbox_offset = line_text.find(checkbox_pattern).or_else(|| {
-                if !alt_pattern.is_empty() {
-                    line_text.find(alt_pattern)
-                } else {
-                    None
-                }
-            });
-
-            if let Some(relative_offset) = checkbox_offset {
-                let checkbox_byte_start = markers.range.start + relative_offset;
+            if let Some(checkbox_byte_start) = self.checkbox_byte_offset(&markers, is_checked) {
                 let mut cursor_pos = cursor_offset;
                 self.propagate_checkbox_up(checkbox_byte_start, is_checked, &mut cursor_pos);
                 self.selection = Selection::new(cursor_pos, cursor_pos);
@@ -1640,7 +1626,6 @@ pub struct Editor {
     /// Last known cursor offset, used to detect cursor movement for autocomplete.
     last_cursor_offset: Option<usize>,
     input_blocked: bool,
-    streaming_mode: bool,
     config: EditorConfig,
     /// Whether mouse is over a checkbox.
     hovering_checkbox: bool,
@@ -1682,25 +1667,23 @@ pub struct Editor {
     /// Detected GitHub refs by line (updated during render).
     /// Used for autocomplete when cursor is inside a ref.
     github_refs_by_line: HashMap<usize, Vec<RawGitHubMatch>>,
+    /// Key of the last link detection: (buffer version, first visible, last
+    /// visible). Detection re-runs only when this changes, keeping the regex
+    /// scan and ref-validation spawns off the per-repaint path.
+    last_link_detect_key: Option<(u64, usize, usize)>,
     /// Autocomplete popup state.
     autocomplete: Option<AutocompleteState>,
     /// Pending autocomplete fetch (for debouncing).
     autocomplete_debounce_task: Option<gpui::Task<()>>,
-    /// Whether this is the primary editor that updates global state (status bar, title bar).
-    /// Only one editor should have this set to true at a time.
-    is_primary: bool,
     /// Unique instance ID for element IDs to prevent GPUI element caching conflicts.
     instance_id: usize,
-    /// Diff state for reviewing agent edits. When set, the editor shows
-    /// inline diff decorations (ghost lines for deletions, green highlights for additions).
+    /// Inline git-diff decorations against HEAD (ghost lines for deletions,
+    /// highlights for additions). Recomputed from `head_base` on every edit.
     diff_state: Option<DiffState>,
-    /// When true, an agent write is pending and file watcher reloads should be blocked.
-    /// This prevents the race condition where file watcher reloads the new content
-    /// before we can capture the old content for diffing.
-    pending_agent_write: bool,
-    /// Line ranges that are user messages (for chat editor background highlighting).
-    /// Each range is start_line..end_line (exclusive).
-    user_message_lines: Vec<Range<usize>>,
+    /// Cached git HEAD version of the file: (raw text, rendered snapshot).
+    /// The snapshot is reused as the diff base so edits don't re-parse HEAD.
+    /// `None` when the file isn't tracked or has no HEAD blob.
+    head_base: Option<(String, RenderSnapshot)>,
 }
 
 impl Editor {
@@ -1724,7 +1707,6 @@ impl Editor {
             last_cursor_line: None,
             last_cursor_offset: None,
             input_blocked: false,
-            streaming_mode: false,
             config,
             hovering_checkbox: false,
             hovering_link_region: false,
@@ -1744,26 +1726,13 @@ impl Editor {
             github_client: None,
             naked_urls_by_line: HashMap::new(),
             github_refs_by_line: HashMap::new(),
+            last_link_detect_key: None,
             autocomplete: None,
             autocomplete_debounce_task: None,
-            is_primary: true, // Default to primary; secondary editors should call set_primary(false)
             instance_id: NEXT_EDITOR_ID.fetch_add(1, Ordering::Relaxed),
             diff_state: None,
-            pending_agent_write: false,
-            user_message_lines: Vec::new(),
+            head_base: None,
         }
-    }
-
-    /// Set whether this editor is the primary editor that updates global state.
-    /// Only the primary editor should update StatusBarInfo and FileInfo globals.
-    pub fn set_primary(&mut self, is_primary: bool) {
-        self.is_primary = is_primary;
-    }
-
-    /// Get a render snapshot of the current buffer state.
-    /// Useful for capturing state before agent edits.
-    pub fn render_snapshot(&mut self) -> RenderSnapshot {
-        self.state.buffer.render_snapshot()
     }
 
     /// Get the file path this editor is editing, if any.
@@ -1771,122 +1740,51 @@ impl Editor {
         self.file_path.as_ref()
     }
 
-    /// Set the diff state for reviewing agent edits.
-    pub fn set_diff_state(&mut self, diff_state: Option<DiffState>) {
-        self.diff_state = diff_state;
+    /// Load the git HEAD version of the current file, cache a render snapshot of
+    /// it as the diff base, then recompute the inline diff against the buffer.
+    /// Call on open and whenever the file is reloaded from disk (HEAD may have moved).
+    pub fn refresh_git_base(&mut self, cx: &mut Context<Self>) {
+        self.head_base = self
+            .file_path
+            .as_ref()
+            .and_then(|path| head_blob_text(path))
+            .map(|text| {
+                let mut base: Buffer = text.parse().expect("Buffer parsing is infallible");
+                let snapshot = base.render_snapshot();
+                (text, snapshot)
+            });
+        self.recompute_diff();
+        cx.notify();
     }
 
-    /// Get a reference to the current diff state, if any.
-    pub fn diff_state(&self) -> Option<&DiffState> {
-        self.diff_state.as_ref()
-    }
-
-    /// Accept the hunk at the current cursor position.
-    /// Since changes are already applied, just remove the hunk from diff state.
-    pub fn accept_current_hunk(&mut self, cx: &mut Context<Self>) {
-        let cursor_line = self.state.buffer.byte_to_line(self.state.selection.head);
-
-        if let Some(ref mut diff_state) = self.diff_state
-            && let Some(hunk_idx) = diff_state.hunk_at_line(cursor_line)
-        {
-            // Accept = just remove the hunk (changes already applied)
-            diff_state.remove_hunk(hunk_idx, 0);
-
-            // If no more hunks, clear diff state entirely
-            if diff_state.hunks.is_empty() {
-                self.diff_state = None;
-            }
-            cx.notify();
-        }
-    }
-
-    /// Accept all pending hunks.
-    pub fn accept_all_hunks(&mut self, cx: &mut Context<Self>) {
-        if self.diff_state.is_some() {
-            self.diff_state = None;
-            cx.notify();
-        }
-    }
-
-    /// Reject the hunk at the current cursor position.
-    /// Restores the old content from the snapshot.
-    pub fn reject_current_hunk(&mut self, cx: &mut Context<Self>) {
-        let cursor_line = self.state.buffer.byte_to_line(self.state.selection.head);
-
-        // Need to extract info before mutating
-        let reject_info = if let Some(ref diff_state) = self.diff_state {
-            if let Some(hunk_idx) = diff_state.hunk_at_line(cursor_line) {
-                diff_state
-                    .reject_hunk_info(hunk_idx)
-                    .map(|info| (hunk_idx, info))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some((hunk_idx, (old_text, new_line_range))) = reject_info {
-            // Replace the new lines with the old content
-            let start_byte = self.state.buffer.line_to_byte(new_line_range.start);
-            let end_byte = if new_line_range.end >= self.state.buffer.line_count() {
-                self.state.buffer.len_bytes()
-            } else {
-                self.state.buffer.line_to_byte(new_line_range.end)
-            };
-
-            // Replace the new content with old content
-            let cursor_before = self.state.selection.head;
-            self.state
-                .buffer
-                .replace(start_byte..end_byte, &old_text, cursor_before);
-
-            // Calculate line delta for adjusting subsequent hunks
-            let old_lines = old_text.chars().filter(|c| *c == '\n').count();
-            let new_line_count = new_line_range.len();
-            let line_delta = old_lines as isize - new_line_count as isize;
-
-            // Update diff state
-            if let Some(ref mut diff_state) = self.diff_state {
-                diff_state.remove_hunk(hunk_idx, line_delta);
-
-                if diff_state.hunks.is_empty() {
-                    self.diff_state = None;
-                }
-            }
-
-            // Move cursor to start of restored content
-            self.state.selection = Selection::new(start_byte, start_byte);
-            cx.notify();
-        }
-    }
-
-    /// Reject all pending hunks, restoring the entire old document.
-    pub fn reject_all_hunks(&mut self, cx: &mut Context<Self>) {
-        if let Some(ref diff_state) = self.diff_state {
-            let old_text = diff_state.reject_all_text();
-            self.set_text(&old_text, cx);
-            self.diff_state = None;
-            cx.notify();
-        }
-    }
-
-    /// Set the pending agent write flag.
-    /// When true, file watcher reloads are blocked to prevent race conditions.
-    pub fn set_pending_agent_write(&mut self, pending: bool) {
-        self.pending_agent_write = pending;
+    /// Recompute the inline diff between the cached git HEAD base and the current
+    /// buffer. Cheap enough to run on every edit — reuses the cached base snapshot,
+    /// so only the diff itself is recomputed, not the markdown parse of HEAD.
+    fn recompute_diff(&mut self) {
+        self.diff_state = self
+            .head_base
+            .as_ref()
+            .and_then(|(base_text, base_snapshot)| {
+                let current = self.state.buffer.text();
+                let state = DiffState::compute(base_snapshot.clone(), base_text, &current);
+                state.has_hunks().then_some(state)
+            });
     }
 
     /// Set the GitHub context for autolink detection.
     /// Should be called when opening a file from a GitHub URL (e.g., via writd).
     pub fn set_github_context(&mut self, context: GitHubContext) {
         self.github_context = Some(context);
+        // Force link detection to re-run now that context is available.
+        self.last_link_detect_key = None;
     }
 
     /// Set the GitHub client for validating references.
     /// Should be called with an authenticated client when a GitHub token is available.
     pub fn set_github_client(&mut self, client: GitHubClient) {
         self.github_client = Some(client);
+        // Force link detection to re-run so refs get validated with the new client.
+        self.last_link_detect_key = None;
     }
 
     /// Clear the GitHub validation cache and re-validate all refs.
@@ -1900,10 +1798,28 @@ impl Editor {
         let line_count = self.state.buffer.line_count();
         let (github_matches, _) = self.detect_links(0, line_count);
         self.spawn_github_validation(&github_matches, cx);
+        // Re-detect visible lines on the next render to refresh stored maps.
+        self.last_link_detect_key = None;
     }
 
     /// Detect GitHub refs and naked URLs in a range of lines.
     /// Returns both indexed by line number for use in rendering.
+    /// Inclusive range of currently-visible line indices, estimated by scanning
+    /// laid-out item bounds from the scroll top until one falls below the viewport.
+    fn visible_line_range(&self, total_lines: usize) -> (usize, usize) {
+        let first = self.list_state.logical_scroll_top().item_ix;
+        let viewport = self.list_state.viewport_bounds();
+        let viewport_bottom = viewport.origin.y + viewport.size.height;
+        let mut last = first;
+        for i in first..total_lines {
+            match self.list_state.bounds_for_item(i) {
+                Some(bounds) if bounds.origin.y <= viewport_bottom => last = i,
+                _ => break,
+            }
+        }
+        (first, last)
+    }
+
     fn detect_links(
         &mut self,
         start_line: usize,
@@ -2016,7 +1932,7 @@ impl Editor {
         let ref_for_task = reference.clone();
         cx.spawn(async move |weak, cx| {
             let result = client.validate_ref(&ref_for_task).await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(editor) = weak.upgrade() {
                     editor.update(cx, |editor, cx| {
                         match result {
@@ -2054,7 +1970,7 @@ impl Editor {
                 .await;
 
             // Now do the actual fetch
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(editor) = weak.upgrade() {
                     editor.update(cx, |editor, cx| {
                         editor.fetch_autocomplete_suggestions(cx);
@@ -2125,7 +2041,7 @@ impl Editor {
                 })
                 .collect();
 
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(editor) = weak.upgrade() {
                     editor.update(cx, |editor, cx| {
                         // Add fetched issues to validation cache with full data
@@ -2216,7 +2132,7 @@ impl Editor {
                 })
                 .collect();
 
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(editor) = weak.upgrade() {
                     editor.update(cx, |editor, cx| {
                         // Only update if autocomplete is still active with the same prefix
@@ -2244,6 +2160,9 @@ impl Editor {
 
         self.file_path = Some(path.clone());
 
+        // Compute the initial inline git diff against HEAD.
+        self.refresh_git_base(cx);
+
         let (tx, rx) = mpsc::channel();
         let watch_path = path.clone();
         let file_exists = path.exists();
@@ -2255,10 +2174,8 @@ impl Editor {
                     EventKind::Modify(_) => {
                         let _ = tx.send(());
                     }
-                    EventKind::Create(_) => {
-                        if event.paths.iter().any(|p| p == &watch_path) {
-                            let _ = tx.send(());
-                        }
+                    EventKind::Create(_) if event.paths.iter().any(|p| p == &watch_path) => {
+                        let _ = tx.send(());
                     }
                     _ => {}
                 }
@@ -2294,26 +2211,24 @@ impl Editor {
                     .timer(std::time::Duration::from_millis(100))
                     .await;
 
-                let continue_loop = cx
-                    .update(|cx| {
-                        if let Some(editor) = weak.upgrade() {
-                            editor.update(cx, |editor, cx| {
-                                if let Some(rx) = &editor.file_watcher_rx {
-                                    let mut changed = false;
-                                    while rx.try_recv().is_ok() {
-                                        changed = true;
-                                    }
-                                    if changed {
-                                        editor.reload_file(cx);
-                                    }
+                let continue_loop = cx.update(|cx| {
+                    if let Some(editor) = weak.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            if let Some(rx) = &editor.file_watcher_rx {
+                                let mut changed = false;
+                                while rx.try_recv().is_ok() {
+                                    changed = true;
                                 }
-                            });
-                            true
-                        } else {
-                            false
-                        }
-                    })
-                    .unwrap_or(false);
+                                if changed {
+                                    editor.reload_file(cx);
+                                }
+                            }
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                });
 
                 if !continue_loop {
                     break;
@@ -2323,20 +2238,13 @@ impl Editor {
         .detach();
     }
 
-    /// Reload the file from disk, replacing buffer contents.
+    /// Reload the file from disk after an external change (e.g. a background
+    /// agent editing the file), then refresh the inline git diff. The cursor's
+    /// line is preserved so reading isn't disrupted.
     fn reload_file(&mut self, cx: &mut Context<Self>) {
-        // Don't reload while reviewing agent changes - the diff state would be lost
-        if self.diff_state.is_some() {
-            return;
-        }
-
-        // Don't reload if an agent write is pending - we need to capture the old content first
-        if self.pending_agent_write {
-            return;
-        }
-
         let Some(path) = &self.file_path else { return };
 
+        // Skip reloads triggered by our own save.
         if let Some(last_save_mtime) = self.last_save_mtime
             && let Ok(metadata) = std::fs::metadata(path)
             && let Ok(file_mtime) = metadata.modified()
@@ -2354,8 +2262,15 @@ impl Editor {
         };
 
         if content != self.state.buffer.text() {
+            let cursor_line = self.state.buffer.byte_to_line(self.state.selection.head);
             self.set_text(&content, cx);
+            let line = cursor_line.min(self.state.buffer.line_count().saturating_sub(1));
+            let offset = self.state.buffer.line_to_byte(line);
+            self.state.selection = Selection::new(offset, offset);
         }
+
+        // HEAD may have moved (e.g. the agent committed); refresh the diff base.
+        self.refresh_git_base(cx);
     }
 
     /// Returns the buffer contents as a string.
@@ -2416,58 +2331,9 @@ impl Editor {
 
         let config = crate::config::Config::global(cx);
         if config.autosave {
+            // save() records last_save_mtime so the watcher skips this write.
             self.save(cx);
-            if let Some(path) = &self.file_path
-                && let Ok(metadata) = std::fs::metadata(path)
-            {
-                self.last_save_mtime = metadata.modified().ok();
-            }
         }
-    }
-
-    /// Insert text at the current cursor position.
-    pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.insert_text(text);
-        cx.notify();
-    }
-
-    /// Append text to the end of the buffer and move cursor to the end.
-    ///
-    /// Useful for streaming content from an AI or other source.
-    pub fn append(&mut self, text: &str, cx: &mut Context<Self>) {
-        let end = self.state.buffer.len_bytes();
-        self.state.buffer.insert(end, text, end);
-        let new_end = self.state.buffer.len_bytes();
-        self.state.selection = Selection::new(new_end, new_end);
-        cx.notify();
-    }
-
-    /// Append a user message to the end of the buffer, tracking its line range
-    /// for background highlighting. Trailing empty lines are not included in the range.
-    pub fn append_user_message(&mut self, text: &str, cx: &mut Context<Self>) {
-        let line_count_before = self.state.buffer.line_count();
-        self.append(text, cx);
-
-        // The content we just added spans from the old last line to (new_count - trailing_blanks)
-        let content_lines = text.trim_end().lines().count();
-        // Content starts at line_count_before - 1 (the old empty last line)
-        let start_line = line_count_before.saturating_sub(1);
-        let end_line = start_line + content_lines;
-
-        if end_line > start_line {
-            self.user_message_lines.push(start_line..end_line);
-        }
-    }
-
-    /// Check if a line is part of a user message.
-    pub fn is_user_message_line(&self, line: usize) -> bool {
-        self.user_message_lines.iter().any(|r| r.contains(&line))
-    }
-
-    /// Append text and scroll to keep the cursor visible.
-    pub fn append_and_scroll(&mut self, text: &str, _window: &mut Window, cx: &mut Context<Self>) {
-        self.append(text, cx);
-        self.request_scroll_to_cursor();
     }
 
     fn cursor(&self) -> Cursor {
@@ -2725,13 +2591,13 @@ impl Editor {
 
         let (popup_y, anchor_corner) = if space_below >= popup_max_height + gap {
             // Enough space below - position popup below cursor
-            (cursor_pos.y + line_height + gap, Corner::TopLeft)
+            (cursor_pos.y + line_height + gap, Anchor::TopLeft)
         } else if space_above >= popup_max_height + gap {
             // Not enough below but enough above - flip to above cursor
-            (cursor_pos.y - gap, Corner::BottomLeft)
+            (cursor_pos.y - gap, Anchor::BottomLeft)
         } else {
             // Not enough space either way - default to below
-            (cursor_pos.y + line_height + gap, Corner::TopLeft)
+            (cursor_pos.y + line_height + gap, Anchor::TopLeft)
         };
 
         // Build suggestion items
@@ -2952,9 +2818,9 @@ impl Editor {
         // Position below the ref, or above if not enough space
         let space_below = viewport.origin.y + viewport.size.height - (pos.y + line_height);
         let (popup_y, anchor_corner) = if space_below >= popup_max_height + gap {
-            (pos.y + line_height + gap, Corner::TopLeft)
+            (pos.y + line_height + gap, Anchor::TopLeft)
         } else {
-            (pos.y - gap, Corner::BottomLeft)
+            (pos.y - gap, Anchor::BottomLeft)
         };
 
         // Build popup content based on validation state
@@ -3211,26 +3077,6 @@ impl Editor {
         let extend = keystroke.modifiers.shift;
 
         match keystroke.key.as_str() {
-            // Diff accept: Ctrl+Y (current hunk) or Ctrl+Shift+Y (all hunks)
-            "y" if (keystroke.modifiers.control || keystroke.modifiers.platform)
-                && self.diff_state.is_some() =>
-            {
-                if keystroke.modifiers.shift {
-                    self.accept_all_hunks(cx);
-                } else {
-                    self.accept_current_hunk(cx);
-                }
-            }
-            // Diff reject: Ctrl+N (current hunk) or Ctrl+Shift+N (all hunks)
-            "n" if (keystroke.modifiers.control || keystroke.modifiers.platform)
-                && self.diff_state.is_some() =>
-            {
-                if keystroke.modifiers.shift {
-                    self.reject_all_hunks(cx);
-                } else {
-                    self.reject_current_hunk(cx);
-                }
-            }
             "backspace" => {
                 self.delete_backward();
             }
@@ -3378,35 +3224,6 @@ impl Editor {
         self.input_blocked = blocked;
     }
 
-    /// Returns true if user input is currently blocked.
-    pub fn is_input_blocked(&self) -> bool {
-        self.input_blocked
-    }
-
-    /// Enter streaming mode: block input and move cursor to end.
-    ///
-    /// Call this before appending streamed content, then call
-    /// [`end_streaming`](Self::end_streaming) when done.
-    pub fn begin_streaming(&mut self, cx: &mut Context<Self>) {
-        self.streaming_mode = true;
-        self.input_blocked = true;
-        let end = self.state.buffer.len_bytes();
-        self.state.selection = Selection::new(end, end);
-        cx.notify();
-    }
-
-    /// Exit streaming mode and re-enable user input.
-    pub fn end_streaming(&mut self, cx: &mut Context<Self>) {
-        self.streaming_mode = false;
-        self.input_blocked = false;
-        cx.notify();
-    }
-
-    /// Returns true if currently in streaming mode.
-    pub fn is_streaming(&self) -> bool {
-        self.streaming_mode
-    }
-
     /// Returns the current cursor position as a byte offset.
     pub fn cursor_position(&self) -> usize {
         self.state.selection.head
@@ -3460,6 +3277,13 @@ impl Editor {
         if let Err(e) = std::fs::write(&path, &content) {
             eprintln!("Failed to save file: {}", e);
             return;
+        }
+
+        // Record the mtime of the file we just wrote so the file watcher can
+        // tell our own save apart from an external edit and skip reloading it
+        // (which would otherwise force a needless HEAD reload + diff recompute).
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            self.last_save_mtime = metadata.modified().ok();
         }
 
         self.state.buffer.mark_clean();
@@ -3608,17 +3432,18 @@ impl Render for Editor {
         if buffer_version != self.last_synced_version {
             self.last_synced_version = buffer_version;
             self.sync_list_state(cx);
+            // Refresh the inline git diff against the cached HEAD base. Runs once
+            // per edit batch (not per keystroke) and reuses the cached base snapshot.
+            self.recompute_diff();
         }
 
-        // Only primary editor updates global file info (dirty state for title bar)
-        if self.is_primary {
-            let file_info = FileInfo::global(cx);
-            if file_info.dirty != self.state.buffer.is_dirty() {
-                cx.set_global(FileInfo {
-                    path: file_info.path.clone(),
-                    dirty: self.state.buffer.is_dirty(),
-                });
-            }
+        // Update global file info (dirty state for title bar)
+        let file_info = FileInfo::global(cx);
+        if file_info.dirty != self.state.buffer.is_dirty() {
+            cx.set_global(FileInfo {
+                path: file_info.path.clone(),
+                dirty: self.state.buffer.is_dirty(),
+            });
         }
 
         // Update status bar info
@@ -3631,31 +3456,32 @@ impl Render for Editor {
         let heading_level = self.find_current_heading(cursor_line);
         let total_lines = self.state.buffer.line_count();
 
-        let first_visible_line = self.list_state.logical_scroll_top().item_ix;
-        // Estimate last visible line by scanning from first visible until out of viewport
-        let viewport = self.list_state.viewport_bounds();
-        let mut last_visible_line = first_visible_line;
-        for i in first_visible_line..total_lines {
-            if let Some(bounds) = self.list_state.bounds_for_item(i) {
-                if bounds.origin.y <= viewport.origin.y + viewport.size.height {
-                    last_visible_line = i;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
+        let (first_visible_line, last_visible_line) = self.visible_line_range(total_lines);
+
+        // Detect GitHub refs and naked URLs in visible lines. Detection walks
+        // every visible line with regexes and takes a fresh snapshot, so only
+        // redo it when the content or the visible range actually changes —
+        // render also runs on cursor blink, hover, scroll and selection. This
+        // is what makes ref validation edit/scroll-driven rather than
+        // per-repaint; the network spawns are additionally deduped by the
+        // validation cache, so they never fire for an already-seen ref.
+        let detect_key = (buffer_version, first_visible_line, last_visible_line);
+        if self.last_link_detect_key != Some(detect_key) {
+            self.last_link_detect_key = Some(detect_key);
+            let (github_matches_by_line, naked_urls_by_line) =
+                self.detect_links(first_visible_line, last_visible_line + 1);
+            self.spawn_github_validation(&github_matches_by_line, cx);
+            self.spawn_naked_url_validation(&naked_urls_by_line, cx);
+            // Store refs for autocomplete and atomic cursor movement.
+            self.github_refs_by_line = github_matches_by_line;
+            self.naked_urls_by_line = naked_urls_by_line;
         }
 
-        // Detect GitHub refs and naked URLs in visible lines
-        let (github_matches_by_line, naked_urls_by_line) =
-            self.detect_links(first_visible_line, last_visible_line + 1);
-        self.spawn_github_validation(&github_matches_by_line, cx);
-        self.spawn_naked_url_validation(&naked_urls_by_line, cx);
-
-        // Store refs for autocomplete and atomic cursor movement
-        self.github_refs_by_line = github_matches_by_line.clone();
-        self.naked_urls_by_line = naked_urls_by_line.clone();
+        // Owned copies for the 'static per-line render closure below. These maps
+        // only hold entries for visible lines that contain refs/URLs, so they're
+        // usually empty or tiny — cheap next to the gated detection above.
+        let github_matches_by_line = self.github_refs_by_line.clone();
+        let naked_urls_by_line = self.naked_urls_by_line.clone();
 
         // Update autocomplete only when cursor position changed (not on every render)
         let cursor_offset_changed = self.last_cursor_offset != Some(cursor_offset);
@@ -3664,20 +3490,18 @@ impl Render for Editor {
             self.fetch_autocomplete_suggestions_debounced(cx);
         }
 
-        // Only primary editor updates global status bar info
-        if self.is_primary {
-            let new_status_bar_info = StatusBarInfo {
-                context_markers,
-                heading_level,
-                cursor_line: cursor_line + 1, // 1-indexed
-                cursor_col: cursor_col + 1,   // 1-indexed
-                total_lines,
-                first_visible_line,
-                last_visible_line,
-            };
-            if new_status_bar_info != *StatusBarInfo::global(cx) {
-                cx.set_global(new_status_bar_info);
-            }
+        // Update global status bar info
+        let new_status_bar_info = StatusBarInfo {
+            context_markers,
+            heading_level,
+            cursor_line: cursor_line + 1, // 1-indexed
+            cursor_col: cursor_col + 1,   // 1-indexed
+            total_lines,
+            first_visible_line,
+            last_visible_line,
+        };
+        if new_status_bar_info != *StatusBarInfo::global(cx) {
+            cx.set_global(new_status_bar_info);
         }
 
         let theme = self.config.theme.clone();
@@ -3715,32 +3539,16 @@ impl Render for Editor {
             line_height: self.config.line_height,
         };
 
-        // Compute diff colors for line backgrounds and inline highlights
-        let diff_deleted_bg: Rgba = {
-            let mut c: Hsla = theme.red.into();
-            c.a = 0.05;
+        // Diff colors for line backgrounds (faint) and inline word highlights (stronger).
+        let with_alpha = |color: Hsla, a: f32| -> Rgba {
+            let mut c = color;
+            c.a = a;
             c.into()
         };
-        let diff_added_bg: Rgba = {
-            let mut c: Hsla = theme.green.into();
-            c.a = 0.05;
-            c.into()
-        };
-        let diff_deleted_inline: Rgba = {
-            let mut c: Hsla = theme.red.into();
-            c.a = 0.25;
-            c.into()
-        };
-        let diff_added_inline: Rgba = {
-            let mut c: Hsla = theme.green.into();
-            c.a = 0.25;
-            c.into()
-        };
-        let user_message_bg: Rgba = {
-            let mut c: Hsla = theme.purple.into();
-            c.a = 0.05;
-            c.into()
-        };
+        let diff_deleted_bg = with_alpha(theme.red.into(), 0.05);
+        let diff_added_bg = with_alpha(theme.green.into(), 0.05);
+        let diff_deleted_inline = with_alpha(theme.red.into(), 0.25);
+        let diff_added_inline = with_alpha(theme.green.into(), 0.25);
 
         // Only show cursor and selection when this editor is focused and input is not blocked
         let is_focused = self.focus_handle.is_focused(window);
@@ -3766,7 +3574,7 @@ impl Render for Editor {
 
         // When scroll is requested (e.g., typing) or in streaming mode,
         // check if cursor line is near the bottom edge and scroll.
-        if self.scroll_to_cursor_pending || self.streaming_mode {
+        if self.scroll_to_cursor_pending {
             self.scroll_to_cursor_pending = false;
             let scroll_buffer = self.config.line_height.to_pixels(window.rem_size());
             if let Some(cursor_bounds) = self.list_state.bounds_for_item(cursor_line) {
@@ -3804,7 +3612,6 @@ impl Render for Editor {
         let max_line_width = self.config.max_line_width;
         let snapshot = self.state.buffer.render_snapshot();
         let diff_state = self.diff_state.clone();
-        let user_message_lines = self.user_message_lines.clone();
 
         let github_cache = self.github_validation_cache.clone();
         let github_context = self.github_context.clone();
@@ -3814,14 +3621,9 @@ impl Render for Editor {
         let editor_id = self.instance_id;
         let line_list = div().id(("line-list", editor_id)).size_full().child(
             list(self.list_state.clone(), move |ix, _window, _cx| {
-                // Bounds check: ensure line index is valid for this snapshot
+                // Bounds check: the list state can transiently be out of sync
+                // with a fresh snapshot during edits.
                 if ix >= snapshot.line_count() {
-                    eprintln!(
-                        "[writ] list callback: ix {} >= line_count {}, rope_len {}",
-                        ix,
-                        snapshot.line_count(),
-                        snapshot.rope.len_bytes()
-                    );
                     return div().into_any_element();
                 }
 
@@ -3922,12 +3724,9 @@ impl Render for Editor {
                     .as_ref()
                     .map(|ds| ds.is_addition(ix))
                     .unwrap_or(false);
-                let is_user_message = user_message_lines.iter().any(|r| r.contains(&ix));
 
                 let line_bg = if is_addition {
                     Some(diff_added_bg)
-                } else if is_user_message {
-                    Some(user_message_bg)
                 } else {
                     None
                 };
@@ -4026,9 +3825,9 @@ impl Render for Editor {
             // from Line click handlers will be routed to THIS editor.
             // Don't focus if input is blocked (read-only mode).
             .capture_any_mouse_down(cx.listener(
-                |editor, _event: &gpui::MouseDownEvent, window, _cx| {
+                |editor, _event: &gpui::MouseDownEvent, window, cx| {
                     if !editor.input_blocked {
-                        editor.focus_handle.focus(window);
+                        editor.focus_handle.focus(window, cx);
                     }
                 },
             ))

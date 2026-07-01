@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_compat::CompatExt;
-use futures::{FutureExt, future::BoxFuture};
+use futures::{AsyncReadExt, FutureExt, future::BoxFuture};
 use gpui::http_client::{
     AsyncBody, HttpClient, Request, Response, Url,
     http::{HeaderValue, StatusCode},
@@ -19,7 +19,7 @@ impl Client {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("failed to build HTTP client");
 
         Arc::new(Self {
             client,
@@ -29,10 +29,6 @@ impl Client {
 }
 
 impl HttpClient for Client {
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn user_agent(&self) -> Option<&HeaderValue> {
         Some(&self.user_agent)
     }
@@ -45,12 +41,28 @@ impl HttpClient for Client {
         &self,
         req: Request<AsyncBody>,
     ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
-        let (parts, _body) = req.into_parts();
+        let (parts, body) = req.into_parts();
         let uri = parts.uri.to_string();
+        let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+            .unwrap_or(reqwest::Method::GET);
+        let headers = parts.headers;
         let client = self.client.clone();
 
         async move {
-            let response = client.get(&uri).send().compat().await?;
+            // Drain the request body (AsyncBody is smol-compatible, no bridging needed).
+            let mut body = body;
+            let mut body_bytes = Vec::new();
+            body.read_to_end(&mut body_bytes).await?;
+
+            let mut builder = client.request(method, &uri);
+            for (name, value) in headers.iter() {
+                builder = builder.header(name.as_str(), value.as_bytes());
+            }
+            if !body_bytes.is_empty() {
+                builder = builder.body(body_bytes);
+            }
+
+            let response = builder.send().compat().await?;
             let status = response.status().as_u16();
             let bytes = response.bytes().compat().await?;
 

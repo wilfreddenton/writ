@@ -654,7 +654,6 @@ impl Line {
         }
 
         let mut boundaries: Vec<usize> = vec![content_range.start, content_range.end];
-        let show_all_markers = false;
 
         if self.line.heading_level().is_some()
             && let Some(marker_range) = self.line.marker_range()
@@ -675,7 +674,7 @@ impl Line {
                 let cursor_inside = self.cursor_offset >= region.full_range.start
                     && self.cursor_offset <= region.full_range.end;
 
-                if show_all_markers || cursor_inside {
+                if cursor_inside {
                     boundaries.push(region.full_range.start.max(content_range.start));
                     boundaries.push(region.full_range.end.min(content_range.end));
                 } else {
@@ -724,7 +723,7 @@ impl Line {
             let cursor_inside = self.cursor_offset >= region.full_range.start
                 && self.cursor_offset <= region.full_range.end;
 
-            if !show_all_markers && !cursor_inside {
+            if !cursor_inside {
                 let opening_start = region.full_range.start.max(content_range.start);
                 let opening_end = region.content_range.start.min(content_range.end);
                 if opening_end > opening_start {
@@ -738,7 +737,7 @@ impl Line {
                 }
             }
 
-            let style_range = if show_all_markers || cursor_inside {
+            let style_range = if cursor_inside {
                 region.full_range.clone()
             } else {
                 region.content_range.clone()
@@ -1110,7 +1109,14 @@ impl Line {
                 let cursor_height = cursor_font_size * 1.2;
                 let y_offset = (line_height - cursor_height) / 2.0;
                 let cursor_pos = point(pos.x, pos.y + y_offset);
-                let _ = shaped_cursor.paint(cursor_pos, cursor_height, window, cx);
+                let _ = shaped_cursor.paint(
+                    cursor_pos,
+                    cursor_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
             },
         )
         .absolute()
@@ -1174,7 +1180,14 @@ impl Line {
                 let cursor_height = cursor_font_size * 1.2;
                 let y_offset = (line_height - cursor_height) / 2.0;
                 let cursor_pos = point(bounds.origin.x + x_pos, bounds.origin.y + y_offset);
-                let _ = shaped_cursor.paint(cursor_pos, cursor_height, window, cx);
+                let _ = shaped_cursor.paint(
+                    cursor_pos,
+                    cursor_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
             },
         )
         .absolute()
@@ -1182,6 +1195,46 @@ impl Line {
         .left_0()
         .w(char_width * (char_offset as f32 + 2.0))
         .h(self.theme.line_height)
+    }
+
+    /// Attach the shared click/drag mouse handlers to a marker spacer element:
+    /// Click on mouse-down, Drag on a left-button drag, both targeting
+    /// `marker_start` and both gated on `input_blocked`. Kept in one place so
+    /// the blockquote / indent / list spacers can't drift apart (they did).
+    fn attach_spacer_handlers(&self, spacer: gpui::Div, marker_start: usize) -> gpui::Div {
+        let input_blocked = self.input_blocked;
+        spacer
+            .on_mouse_down(
+                MouseButton::Left,
+                move |event: &MouseDownEvent, window, cx| {
+                    if input_blocked {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    window.dispatch_action(
+                        Box::new(DispatchEditorAction(EditorAction::Click {
+                            offset: marker_start,
+                            shift: event.modifiers.shift,
+                            click_count: event.click_count,
+                        })),
+                        cx,
+                    );
+                },
+            )
+            .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+                if input_blocked {
+                    return;
+                }
+                if event.pressed_button == Some(MouseButton::Left) {
+                    cx.stop_propagation();
+                    window.dispatch_action(
+                        Box::new(DispatchEditorAction(EditorAction::Drag {
+                            offset: marker_start,
+                        })),
+                        cx,
+                    );
+                }
+            })
     }
 }
 
@@ -1295,7 +1348,15 @@ impl RenderOnce for Line {
             let mut line_wrapper = window
                 .text_system()
                 .line_wrapper(self.theme.text_font.clone(), font_size);
-            line_wrapper.truncate_line(display_text.into(), truncate_width, "…", &mut runs)
+            let (truncated, truncated_runs) = line_wrapper.truncate_line(
+                display_text.into(),
+                truncate_width,
+                "…",
+                &runs,
+                gpui::TruncateFrom::End,
+            );
+            runs = truncated_runs.into_owned();
+            truncated
         } else {
             display_text.into()
         };
@@ -1363,39 +1424,7 @@ impl RenderOnce for Line {
                     if cursor_in_this_marker {
                         spacer = spacer.child(self.render_spacer_cursor(cursor_char_offset));
                     }
-                    let marker_start = marker.range.start;
-                    spacer = spacer.on_mouse_down(
-                        MouseButton::Left,
-                        move |event: &MouseDownEvent, window, cx| {
-                            if input_blocked {
-                                return;
-                            }
-                            cx.stop_propagation();
-                            window.dispatch_action(
-                                Box::new(DispatchEditorAction(EditorAction::Click {
-                                    offset: marker_start,
-                                    shift: event.modifiers.shift,
-                                    click_count: event.click_count,
-                                })),
-                                cx,
-                            );
-                        },
-                    );
-                    let marker_start = marker.range.start;
-                    spacer = spacer.on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
-                        if input_blocked {
-                            return;
-                        }
-                        if event.pressed_button == Some(MouseButton::Left) {
-                            cx.stop_propagation();
-                            window.dispatch_action(
-                                Box::new(DispatchEditorAction(EditorAction::Drag {
-                                    offset: marker_start,
-                                })),
-                                cx,
-                            );
-                        }
-                    });
+                    spacer = self.attach_spacer_handlers(spacer, marker.range.start);
                     spacers.push(spacer);
                 }
                 MarkerKind::CodeBlockFence { .. } => {}
@@ -1465,33 +1494,7 @@ impl RenderOnce for Line {
                     if cursor_in_this_marker {
                         spacer = spacer.child(self.render_spacer_cursor(cursor_char_offset));
                     }
-                    let marker_start = marker.range.start;
-                    spacer = spacer.on_mouse_down(
-                        MouseButton::Left,
-                        move |event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            window.dispatch_action(
-                                Box::new(DispatchEditorAction(EditorAction::Click {
-                                    offset: marker_start,
-                                    shift: event.modifiers.shift,
-                                    click_count: event.click_count,
-                                })),
-                                cx,
-                            );
-                        },
-                    );
-                    let marker_start = marker.range.start;
-                    spacer = spacer.on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
-                        if event.pressed_button == Some(MouseButton::Left) {
-                            cx.stop_propagation();
-                            window.dispatch_action(
-                                Box::new(DispatchEditorAction(EditorAction::Drag {
-                                    offset: marker_start,
-                                })),
-                                cx,
-                            );
-                        }
-                    });
+                    spacer = self.attach_spacer_handlers(spacer, marker.range.start);
                     spacers.push(spacer);
                 }
                 MarkerKind::ListItem {
@@ -1530,35 +1533,7 @@ impl RenderOnce for Line {
                             marker_label.child(self.render_spacer_cursor(cursor_char_offset));
                     }
 
-                    let marker_start = marker.range.start;
-                    marker_label = marker_label.on_mouse_down(
-                        MouseButton::Left,
-                        move |event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            window.dispatch_action(
-                                Box::new(DispatchEditorAction(EditorAction::Click {
-                                    offset: marker_start,
-                                    shift: event.modifiers.shift,
-                                    click_count: event.click_count,
-                                })),
-                                cx,
-                            );
-                        },
-                    );
-                    let marker_start = marker.range.start;
-                    marker_label =
-                        marker_label.on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
-                            if event.pressed_button == Some(MouseButton::Left) {
-                                cx.stop_propagation();
-                                window.dispatch_action(
-                                    Box::new(DispatchEditorAction(EditorAction::Drag {
-                                        offset: marker_start,
-                                    })),
-                                    cx,
-                                );
-                            }
-                        });
-
+                    marker_label = self.attach_spacer_handlers(marker_label, marker.range.start);
                     spacers.push(marker_label);
                 }
                 MarkerKind::Checkbox { .. } => {
@@ -1604,37 +1579,33 @@ impl RenderOnce for Line {
             0
         };
 
-        let show_all_markers = false;
         let cursor_offset = self.cursor_offset;
-        let hidden_regions: Vec<(usize, usize, usize, usize)> = if show_all_markers {
-            Vec::new()
-        } else {
-            self.inline_styles
-                .iter()
-                .filter_map(|region| {
-                    let cursor_inside = cursor_offset >= region.full_range.start
-                        && cursor_offset <= region.full_range.end;
-                    if cursor_inside {
-                        None
-                    } else {
-                        let opening_start = region
-                            .full_range
-                            .start
-                            .max(content_range_for_handlers.start);
-                        let opening_end = region
-                            .content_range
-                            .start
-                            .min(content_range_for_handlers.end);
-                        let closing_start = region
-                            .content_range
-                            .end
-                            .max(content_range_for_handlers.start);
-                        let closing_end = region.full_range.end.min(content_range_for_handlers.end);
-                        Some((opening_start, opening_end, closing_start, closing_end))
-                    }
-                })
-                .collect()
-        };
+        let hidden_regions: Vec<(usize, usize, usize, usize)> = self
+            .inline_styles
+            .iter()
+            .filter_map(|region| {
+                let cursor_inside = cursor_offset >= region.full_range.start
+                    && cursor_offset <= region.full_range.end;
+                if cursor_inside {
+                    None
+                } else {
+                    let opening_start = region
+                        .full_range
+                        .start
+                        .max(content_range_for_handlers.start);
+                    let opening_end = region
+                        .content_range
+                        .start
+                        .min(content_range_for_handlers.end);
+                    let closing_start = region
+                        .content_range
+                        .end
+                        .max(content_range_for_handlers.start);
+                    let closing_end = region.full_range.end.min(content_range_for_handlers.end);
+                    Some((opening_start, opening_end, closing_start, closing_end))
+                }
+            })
+            .collect();
 
         let prefix_len = self.get_substitution().map(|s| s.len()).unwrap_or(0);
 

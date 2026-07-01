@@ -1,11 +1,10 @@
-//! Diff computation and state management for agent edits.
+//! Inline diff computation for the git HEAD-vs-working view.
 //!
-//! When an agent writes to a file, we:
-//! 1. Snapshot the current buffer state (via RenderSnapshot)
-//! 2. Apply the new content to the buffer
-//! 3. Compute line-level hunks between old and new
-//! 4. For replacement hunks, compute word-level changes for precise highlighting
-//! 5. Store DiffState for rendering ghost lines and accept/reject
+//! To render the diff, we:
+//! 1. Snapshot the HEAD version of the file (via RenderSnapshot) as the base
+//! 2. Compute line-level hunks between the HEAD base and the current buffer
+//! 3. For replacement hunks, compute word-level changes for precise highlighting
+//! 4. Store DiffState for rendering ghost (deleted) lines and highlighting additions
 
 use crate::buffer::RenderSnapshot;
 use imara_diff::{Algorithm, Diff, InternedInput};
@@ -55,103 +54,9 @@ impl DiffState {
         }
     }
 
-    /// Check if there are any pending hunks.
-    pub fn has_pending_hunks(&self) -> bool {
+    /// Check if there are any hunks (i.e. the buffer differs from the HEAD base).
+    pub fn has_hunks(&self) -> bool {
         !self.hunks.is_empty()
-    }
-
-    /// Accept a hunk by index. Since changes are already applied, just remove it.
-    pub fn accept_hunk(&mut self, index: usize) {
-        if index < self.hunks.len() {
-            self.hunks.remove(index);
-        }
-    }
-
-    /// Accept all pending hunks.
-    pub fn accept_all(&mut self) {
-        self.hunks.clear();
-    }
-
-    /// Get the old text content for a hunk from the snapshot.
-    /// Returns the text that was deleted (to be restored on reject).
-    pub fn old_text_for_hunk(&self, index: usize) -> Option<String> {
-        let hunk = self.hunks.get(index)?;
-        if hunk.old_lines.is_empty() {
-            return Some(String::new());
-        }
-
-        let rope = &self.old_snapshot.rope;
-        let start_line = hunk.old_lines.start;
-        let end_line = hunk.old_lines.end;
-
-        // Get byte range for the old lines
-        let start_byte = rope.line_to_byte(start_line);
-        let end_byte = if end_line >= rope.len_lines() {
-            rope.len_bytes()
-        } else {
-            rope.line_to_byte(end_line)
-        };
-
-        Some(
-            rope.slice(rope.byte_to_char(start_byte)..rope.byte_to_char(end_byte))
-                .to_string(),
-        )
-    }
-
-    /// Find the hunk index that contains the given line (in the new buffer).
-    /// Returns None if the line is not part of any hunk.
-    pub fn hunk_at_line(&self, new_line: usize) -> Option<usize> {
-        for (idx, hunk) in self.hunks.iter().enumerate() {
-            // Check if line is in the new_lines range (additions)
-            if hunk.new_lines.contains(&new_line) {
-                return Some(idx);
-            }
-            // Also check if cursor is at the start of a pure deletion
-            // (ghost lines appear before new_lines.start)
-            if hunk.new_lines.is_empty() && hunk.new_lines.start == new_line {
-                return Some(idx);
-            }
-        }
-        None
-    }
-
-    /// Reject a hunk by index.
-    /// Returns (old_text, new_line_range) - the old content to restore and where to put it.
-    /// After calling this, the caller should replace lines new_line_range with old_text,
-    /// then call `remove_hunk` to update the diff state.
-    pub fn reject_hunk_info(&self, index: usize) -> Option<(String, Range<usize>)> {
-        let hunk = self.hunks.get(index)?;
-        let old_text = self.old_text_for_hunk(index)?;
-        Some((old_text, hunk.new_lines.clone()))
-    }
-
-    /// Remove a hunk after it's been accepted or rejected.
-    /// Adjusts subsequent hunk line numbers based on the line delta.
-    pub fn remove_hunk(&mut self, index: usize, line_delta: isize) {
-        if index >= self.hunks.len() {
-            return;
-        }
-        self.hunks.remove(index);
-
-        // Adjust line numbers for subsequent hunks
-        if line_delta != 0 {
-            for hunk in &mut self.hunks[index..] {
-                if line_delta > 0 {
-                    hunk.new_lines.start += line_delta as usize;
-                    hunk.new_lines.end += line_delta as usize;
-                } else {
-                    let delta = (-line_delta) as usize;
-                    hunk.new_lines.start = hunk.new_lines.start.saturating_sub(delta);
-                    hunk.new_lines.end = hunk.new_lines.end.saturating_sub(delta);
-                }
-            }
-        }
-    }
-
-    /// Reject all pending hunks.
-    /// Returns the full old text to restore the entire document.
-    pub fn reject_all_text(&self) -> String {
-        self.old_snapshot.rope.to_string()
     }
 
     /// Get the old line range for a hunk if it should render ghost lines before this new line.

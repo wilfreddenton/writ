@@ -9,7 +9,7 @@
 //! - **Live inline rendering**: Markdown syntax is hidden when not editing
 //! - **Syntax highlighting**: Code blocks with tree-sitter based highlighting
 //! - **Smart continuation**: Shift+Enter continues lists, blockquotes, etc.
-//! - **Streaming support**: Append text programmatically for AI chat applications
+//! - **Inline git diff**: Renders the working file's diff against git HEAD
 //!
 //! # Quick Start
 //!
@@ -23,24 +23,9 @@
 //! let config = EditorConfig::default();
 //! let editor = cx.new(|cx| Editor::with_config("# Hello", config, cx));
 //! ```
-//!
-//! # Streaming
-//!
-//! For AI chat or other streaming use cases:
-//!
-//! ```ignore
-//! editor.update(cx, |e, cx| e.begin_streaming(cx));
-//! for token in stream {
-//!     editor.update(cx, |e, cx| e.append(&token, cx));
-//! }
-//! editor.update(cx, |e, cx| e.end_streaming(cx));
-//! ```
 
-pub use agent_view::{AgentView, SubmitPrompt, ToggleChatPanel};
 pub use editor::{Direction, Editor, EditorAction, EditorConfig, EditorTheme};
 
-pub mod acp;
-pub mod agent_view;
 pub mod buffer;
 pub mod config;
 pub mod cursor;

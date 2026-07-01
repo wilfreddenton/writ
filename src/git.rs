@@ -42,6 +42,23 @@ fn parse_github_url(url: &str) -> Option<GitHubContext> {
     None
 }
 
+/// Read the git HEAD version of the file at `path` as a UTF-8 string.
+///
+/// Used as the base for the inline diff view. Returns `None` when there's no
+/// repository, no HEAD commit, the file isn't tracked in HEAD (new file), or
+/// the blob isn't valid UTF-8 — in all of which cases there's no diff base.
+pub fn head_blob_text(path: &Path) -> Option<String> {
+    let abs = path.canonicalize().ok()?;
+    let repo = gix::discover(abs.parent()?).ok()?;
+    let workdir = repo.workdir()?.canonicalize().ok()?;
+    let rel = abs.strip_prefix(&workdir).ok()?;
+
+    let tree = repo.head_commit().ok()?.tree().ok()?;
+    let entry = tree.lookup_entry_by_path(rel).ok()??;
+    let blob = entry.object().ok()?;
+    String::from_utf8(blob.data.clone()).ok()
+}
+
 /// Parse a "owner/repo" string into GitHubContext.
 pub fn parse_github_repo_string(s: &str) -> Option<GitHubContext> {
     let (owner, repo) = s.split_once('/')?;
@@ -105,5 +122,23 @@ mod tests {
         let ctx = detect_github_context(std::path::Path::new(".")).unwrap();
         assert_eq!(ctx.owner, "wilfreddenton");
         assert_eq!(ctx.repo, "writ");
+    }
+}
+
+#[cfg(test)]
+mod head_blob_tests {
+    use super::*;
+
+    #[test]
+    fn head_blob_reads_tracked_file() {
+        // Cargo.toml is always committed and always contains the [package] table,
+        // regardless of uncommitted working-tree edits.
+        let text = head_blob_text(std::path::Path::new("Cargo.toml")).unwrap();
+        assert!(text.contains("[package]"));
+    }
+
+    #[test]
+    fn head_blob_none_for_missing() {
+        assert!(head_blob_text(std::path::Path::new("does/not/exist.md")).is_none());
     }
 }

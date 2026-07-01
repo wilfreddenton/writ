@@ -2,6 +2,27 @@ use std::ops::Range;
 
 use crate::buffer::Buffer;
 
+/// Compute the byte offset on `target_line` at the same character column as
+/// `offset` on `from_line`, clamped to the target line's length. Works in char
+/// units so the result always lands on a codepoint boundary — measuring the
+/// column in bytes would land mid-codepoint on lines containing multibyte text.
+fn same_column_offset(
+    buffer: &Buffer,
+    from_line: usize,
+    offset: usize,
+    target_line: usize,
+) -> usize {
+    let rope = buffer.rope();
+    let from_start = buffer.line_to_byte(from_line);
+    let column = rope.byte_to_char(offset) - rope.byte_to_char(from_start);
+
+    let target = buffer.line_byte_range(target_line);
+    let target_start_char = rope.byte_to_char(target.start);
+    let target_len_chars = rope.byte_to_char(target.end) - target_start_char;
+
+    rope.char_to_byte(target_start_char + column.min(target_len_chars))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Cursor {
     pub offset: usize,
@@ -19,12 +40,6 @@ impl Cursor {
     pub fn end(buffer: &Buffer) -> Self {
         Self {
             offset: buffer.len_bytes(),
-        }
-    }
-
-    pub fn clamp(&self, buffer: &Buffer) -> Self {
-        Self {
-            offset: self.offset.min(buffer.len_bytes()),
         }
     }
 
@@ -101,18 +116,8 @@ impl Cursor {
         if current_line == 0 {
             return Self::start();
         }
-
-        let target_line = current_line - 1;
-        let line_start = buffer.line_to_byte(current_line);
-        let column = self.offset - line_start;
-
-        let target_line_range = buffer.line_byte_range(target_line);
-        let target_line_start = target_line_range.start;
-        let target_line_len = target_line_range.len();
-
-        let new_column = column.min(target_line_len);
         Self {
-            offset: target_line_start + new_column,
+            offset: same_column_offset(buffer, current_line, self.offset, current_line - 1),
         }
     }
 
@@ -123,18 +128,8 @@ impl Cursor {
         if current_line >= line_count - 1 {
             return Self::end(buffer);
         }
-
-        let target_line = current_line + 1;
-        let line_start = buffer.line_to_byte(current_line);
-        let column = self.offset - line_start;
-
-        let target_line_range = buffer.line_byte_range(target_line);
-        let target_line_start = target_line_range.start;
-        let target_line_len = target_line_range.len();
-
-        let new_column = column.min(target_line_len);
         Self {
-            offset: target_line_start + new_column,
+            offset: same_column_offset(buffer, current_line, self.offset, current_line + 1),
         }
     }
 
@@ -173,13 +168,6 @@ impl Selection {
         Self { anchor, head }
     }
 
-    pub fn from_cursor(cursor: Cursor) -> Self {
-        Self {
-            anchor: cursor.offset,
-            head: cursor.offset,
-        }
-    }
-
     pub fn is_collapsed(&self) -> bool {
         self.anchor == self.head
     }
@@ -200,37 +188,6 @@ impl Selection {
         Self {
             anchor: self.anchor,
             head: new_head,
-        }
-    }
-
-    pub fn collapse(&self) -> Self {
-        Self {
-            anchor: self.head,
-            head: self.head,
-        }
-    }
-
-    pub fn collapse_to_start(&self) -> Self {
-        let start = self.range().start;
-        Self {
-            anchor: start,
-            head: start,
-        }
-    }
-
-    pub fn collapse_to_end(&self) -> Self {
-        let end = self.range().end;
-        Self {
-            anchor: end,
-            head: end,
-        }
-    }
-
-    pub fn clamp(&self, buffer: &Buffer) -> Self {
-        let len = buffer.len_bytes();
-        Self {
-            anchor: self.anchor.min(len),
-            head: self.head.min(len),
         }
     }
 
@@ -329,20 +286,38 @@ mod tests {
     }
 
     #[test]
-    fn test_selection_collapse() {
-        let sel = Selection::new(5, 10);
+    fn test_move_vertical_multibyte_lands_on_boundary() {
+        // Second line starts with a 2-byte char; a byte-column carry would land
+        // mid-codepoint (byte offset 6). All offsets must sit on char boundaries.
+        let buf: Buffer = "abcd\néfgh\nijkl".parse().unwrap();
+        let rope = buf.rope();
+        let on_boundary = |o: usize| rope.char_to_byte(rope.byte_to_char(o)) == o;
 
-        let collapsed = sel.collapse();
-        assert_eq!(collapsed.anchor, 10);
-        assert_eq!(collapsed.head, 10);
+        // From line 0 column 1 (byte 1, after 'a') moving down onto the "é" line.
+        // Column 1 on "éfgh" is just after "é" (2 bytes): byte offset 5 + 2 = 7.
+        let down = Cursor::new(1).move_down(&buf);
+        assert!(on_boundary(down.offset));
+        assert_eq!(down.offset, 7);
 
-        let to_start = sel.collapse_to_start();
-        assert_eq!(to_start.anchor, 5);
-        assert_eq!(to_start.head, 5);
+        // Moving back up preserves the char column (col 1 on "abcd").
+        let up = down.move_up(&buf);
+        assert!(on_boundary(up.offset));
+        assert_eq!(up.offset, 1);
 
-        let to_end = sel.collapse_to_end();
-        assert_eq!(to_end.anchor, 10);
-        assert_eq!(to_end.head, 10);
+        // `down` is at column 1 ("f"); moving down again lands on column 1 of
+        // "ijkl" = "j" at byte offset 12.
+        let down2 = down.move_down(&buf);
+        assert!(on_boundary(down2.offset));
+        assert_eq!(down2.offset, 12);
+    }
+
+    #[test]
+    fn test_move_vertical_clamps_to_shorter_line() {
+        // Moving onto a shorter line clamps to that line's end.
+        let buf: Buffer = "abcdef\nxy\nghijkl".parse().unwrap();
+        // Column 5 on line 0 → clamp to end of "xy" (line start 7 + 2 chars = 9).
+        let down = Cursor::new(5).move_down(&buf);
+        assert_eq!(down.offset, 9);
     }
 
     #[test]

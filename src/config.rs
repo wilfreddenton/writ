@@ -49,11 +49,6 @@ pub struct Config {
     /// If not specified, will try to detect from .git/config.
     #[arg(long, env = "WRIT_GITHUB_REPO")]
     pub github_repo: Option<String>,
-
-    /// Agent command to spawn for AI assistance (e.g., "claude").
-    /// When specified, enables the chat panel for agent interaction.
-    #[arg(long, env = "WRIT_AGENT")]
-    pub agent: Option<String>,
 }
 
 impl Global for Config {}

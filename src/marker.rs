@@ -277,38 +277,6 @@ impl LineMarkers {
         self.markers.iter().any(|m| m.kind.is_container())
     }
 
-    /// Returns true if this line has a list marker (ordered or unordered).
-    pub fn has_list_marker(&self) -> bool {
-        self.markers
-            .iter()
-            .any(|m| matches!(m.kind, MarkerKind::ListItem { .. }))
-    }
-
-    /// Returns the list marker kind if present (for comparing list types).
-    /// Returns a tuple of (is_ordered, has_checkbox) to distinguish list types.
-    pub fn list_marker_kind(&self) -> Option<(bool, bool)> {
-        let mut is_ordered = None;
-        let mut has_checkbox = false;
-        for m in &self.markers {
-            match &m.kind {
-                MarkerKind::ListItem { ordered, .. } => is_ordered = Some(*ordered),
-                MarkerKind::Checkbox { .. } => has_checkbox = true,
-                _ => {}
-            }
-        }
-        is_ordered.map(|ordered| (ordered, has_checkbox))
-    }
-
-    /// Returns the container markers (blockquotes, indents) without the list marker.
-    /// Used for comparing if two list items are in the same container context.
-    pub fn container_signature(&self) -> Vec<&MarkerKind> {
-        self.markers
-            .iter()
-            .filter(|m| matches!(m.kind, MarkerKind::BlockQuote | MarkerKind::Indent))
-            .map(|m| &m.kind)
-            .collect()
-    }
-
     /// Returns the checkbox state if this line has a checkbox marker.
     pub fn checkbox(&self) -> Option<bool> {
         for m in &self.markers {
@@ -362,67 +330,6 @@ impl LineMarkers {
                 .markers
                 .iter()
                 .any(|m| matches!(m.kind, MarkerKind::BlockQuote))
-    }
-
-    /// Returns the indent string if this line has exactly one Indent marker, empty otherwise.
-    pub fn indent_only_rope(&self, rope: &Rope) -> String {
-        if self.markers.len() == 1 && matches!(self.markers[0].kind, MarkerKind::Indent) {
-            rope_slice_cow(rope, self.markers[0].range.start, self.markers[0].range.end)
-                .into_owned()
-        } else {
-            String::new()
-        }
-    }
-
-    /// Returns continuation text excluding code fence markers.
-    /// Used when inside code blocks to preserve outer container markers (e.g., blockquotes).
-    /// Note: Uses static continuation strings, not actual buffer text.
-    pub fn continuation_without_fence(&self) -> String {
-        self.markers
-            .iter()
-            .rev()
-            .filter(|m| !matches!(m.kind, MarkerKind::CodeBlockFence { .. }))
-            .map(|m| m.kind.continuation())
-            .collect()
-    }
-
-    /// Returns continuation text excluding list markers.
-    /// Used for paragraph breaks within lists to preserve outer container markers (e.g., blockquotes)
-    /// without repeating the list marker on the empty line.
-    /// Extracts actual text from rope to preserve leading whitespace.
-    pub fn continuation_without_list_rope(&self, rope: &Rope) -> String {
-        self.markers
-            .iter()
-            .rev()
-            .filter(|m| {
-                !matches!(
-                    m.kind,
-                    MarkerKind::ListItem { .. } | MarkerKind::Checkbox { .. }
-                )
-            })
-            .map(|m| match &m.kind {
-                MarkerKind::Indent | MarkerKind::BlockQuote => {
-                    rope_slice_cow(rope, m.range.start, m.range.end).into_owned()
-                }
-                _ => m.kind.continuation().to_string(),
-            })
-            .collect()
-    }
-
-    /// Returns continuation text excluding list markers (static strings, no rope).
-    /// Used when rope is not available.
-    pub fn continuation_without_list(&self) -> String {
-        self.markers
-            .iter()
-            .rev()
-            .filter(|m| {
-                !matches!(
-                    m.kind,
-                    MarkerKind::ListItem { .. } | MarkerKind::Checkbox { .. } | MarkerKind::Indent
-                )
-            })
-            .map(|m| m.kind.continuation())
-            .collect()
     }
 
     /// Returns the indentation string for a nested paragraph under the current markers.

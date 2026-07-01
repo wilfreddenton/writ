@@ -41,6 +41,22 @@ fn compute_line_byte_range(rope: &Rope, line_idx: usize) -> Range<usize> {
     start_byte..adjusted_end
 }
 
+/// Compute `LineMarkers` for `line_idx` from parsed nodes and a rope. Shared by
+/// `RenderSnapshot` and `BufferContent`, which differ only in their rope field.
+fn line_markers_from(parsed: &ParsedNodes, rope: &Rope, line_idx: usize) -> LineMarkers {
+    let range = compute_line_byte_range(rope, line_idx);
+    let markers = markers_at_from_infos(&parsed.nodes, rope, range.start, range.end);
+    let in_checked_task = is_line_in_checked_task(&parsed.nodes, range.start);
+    let in_code_block = is_line_in_code_block(&parsed.nodes, range.start);
+    LineMarkers {
+        range,
+        line_number: line_idx,
+        markers,
+        in_checked_task,
+        in_code_block,
+    }
+}
+
 /// A snapshot of buffer data for rendering. All fields use Rc for O(1) cloning.
 /// LineMarkers are computed lazily per-line using the nodes cache.
 #[derive(Clone)]
@@ -66,17 +82,7 @@ impl RenderSnapshot {
 
     /// Compute LineMarkers for a specific line on demand. O(log n) binary search + marker extraction.
     pub fn line_markers(&self, line_idx: usize) -> LineMarkers {
-        let range = self.line_byte_range(line_idx);
-        let markers = markers_at_from_infos(&self.parsed.nodes, &self.rope, range.start, range.end);
-        let in_checked_task = is_line_in_checked_task(&self.parsed.nodes, range.start);
-        let in_code_block = is_line_in_code_block(&self.parsed.nodes, range.start);
-        LineMarkers {
-            range,
-            line_number: line_idx,
-            markers,
-            in_checked_task,
-            in_code_block,
-        }
+        line_markers_from(&self.parsed, &self.rope, line_idx)
     }
 
     /// Get inline styles for a specific line. O(log n) binary search.
@@ -488,17 +494,7 @@ impl BufferContent {
 
     /// Compute LineMarkers for a specific line on demand.
     pub fn line_markers(&self, line_idx: usize) -> LineMarkers {
-        let range = self.line_byte_range(line_idx);
-        let markers = markers_at_from_infos(&self.parsed.nodes, &self.text, range.start, range.end);
-        let in_checked_task = is_line_in_checked_task(&self.parsed.nodes, range.start);
-        let in_code_block = is_line_in_code_block(&self.parsed.nodes, range.start);
-        LineMarkers {
-            range,
-            line_number: line_idx,
-            markers,
-            in_checked_task,
-            in_code_block,
-        }
+        line_markers_from(&self.parsed, &self.text, line_idx)
     }
 
     /// Compute LineMarkers for all lines. Only available in tests.
@@ -524,15 +520,6 @@ impl BufferContent {
             parsed: Rc::clone(&self.parsed),
             line_count: self.text.len_lines(),
         }
-    }
-
-    /// Get inline styles that overlap with a byte range.
-    /// Uses binary search for efficient O(log n) lookup.
-    pub fn inline_styles_for_range(&self, range: &Range<usize>) -> Vec<StyledRegion> {
-        styles_in_range(&self.inline_styles, range)
-            .into_iter()
-            .cloned()
-            .collect()
     }
 
     pub fn byte_to_line(&self, byte_offset: usize) -> usize {
@@ -604,24 +591,6 @@ impl BufferContent {
             Some(s) => std::borrow::Cow::Borrowed(s),
             None => std::borrow::Cow::Owned(slice.to_string()),
         }
-    }
-
-    pub fn code_highlights_for_range(&mut self, range: Range<usize>) -> Vec<HighlightSpan> {
-        if !self.code_highlight_cache.valid {
-            self.rebuild_code_highlight_cache();
-        }
-
-        let mut result = Vec::new();
-        for (block_range, highlights) in self.code_highlight_cache.highlights.iter() {
-            if range.start < block_range.end && range.end > block_range.start {
-                for span in highlights {
-                    if span.range.start < range.end && span.range.end > range.start {
-                        result.push(span.clone());
-                    }
-                }
-            }
-        }
-        result
     }
 
     fn rebuild_code_highlight_cache(&mut self) {

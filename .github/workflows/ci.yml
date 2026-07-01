@@ -8,6 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # gpui is built from the zed git fork (huge). Trim CI compile time and the
+  # cached target size (GitHub's cache cap is 10 GB) so caching stays effective.
+  CARGO_PROFILE_DEV_DEBUG: "0" # no debuginfo: faster codegen, much smaller target
+  CARGO_INCREMENTAL: "0" # incremental only helps warm local trees, not CI
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true" # system git fetches the large zed repo faster
 
 jobs:
   check:
@@ -21,11 +26,14 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
+        with:
+          # Persist the (expensive) gpui-from-git build even if a later step fails.
+          cache-on-failure: "true"
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libxcb1-dev libxkbcommon-x11-dev
+          sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libxcb1-dev libxkbcommon-x11-dev libfontconfig1-dev
 
       - name: Check formatting
         run: cargo fmt --all -- --check
