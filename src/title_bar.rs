@@ -37,9 +37,8 @@ pub fn title_bar(theme: &EditorTheme, cx: &mut App) -> impl IntoElement {
     let file_name = file_info
         .path
         .file_name()
-        .expect("file name")
-        .display()
-        .to_string();
+        .map(|n| n.display().to_string())
+        .unwrap_or_else(|| "untitled".to_string());
     let title = if file_info.dirty {
         format!("* {}", file_name)
     } else {

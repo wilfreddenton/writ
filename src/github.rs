@@ -390,6 +390,9 @@ impl GitHubClient {
                 "[graphql] errors: {:?}",
                 result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
             );
+            // Treat a partially-failed query as a failure rather than acting on
+            // incomplete data (e.g. validating a ref against a truncated result).
+            return None;
         }
 
         result.data

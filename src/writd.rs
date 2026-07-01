@@ -35,8 +35,6 @@ struct ClientMessage {
     title: Option<String>,
     url: Option<String>,
     text: String,
-    #[allow(dead_code)]
-    selections: Option<Vec<Selection>>,
 }
 
 /// Extract owner/repo from a GitHub URL.
@@ -166,15 +164,6 @@ mod tests {
 #[derive(Serialize)]
 struct ServerMessage {
     text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    selections: Option<Vec<Selection>>,
-}
-
-/// Selection/cursor position (UTF-16 code units)
-#[derive(Deserialize, Serialize, Clone, Debug)]
-struct Selection {
-    start: usize,
-    end: usize,
 }
 
 #[tokio::main]
@@ -352,10 +341,7 @@ async fn handle_websocket(
             Some(content) = file_rx.recv() => {
                 if content != last_content {
                     last_content = content.clone();
-                    let msg = ServerMessage {
-                        text: content,
-                        selections: None,
-                    };
+                    let msg = ServerMessage { text: content };
                     let json = serde_json::to_string(&msg)?;
                     if write.send(Message::Text(json.into())).await.is_err() {
                         break;
@@ -384,10 +370,7 @@ async fn handle_websocket(
                 if let Ok(content) = std::fs::read_to_string(&temp_file)
                     && content != last_content
                 {
-                    let msg = ServerMessage {
-                        text: content,
-                        selections: None,
-                    };
+                    let msg = ServerMessage { text: content };
                     let json = serde_json::to_string(&msg)?;
                     let _ = write.send(Message::Text(json.into())).await;
                 }

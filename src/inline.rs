@@ -907,33 +907,25 @@ fn extract_image_region(node: &Node, rope: &Rope) -> Option<StyledRegion> {
 }
 
 /// Get inline styles that overlap with a byte range.
-/// Uses binary search for efficient lookup.
+///
+/// `styles` must be sorted by `full_range.start` (ascending).
 pub fn styles_in_range<'a>(
     styles: &'a [StyledRegion],
     range: &Range<usize>,
 ) -> Vec<&'a StyledRegion> {
-    if styles.is_empty() {
-        return Vec::new();
-    }
+    // Regions are sorted by start, so anything starting at/after `range.end`
+    // (and everything after it) cannot overlap.
+    let end_idx = styles.partition_point(|s| s.full_range.start < range.end);
 
-    // Binary search to find first style that might overlap
-    let start_idx = styles
-        .binary_search_by_key(&range.start, |s| s.full_range.start)
-        .unwrap_or_else(|idx| idx.saturating_sub(1));
-
-    let mut result = Vec::new();
-    for style in &styles[start_idx..] {
-        // Stop if we're past the range
-        if style.full_range.start >= range.end {
-            break;
-        }
-        // Include if overlapping
-        if style.full_range.end > range.start {
-            result.push(style);
-        }
-    }
-
-    result
+    // Among the remaining candidates, a region overlaps iff it ends past
+    // `range.start`. We must check all of them, not just the immediate
+    // predecessor: an enclosing region (e.g. bold spanning a nested link) can
+    // start several indices earlier while a closer nested region ends before
+    // `range.start`. Callers only query visible lines, so `end_idx` is bounded.
+    styles[..end_idx]
+        .iter()
+        .filter(|s| s.full_range.end > range.start)
+        .collect()
 }
 
 #[cfg(test)]
@@ -944,6 +936,43 @@ mod tests {
     fn get_styles(text: &str) -> Vec<StyledRegion> {
         let buf: Buffer = text.parse().unwrap();
         extract_all_inline_styles(buf.tree().unwrap(), buf.rope())
+    }
+
+    fn region(full: Range<usize>) -> StyledRegion {
+        StyledRegion {
+            content_range: full.clone(),
+            full_range: full,
+            style: TextStyle::default(),
+            link_url: None,
+            is_image: false,
+            checkbox: None,
+            display_text: None,
+        }
+    }
+
+    #[test]
+    fn test_styles_in_range_includes_enclosing_region() {
+        // Enclosing region A spans a nested region B; a third region C sits
+        // between B and the query point. Querying inside A but after B and C
+        // must still return A (the earlier "walk back one" approach dropped it).
+        let styles = vec![region(0..50), region(5..10), region(12..14)];
+        let hit = styles_in_range(&styles, &(15..16));
+        let ranges: Vec<_> = hit.iter().map(|s| s.full_range.clone()).collect();
+        assert_eq!(ranges, vec![0..50]);
+    }
+
+    #[test]
+    fn test_styles_in_range_nested_pair() {
+        let styles = vec![region(0..50), region(10..20)];
+        let hit = styles_in_range(&styles, &(15..16));
+        let ranges: Vec<_> = hit.iter().map(|s| s.full_range.clone()).collect();
+        assert_eq!(ranges, vec![0..50, 10..20]);
+    }
+
+    #[test]
+    fn test_styles_in_range_excludes_non_overlapping() {
+        let styles = vec![region(0..5), region(10..20)];
+        assert!(styles_in_range(&styles, &(6..9)).is_empty());
     }
 
     #[test]

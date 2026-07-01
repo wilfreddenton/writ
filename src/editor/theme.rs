@@ -1,6 +1,6 @@
 use gpui::{Global, Rgba, rgb};
 
-use crate::highlight::HIGHLIGHT_NAMES;
+use crate::highlight::Highlighter;
 
 // Platform-specific default fonts
 #[cfg(target_os = "windows")]
@@ -86,8 +86,7 @@ impl EditorTheme {
     }
 
     pub fn color_for_highlight(&self, highlight_id: usize) -> Rgba {
-        let capture = HIGHLIGHT_NAMES.get(highlight_id).copied().unwrap_or("");
-        self.color_for_capture(capture)
+        self.color_for_capture(Highlighter::capture_name(highlight_id))
     }
 }
 

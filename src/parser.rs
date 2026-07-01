@@ -1,134 +1,12 @@
 use std::collections::HashMap;
-use std::num::NonZeroU16;
 
-use tree_sitter::{InputEdit, Language, Node, Parser, Point, Range, Tree, TreeCursor};
+use tree_sitter::{InputEdit, Language, Node, Parser, Point, Range, Tree};
 use tree_sitter_md::{INLINE_LANGUAGE, LANGUAGE};
 
 pub struct MarkdownParser {
     parser: Parser,
     block_language: Language,
     inline_language: Language,
-}
-
-pub struct MarkdownCursor<'a> {
-    markdown_tree: &'a MarkdownTree,
-    block_cursor: TreeCursor<'a>,
-    inline_cursor: Option<TreeCursor<'a>>,
-}
-
-impl<'a> MarkdownCursor<'a> {
-    pub fn node(&self) -> Node<'a> {
-        match &self.inline_cursor {
-            Some(cursor) => cursor.node(),
-            None => self.block_cursor.node(),
-        }
-    }
-
-    pub fn is_inline(&self) -> bool {
-        self.inline_cursor.is_some()
-    }
-
-    pub fn field_id(&self) -> Option<NonZeroU16> {
-        match &self.inline_cursor {
-            Some(cursor) => cursor.field_id(),
-            None => self.block_cursor.field_id(),
-        }
-    }
-
-    pub fn field_name(&self) -> Option<&'static str> {
-        match &self.inline_cursor {
-            Some(cursor) => cursor.field_name(),
-            None => self.block_cursor.field_name(),
-        }
-    }
-
-    fn move_to_inline_tree(&mut self) -> bool {
-        let node = self.block_cursor.node();
-        match node.kind() {
-            "inline" | "pipe_table_cell" => {
-                if let Some(inline_tree) = self.markdown_tree.inline_tree(&node) {
-                    self.inline_cursor = Some(inline_tree.walk());
-                    return true;
-                }
-            }
-            _ => (),
-        }
-        false
-    }
-
-    fn move_to_block_tree(&mut self) {
-        self.inline_cursor = None;
-    }
-
-    pub fn goto_first_child(&mut self) -> bool {
-        match &mut self.inline_cursor {
-            Some(cursor) => cursor.goto_first_child(),
-            None => {
-                if self.move_to_inline_tree() {
-                    if !self.inline_cursor.as_mut().unwrap().goto_first_child() {
-                        self.move_to_block_tree();
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    self.block_cursor.goto_first_child()
-                }
-            }
-        }
-    }
-
-    pub fn goto_parent(&mut self) -> bool {
-        match &mut self.inline_cursor {
-            Some(inline_cursor) => {
-                inline_cursor.goto_parent();
-                if inline_cursor.node().parent().is_none() {
-                    self.move_to_block_tree();
-                }
-                true
-            }
-            None => self.block_cursor.goto_parent(),
-        }
-    }
-
-    pub fn goto_next_sibling(&mut self) -> bool {
-        match &mut self.inline_cursor {
-            Some(inline_cursor) => inline_cursor.goto_next_sibling(),
-            None => self.block_cursor.goto_next_sibling(),
-        }
-    }
-
-    pub fn goto_first_child_for_byte(&mut self, index: usize) -> Option<usize> {
-        match &mut self.inline_cursor {
-            Some(cursor) => cursor.goto_first_child_for_byte(index),
-            None => {
-                if self.move_to_inline_tree() {
-                    self.inline_cursor
-                        .as_mut()
-                        .unwrap()
-                        .goto_first_child_for_byte(index)
-                } else {
-                    self.block_cursor.goto_first_child_for_byte(index)
-                }
-            }
-        }
-    }
-
-    pub fn goto_first_child_for_point(&mut self, index: Point) -> Option<usize> {
-        match &mut self.inline_cursor {
-            Some(cursor) => cursor.goto_first_child_for_point(index),
-            None => {
-                if self.move_to_inline_tree() {
-                    self.inline_cursor
-                        .as_mut()
-                        .unwrap()
-                        .goto_first_child_for_point(index)
-                } else {
-                    self.block_cursor.goto_first_child_for_point(index)
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -157,14 +35,6 @@ impl MarkdownTree {
 
     pub fn inline_trees(&self) -> &[Tree] {
         &self.inline_trees
-    }
-
-    pub fn walk(&self) -> MarkdownCursor<'_> {
-        MarkdownCursor {
-            markdown_tree: self,
-            block_cursor: self.block_tree.walk(),
-            inline_cursor: None,
-        }
     }
 }
 
@@ -349,54 +219,6 @@ mod tests {
                 .kind(),
             "shortcut_link"
         );
-    }
-
-    #[test]
-    fn markdown_cursor() {
-        let code = "# title\n\nInline [content].\n";
-        let mut parser = MarkdownParser::default();
-        let tree = parser.parse(code.as_bytes(), None).unwrap();
-        let mut cursor = tree.walk();
-        assert_eq!(cursor.node().kind(), "document");
-        assert!(cursor.goto_first_child());
-        assert_eq!(cursor.node().kind(), "section");
-        assert!(cursor.goto_first_child());
-        assert_eq!(cursor.node().kind(), "atx_heading");
-        assert!(cursor.goto_next_sibling());
-        assert_eq!(cursor.node().kind(), "paragraph");
-        assert!(cursor.goto_first_child());
-        assert_eq!(cursor.node().kind(), "inline");
-        assert!(cursor.goto_first_child());
-        assert_eq!(cursor.node().kind(), "shortcut_link");
-        assert!(cursor.goto_parent());
-        assert!(cursor.goto_parent());
-        assert!(cursor.goto_parent());
-        assert!(cursor.goto_parent());
-        assert_eq!(cursor.node().kind(), "document");
-    }
-
-    #[test]
-    fn table() {
-        let code = "| foo |\n| --- |\n| *bar*|\n";
-        let mut parser = MarkdownParser::default();
-        let tree = parser.parse(code.as_bytes(), None).unwrap();
-        dbg!(&tree.inline_trees());
-        let mut cursor = tree.walk();
-
-        assert_eq!(cursor.node().kind(), "document");
-        assert!(cursor.goto_first_child());
-        assert_eq!(cursor.node().kind(), "section");
-        assert!(cursor.goto_first_child());
-        assert_eq!(cursor.node().kind(), "pipe_table");
-        assert!(cursor.goto_first_child());
-        assert!(cursor.goto_next_sibling());
-        assert!(cursor.goto_next_sibling());
-        assert_eq!(cursor.node().kind(), "pipe_table_row");
-        assert!(cursor.goto_first_child());
-        assert!(cursor.goto_next_sibling());
-        assert_eq!(cursor.node().kind(), "pipe_table_cell");
-        assert!(cursor.goto_first_child());
-        assert_eq!(cursor.node().kind(), "emphasis");
     }
 
     #[test]

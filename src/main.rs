@@ -7,7 +7,6 @@ use gpui::{
     Window, WindowBounds, WindowDecorations, WindowOptions, div, prelude::*, px,
 };
 use writ::{
-    agent_view::{AgentView, SubmitPrompt, ToggleChatPanel},
     buffer::Buffer,
     config::Config,
     demo::{DemoStep, DemoTiming, demo_script},
@@ -78,12 +77,12 @@ fn run_demo(editor: Entity<Editor>, cx: &mut gpui::App) {
 
 pub struct Root {
     focus_handle: FocusHandle,
-    agent_view: Entity<AgentView>,
+    document_editor: Entity<Editor>,
     theme: EditorTheme,
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         window_shadow(self.theme.clone()).child(
             div()
                 .id("root")
@@ -100,16 +99,11 @@ impl Render for Root {
                 .on_action(|Quit, _, cx| {
                     cx.quit();
                 })
-                .on_action(cx.listener(|this, _: &ToggleChatPanel, _window, cx| {
-                    this.agent_view.update(cx, |view, cx| {
-                        view.toggle_chat_panel(cx);
-                    });
-                }))
                 .flex()
                 .flex_col()
                 .size_full()
                 .overflow_hidden()
-                .child(self.agent_view.clone()),
+                .child(self.document_editor.clone()),
         )
     }
 }
@@ -155,12 +149,6 @@ fn main() {
             KeyBinding::new("ctrl-w", CloseWindow, None),
             KeyBinding::new("cmd-w", CloseWindow, None),
             KeyBinding::new("cmd-q", Quit, None),
-            // Toggle chat panel with Cmd+Shift+A (or Ctrl+Shift+A on Linux)
-            KeyBinding::new("cmd-shift-a", ToggleChatPanel, None),
-            KeyBinding::new("ctrl-shift-a", ToggleChatPanel, None),
-            // Submit prompt with Cmd+Enter (or Ctrl+Enter on Linux)
-            KeyBinding::new("cmd-enter", SubmitPrompt, None),
-            KeyBinding::new("ctrl-enter", SubmitPrompt, None),
         ]);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -198,27 +186,9 @@ fn main() {
                 // Extract config before borrowing cx mutably
                 let github_repo = cli_config.github_repo.clone();
                 let github_token = cli_config.github_token.clone();
-                let agent_command = cli_config.agent.clone();
 
-                // Create the agent view (contains document editor + chat panel)
-                let agent_view = cx.new(|cx| AgentView::new(&content, editor_config, cx));
-
-                // Connect to agent if specified
-                if let Some(agent_cmd) = agent_command {
-                    let cwd = file_path
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    eprintln!("[writ] Connecting to agent: {}", agent_cmd);
-                    agent_view.update(cx, |view, cx| {
-                        view.connect_agent(agent_cmd, cwd, cx);
-                        // Show the chat panel when agent is connected
-                        view.set_chat_panel_visible(true, cx);
-                    });
-                }
-
-                // Get the document editor from the agent view for configuration
-                let document_editor = agent_view.read(cx).document_editor().clone();
+                // Create the document editor
+                let document_editor = cx.new(|cx| Editor::with_config(&content, editor_config, cx));
 
                 // Set up GitHub context for autolink detection
                 // Priority: CLI arg/env var > auto-detect from .git/config
@@ -278,7 +248,7 @@ fn main() {
 
                     Root {
                         focus_handle: cx.focus_handle(),
-                        agent_view,
+                        document_editor,
                         theme,
                     }
                 })
