@@ -1,11 +1,13 @@
 //! winit + wgpu + Vello application shell — the gpui replacement (see MIGRATION-PLAN.md).
 //!
-//! Phase 0–4: a working editor — renders a full markdown document (variable-height
-//! lines, tree-sitter highlighting, browser-grade wrapping, cursor-aware marker
-//! hiding) via Vello, with typing/arrows/backspace/enter/tab, click-to-place and
-//! drag selection (Parley hit-testing through the segment map), caret + selection
-//! painting, scroll (wheel + scroll-to-cursor), and minimal IME commit. Inline git
-//! diff and chrome (status/title bar, overlays) land in later phases. Run with
+//! Phase 0–5: a working editor with inline git diff — renders a full markdown
+//! document (variable-height lines, tree-sitter highlighting, browser-grade
+//! wrapping, cursor-aware marker hiding) via Vello, with typing/arrows/backspace/
+//! enter/tab, click-to-place and drag selection (Parley hit-testing through the
+//! segment map), caret + selection painting, scroll (wheel + scroll-to-cursor),
+//! minimal IME commit, and inline diff vs HEAD (green added lines/words, red ghost
+//! deleted lines interleaved above). Chrome (status/title bar, overlays) lands in
+//! later phases. Run with
 //! `WGPU_BACKEND=vulkan cargo run --bin writ-next` on Asahi; set
 //! `WRIT_SHELL_SNAPSHOT=out.ppm` (+ optional `WRIT_SHELL_{W,H,SCROLL,CURSOR,SEL_A,SEL_B}`)
 //! to render one frame headlessly instead.
@@ -28,7 +30,7 @@ use winit::window::{Window, WindowId};
 use crate::core::Editor;
 use crate::doc_layout::DocLayout;
 use crate::editor::{Direction, EditorTheme};
-use crate::text_engine::{TextEngine, peniko_color, peniko_color_alpha};
+use crate::text_engine::{TextEngine, peniko_color};
 
 const PADDING: f32 = 24.0;
 const FONT_SIZE: f32 = 18.0;
@@ -429,12 +431,7 @@ impl ApplicationHandler for App {
                 let viewport_h = state.surface.config.height as f32;
                 if let Some(doc) = self.doc.as_ref() {
                     // Draw order (all before glyphs): diff row/word bg, then selection.
-                    doc.draw_added_backgrounds(
-                        &mut self.scene,
-                        viewport_h,
-                        peniko_color_alpha(self.theme.green, 0.05),
-                        peniko_color_alpha(self.theme.green, 0.25),
-                    );
+                    doc.draw_added_backgrounds(&mut self.scene, viewport_h);
                     if let Some(sel) = self.editor.selection_range() {
                         let color = peniko_color(self.theme.selection);
                         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
@@ -583,12 +580,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     let mut doc = rebuild_doc(&mut engine, &mut editor, &theme, width as f32, 1.0);
     doc.scroll_by(scroll_y, height as f32);
     let mut scene = Scene::new();
-    doc.draw_added_backgrounds(
-        &mut scene,
-        height as f32,
-        peniko_color_alpha(theme.green, 0.05),
-        peniko_color_alpha(theme.green, 0.25),
-    );
+    doc.draw_added_backgrounds(&mut scene, height as f32);
     if let Some(sel) = editor.selection_range() {
         let color = peniko_color(theme.selection);
         for (x0, y0, x1, y1) in doc.selection_rects(sel) {

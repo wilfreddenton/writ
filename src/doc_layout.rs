@@ -11,14 +11,15 @@ use std::ops::Range;
 
 use parley::{Affinity, Cursor, Selection};
 use vello::Scene;
-use vello::peniko::{Brush, Color};
+use vello::kurbo::{Affine, Rect};
+use vello::peniko::{Brush, Color, Fill};
 
 use crate::buffer::RenderSnapshot;
 use crate::diff::DiffState;
 use crate::editor::EditorTheme;
 use crate::render::build_line_render;
 use crate::segment_map::SegmentMap;
-use crate::text_engine::{TextEngine, peniko_color};
+use crate::text_engine::{TextEngine, peniko_color, peniko_color_alpha};
 
 /// A screen-space rectangle (device px), already offset by padding + scroll.
 pub type ScreenRect = (f64, f64, f64, f64);
@@ -29,6 +30,82 @@ struct LineDiff {
     is_addition: bool,
     /// Display byte ranges of word-level additions within the line.
     inline: Vec<Range<usize>>,
+}
+
+/// A deleted (ghost) line, rendered from the HEAD snapshot above the buffer line
+/// it was removed before. Inert: not in the hit-test/cursor index.
+struct Ghost {
+    layout: parley::Layout<Brush>,
+    height: f32,
+    /// Display byte ranges of word-level deletions within the ghost line.
+    inline: Vec<Range<usize>>,
+}
+
+/// The four translucent inline-diff colors, baked from the theme at build time.
+struct DiffColors {
+    added_bg: Color,
+    added_inline: Color,
+    deleted_bg: Color,
+    deleted_inline: Color,
+}
+
+/// Build the ghost (deleted) lines that render above buffer line `new_line`,
+/// laying out each from the HEAD snapshot. `usize::MAX` cursor keeps every marker
+/// hidden in ghosts (the cursor is never "on" a ghost line).
+#[allow(clippy::too_many_arguments)]
+fn build_ghosts_before(
+    engine: &mut TextEngine,
+    diff: Option<&DiffState>,
+    new_line: usize,
+    theme: &EditorTheme,
+    scale: f32,
+    base_font_size: f32,
+    line_height: f32,
+    max_advance: f32,
+    fg: Color,
+) -> Vec<Ghost> {
+    let Some(d) = diff else { return Vec::new() };
+    let Some(old_range) = d.ghost_lines_before(new_line) else {
+        return Vec::new();
+    };
+    let old = &d.old_snapshot;
+    let mut out = Vec::new();
+    for old_line in old_range {
+        if old_line >= old.line_count() {
+            break;
+        }
+        let lr = build_line_render(old, old_line, theme, base_font_size, usize::MAX);
+        let layout = engine.build_line(
+            &lr.text,
+            scale,
+            lr.font_size,
+            line_height,
+            fg,
+            Some(max_advance),
+            &lr.runs,
+        );
+        let line_start = old.line_markers(old_line).range.start;
+        let inline = d
+            .old_inline_changes(old_line)
+            .map(|changes| {
+                changes
+                    .iter()
+                    .filter_map(|c| {
+                        let dr = lr.map.buffer_range_to_display(
+                            line_start + c.range.start..line_start + c.range.end,
+                        );
+                        (!dr.is_empty()).then_some(dr)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(Ghost {
+            height: layout.height(),
+            layout,
+            inline,
+        });
+    }
+    out
 }
 
 /// Prefix-sum tops for `heights`: `out[0] = pad_top`, `out[i+1] = out[i] +
@@ -52,8 +129,14 @@ pub struct DocLayout {
     line_ranges: Vec<Range<usize>>,
     /// Per-line inline git-diff decorations, parallel to `layouts`.
     line_diffs: Vec<LineDiff>,
-    /// Top y of each line; length `layouts.len() + 1`. Device px.
+    /// Ghost (deleted) lines rendered *above* each real line, parallel to `layouts`.
+    ghosts: Vec<Vec<Ghost>>,
+    /// Total ghost-block height above each real line, parallel to `layouts`.
+    ghost_height: Vec<f32>,
+    /// Top y of each line's *ghost block*; the real line begins at
+    /// `tops[i] + ghost_height[i]`. Length `layouts.len() + 1`. Device px.
     tops: Vec<f32>,
+    diff_colors: DiffColors,
     pub scroll_y: f32,
     /// Surface width in device px (for full-width diff row backgrounds).
     width: f32,
@@ -87,8 +170,25 @@ impl DocLayout {
         let mut maps = Vec::with_capacity(n);
         let mut line_ranges = Vec::with_capacity(n);
         let mut line_diffs = Vec::with_capacity(n);
+        let mut ghosts = Vec::with_capacity(n);
+        let mut ghost_height = Vec::with_capacity(n);
+        // Each line's total height = its ghost block above + the real line.
         let mut heights = Vec::with_capacity(n);
         for i in 0..n {
+            // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
+            let line_ghosts = build_ghosts_before(
+                engine,
+                diff,
+                i,
+                theme,
+                scale,
+                base_font_size,
+                line_height,
+                max_advance,
+                fg,
+            );
+            let gh: f32 = line_ghosts.iter().map(|g| g.height).sum();
+
             let lr = build_line_render(snapshot, i, theme, base_font_size, cursor_offset);
             let layout = engine.build_line(
                 &lr.text,
@@ -125,17 +225,28 @@ impl DocLayout {
                 }
                 _ => LineDiff::default(),
             };
-            heights.push(layout.height());
+            heights.push(gh + layout.height());
             layouts.push(layout);
             maps.push(lr.map);
             line_ranges.push(range);
             line_diffs.push(line_diff);
+            ghosts.push(line_ghosts);
+            ghost_height.push(gh);
         }
+        let diff_colors = DiffColors {
+            added_bg: peniko_color_alpha(theme.green, 0.05),
+            added_inline: peniko_color_alpha(theme.green, 0.25),
+            deleted_bg: peniko_color_alpha(theme.red, 0.05),
+            deleted_inline: peniko_color_alpha(theme.red, 0.25),
+        };
         Self {
             layouts,
             maps,
             line_ranges,
             line_diffs,
+            ghosts,
+            ghost_height,
+            diff_colors,
             tops: compute_tops(&heights, pad_top * scale),
             scroll_y: 0.0,
             width: device_width,
@@ -162,6 +273,12 @@ impl DocLayout {
             .min(n - 1)
     }
 
+    /// Top y (device px, before scroll) of the *real* text of line `i` — i.e. below
+    /// any ghost (deleted) rows stacked above it.
+    fn real_top(&self, line: usize) -> f32 {
+        self.tops[line] + self.ghost_height[line]
+    }
+
     /// Screen-space caret rectangle for a buffer offset, or None if empty doc.
     /// `caret_width` is in device px.
     pub fn caret_rect(&self, buffer_off: usize, caret_width: f32) -> Option<ScreenRect> {
@@ -171,7 +288,7 @@ impl DocLayout {
         let cursor = Cursor::from_byte_index(layout, display_off, Affinity::Downstream);
         let bb = cursor.geometry(layout, caret_width);
         let dx = self.pad_x as f64;
-        let dy = (self.tops[line] - self.scroll_y) as f64;
+        let dy = (self.real_top(line) - self.scroll_y) as f64;
         Some((bb.x0 + dx, bb.y0 + dy, bb.x1 + dx, bb.y1 + dy))
     }
 
@@ -203,7 +320,7 @@ impl DocLayout {
                 Cursor::from_byte_index(layout, de, Affinity::Upstream),
             );
             let dx = self.pad_x as f64;
-            let dy = (self.tops[line] - self.scroll_y) as f64;
+            let dy = (self.real_top(line) - self.scroll_y) as f64;
             for (bb, _) in sel.geometry(layout) {
                 rects.push((bb.x0 + dx, bb.y0 + dy, bb.x1 + dx, bb.y1 + dy));
             }
@@ -212,6 +329,8 @@ impl DocLayout {
     }
 
     /// Map a screen point (device px) to a buffer offset via Parley hit-testing.
+    /// Points landing in a ghost (deleted) block are inert — they map to the start
+    /// of the real line the ghosts precede.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
         let n = self.layouts.len();
         if n == 0 {
@@ -222,14 +341,20 @@ impl DocLayout {
             .partition_point(|&t| t <= cy)
             .saturating_sub(1)
             .min(n - 1);
+        let real_top = self.real_top(line);
+        if cy < real_top {
+            // In the ghost block above the real line: inert.
+            return Some(self.line_ranges[line].start);
+        }
         let layout = &self.layouts[line];
         let lx = (x - self.pad_x).max(0.0);
-        let ly = (cy - self.tops[line]).max(0.0);
+        let ly = (cy - real_top).max(0.0);
         let display_off = Cursor::from_point(layout, lx, ly).index();
         Some(self.maps[line].display_to_buffer(display_off))
     }
 
     /// Scroll the minimum amount so the line containing `buffer_off` is visible.
+    /// Reveals the ghost block above too (so a hunk's deletions come into view).
     pub fn scroll_to(&mut self, buffer_off: usize, viewport_h: f32) {
         let line = self.line_of(buffer_off);
         let top = self.tops[line];
@@ -279,64 +404,93 @@ impl DocLayout {
         (first, last.max(first))
     }
 
-    /// Paint visible lines into `scene`, translated by scroll + padding.
+    /// Fill the word-change rects of `ranges` within `layout`, offset to `top_y`.
+    fn fill_word_ranges(
+        &self,
+        scene: &mut Scene,
+        layout: &parley::Layout<Brush>,
+        ranges: &[Range<usize>],
+        top_y: f64,
+        color: Color,
+    ) {
+        for r in ranges {
+            let sel = Selection::new(
+                Cursor::from_byte_index(layout, r.start, Affinity::Downstream),
+                Cursor::from_byte_index(layout, r.end, Affinity::Upstream),
+            );
+            for (bb, _) in sel.geometry(layout) {
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    color,
+                    None,
+                    &Rect::new(
+                        bb.x0 + self.pad_x as f64,
+                        bb.y0 + top_y,
+                        bb.x1 + self.pad_x as f64,
+                        bb.y1 + top_y,
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Paint visible lines: ghost (deleted) rows above each line, then real glyphs.
     pub fn draw(&self, engine: &TextEngine, scene: &mut Scene, viewport_h: f32) {
         let (first, last) = self.visible_range(viewport_h);
         for i in first..last {
-            let y = self.tops[i] - self.scroll_y;
-            engine.draw_line(scene, &self.layouts[i], (self.pad_x, y));
+            // Ghost (deleted) rows stacked in this line's ghost block.
+            let mut gy = self.tops[i] - self.scroll_y;
+            for ghost in &self.ghosts[i] {
+                let top = gy as f64;
+                let bottom = (gy + ghost.height) as f64;
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    self.diff_colors.deleted_bg,
+                    None,
+                    &Rect::new(0.0, top, self.width as f64, bottom),
+                );
+                self.fill_word_ranges(
+                    scene,
+                    &ghost.layout,
+                    &ghost.inline,
+                    top,
+                    self.diff_colors.deleted_inline,
+                );
+                engine.draw_line(scene, &ghost.layout, (self.pad_x, gy));
+                gy += ghost.height;
+            }
+            // The real line, below its ghost block.
+            engine.draw_line(scene, &self.layouts[i], (self.pad_x, gy));
         }
     }
 
     /// Paint inline-diff backgrounds for added lines (faint full-row bg + stronger
     /// word-change bg). Call BEFORE `draw` so glyphs sit on top.
-    pub fn draw_added_backgrounds(
-        &self,
-        scene: &mut Scene,
-        viewport_h: f32,
-        row_bg: Color,
-        inline_bg: Color,
-    ) {
-        use vello::kurbo::{Affine, Rect};
-        use vello::peniko::Fill;
-
+    pub fn draw_added_backgrounds(&self, scene: &mut Scene, viewport_h: f32) {
         let (first, last) = self.visible_range(viewport_h);
         for i in first..last {
             let d = &self.line_diffs[i];
             if !d.is_addition {
                 continue;
             }
-            let top = (self.tops[i] - self.scroll_y) as f64;
+            let top = (self.real_top(i) - self.scroll_y) as f64;
             let bottom = (self.tops[i + 1] - self.scroll_y) as f64;
             scene.fill(
                 Fill::NonZero,
                 Affine::IDENTITY,
-                row_bg,
+                self.diff_colors.added_bg,
                 None,
                 &Rect::new(0.0, top, self.width as f64, bottom),
             );
-            // Word-level additions, via the same per-visual-row geometry as selection.
-            let layout = &self.layouts[i];
-            for r in &d.inline {
-                let sel = Selection::new(
-                    Cursor::from_byte_index(layout, r.start, Affinity::Downstream),
-                    Cursor::from_byte_index(layout, r.end, Affinity::Upstream),
-                );
-                for (bb, _) in sel.geometry(layout) {
-                    scene.fill(
-                        Fill::NonZero,
-                        Affine::IDENTITY,
-                        inline_bg,
-                        None,
-                        &Rect::new(
-                            bb.x0 + self.pad_x as f64,
-                            bb.y0 + top,
-                            bb.x1 + self.pad_x as f64,
-                            bb.y1 + top,
-                        ),
-                    );
-                }
-            }
+            self.fill_word_ranges(
+                scene,
+                &self.layouts[i],
+                &d.inline,
+                top,
+                self.diff_colors.added_inline,
+            );
         }
     }
 }
@@ -370,6 +524,14 @@ mod tests {
                 .collect(),
             line_ranges: heights.iter().map(|_| 0..0).collect(),
             line_diffs: heights.iter().map(|_| LineDiff::default()).collect(),
+            ghosts: heights.iter().map(|_| Vec::new()).collect(),
+            ghost_height: heights.iter().map(|_| 0.0).collect(),
+            diff_colors: DiffColors {
+                added_bg: Color::TRANSPARENT,
+                added_inline: Color::TRANSPARENT,
+                deleted_bg: Color::TRANSPARENT,
+                deleted_inline: Color::TRANSPARENT,
+            },
             tops: compute_tops(heights, pad_top),
             scroll_y: 0.0,
             width: 100.0,
@@ -441,5 +603,46 @@ mod tests {
             let got = doc.hit_test(cx, cy).expect("hit test");
             assert_eq!(got, off, "offset {off} round-trip (got {got})");
         }
+    }
+
+    /// Ghost (deleted) rows offset the real line below them, and clicks in a ghost
+    /// block are inert. Locks the Phase 5b interleave math (the plan's defect surface).
+    #[test]
+    fn ghost_rows_offset_and_are_inert() {
+        use crate::buffer::Buffer;
+        use crate::diff::DiffState;
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let old_text = "line one\nline two\n";
+        let new_text = "line one changed here\nline two\n";
+        let mut base: Buffer = old_text.parse().unwrap();
+        let diff = DiffState::compute(base.render_snapshot(), old_text, new_text);
+        assert!(diff.has_hunks());
+
+        let mut buf: Buffer = new_text.parse().unwrap();
+        let snapshot = buf.render_snapshot();
+        let doc = DocLayout::build(
+            &mut engine,
+            &snapshot,
+            &theme,
+            Some(&diff),
+            usize::MAX,
+            1200.0,
+            1.0,
+            24.0,
+            24.0,
+            48.0,
+            18.0,
+            1.5,
+        );
+        // Line 0's changed version has a deleted ghost stacked above it.
+        assert!(doc.ghost_height[0] > 0.0, "expected a ghost above line 0");
+        // The real line begins below its ghost block, and the caret follows.
+        assert!(doc.real_top(0) > doc.tops[0]);
+        let (_, cy0, _, _) = doc.caret_rect(0, 2.0).unwrap();
+        assert!(cy0 as f32 >= doc.real_top(0) - 1.0);
+        // A click in the ghost block is inert → maps to the real line start (offset 0).
+        let ghost_mid = doc.tops[0] + doc.ghost_height[0] * 0.5;
+        assert_eq!(doc.hit_test(50.0, ghost_mid), Some(0));
     }
 }
