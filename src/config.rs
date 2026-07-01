@@ -2,7 +2,6 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use clap::Parser;
-use gpui::Global;
 
 /// Environment variable name for GitHub token (shared between clap and tests)
 pub const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
@@ -50,8 +49,6 @@ pub struct Config {
     #[arg(long, env = "WRIT_GITHUB_REPO")]
     pub github_repo: Option<String>,
 }
-
-impl Global for Config {}
 
 impl Config {
     pub fn validate(self) -> Result<Self> {

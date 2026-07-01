@@ -16,19 +16,14 @@ too_many_arguments = "allow"
 name = "writ"
 path = "src/lib.rs"
 
+# The editor: winit + wgpu + Vello + Parley shell (formerly the gpui app).
 [[bin]]
 name = "writ"
-path = "src/main.rs"
+path = "src/bin/writ_next.rs"
 
 [[bin]]
 name = "writd"
 path = "src/writd.rs"
-
-# New Linebender-stack shell, built additively during the migration. Grows into
-# the walking skeleton; at phase 7 it replaces the gpui `writ` bin above.
-[[bin]]
-name = "writ-next"
-path = "src/bin/writ_next.rs"
 
 [dependencies]
 anyhow = "1"
@@ -37,20 +32,13 @@ clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
 imara-diff = "0.2"
 gix = { version = "0.84", default-features = false, features = ["sha1"] }
-gpui = "0.2"
-# --- gpui-replacement migration (Linebender stack); see MIGRATION-PLAN.md ---
-# Additive during phases 0-6; gpui is removed in phase 7. `wgpu` is NOT a direct
-# dep — we use `vello::wgpu` so there is a single wgpu in the tree.
+# --- Linebender rendering stack (see MIGRATION-PLAN.md). `wgpu` is NOT a direct
+# dep — we use `vello::wgpu` so there is a single wgpu in the tree. ---
 parley = "0.11"
 vello = "0.9"
 winit = "0.30"
 fontique = { version = "0.11", features = ["fontconfig-dlopen"] }
 pollster = "0.4"
-# Provides `application()` = `Application::with_platform(current_platform(..))`,
-# which gpui core no longer exposes directly. Pinned to the same rev as the patch.
-# The wayland/x11 features gate the Linux windowing backends (gpui_linux); without
-# them the platform match falls through to unreachable!() at runtime.
-gpui_platform = { git = "https://github.com/wilfreddenton/zed", rev = "52726eee52e9cde291351464a6234eb088b4ce49", features = ["wayland", "x11"] }
 notify = "8.2"
 open = "5"
 regex = "1.12.2"
@@ -80,10 +68,3 @@ codegen-units = 16
 
 [dev-dependencies]
 rustls = { version = "0.23.36", features = ["ring"] }
-
-# Track the last stable Zed release (v1.8.2) for gpui, plus our orphaned-
-# punctuation line-wrapping fix. gpui's version is frozen at 0.2.2 both on
-# crates.io and in-tree, so this override satisfies the `gpui = "0.2"` requirement.
-# Branch writ-gpui-v1.8.2 = v1.8.2 + the fix; rev pinned for reproducibility.
-[patch.crates-io]
-gpui = { git = "https://github.com/wilfreddenton/zed", rev = "52726eee52e9cde291351464a6234eb088b4ce49" }

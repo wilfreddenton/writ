@@ -214,25 +214,16 @@ fn stroke_decoration(
     scene.stroke(&Stroke::new(width.into()), transform, brush, None, &line);
 }
 
-/// Convert a gpui `Rgba` (0..1 channels) into a Vello `peniko::Color`. Boundary
-/// shim while `EditorTheme` still holds gpui colors; removed when theme is deglued.
-pub fn peniko_color(c: gpui::Rgba) -> Color {
-    Color::from_rgba8(
-        (c.r * 255.0).round() as u8,
-        (c.g * 255.0).round() as u8,
-        (c.b * 255.0).round() as u8,
-        (c.a * 255.0).round() as u8,
-    )
+/// Identity pass-through (theme colors are already `peniko::Color`). Retained to
+/// avoid churning every `peniko_color(theme.x)` call site; can be inlined later.
+pub fn peniko_color(c: Color) -> Color {
+    c
 }
 
-/// A gpui `Rgba` at an explicit alpha (0..1) — for translucent diff backgrounds.
-pub fn peniko_color_alpha(c: gpui::Rgba, alpha: f32) -> Color {
-    Color::from_rgba8(
-        (c.r * 255.0).round() as u8,
-        (c.g * 255.0).round() as u8,
-        (c.b * 255.0).round() as u8,
-        (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
-    )
+/// A theme color at an explicit alpha (0..1) — for translucent diff backgrounds.
+pub fn peniko_color_alpha(c: Color, alpha: f32) -> Color {
+    let [r, g, b, _] = c.components;
+    Color::new([r, g, b, alpha.clamp(0.0, 1.0)])
 }
 
 #[cfg(test)]
