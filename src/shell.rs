@@ -1,38 +1,73 @@
 //! winit + wgpu + Vello application shell — the gpui replacement (see MIGRATION-PLAN.md).
 //!
-//! Phase 0–1: opens a resizable window and renders one syntax-highlighted,
-//! Chromium-wrapped markdown line via Vello on the GPU. Later phases layer full
-//! document rendering, input, diff, and chrome onto this skeleton. Run with
+//! Phase 0–3a: opens a resizable window and renders a full markdown document
+//! (variable-height lines, tree-sitter highlighting, browser-grade wrapping) via
+//! Vello on the GPU, with mouse-wheel scrolling and resize re-wrap. Markers are
+//! still shown; marker-hiding + the display↔buffer segment map, the cursor, and
+//! inline diff land in later phases. Run with
 //! `WGPU_BACKEND=vulkan cargo run --bin writ-next` on Asahi; set
-//! `WRIT_SHELL_SNAPSHOT=out.ppm` to render one frame headlessly instead.
+//! `WRIT_SHELL_SNAPSHOT=out.ppm` (+ optional `WRIT_SHELL_{W,H,SCROLL}`) to render
+//! one frame headlessly instead.
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use parley::Layout;
-use vello::peniko::Brush;
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
 use vello::wgpu::CurrentSurfaceTexture;
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
+use crate::core::Editor;
+use crate::doc_layout::DocLayout;
 use crate::editor::EditorTheme;
-use crate::text_engine::{StyleRun, TextEngine, peniko_color};
+use crate::text_engine::{TextEngine, peniko_color};
 
 const PADDING: f32 = 24.0;
 const FONT_SIZE: f32 = 18.0;
 const LINE_HEIGHT: f32 = 1.5;
+/// Device px scrolled per mouse-wheel line notch.
+const WHEEL_LINE_STEP: f32 = 48.0;
+
+/// Sample document shown until the shell loads real files (Phase 4+ wires input).
+const SAMPLE_DOC: &str = "\
+# writ on Vello
+
+The editor now renders a **whole document** through Parley and Vello, laid out
+line by line with browser-grade wrapping so a closing paren never gets orphaned
+onto the next line (see: writ). Headings are larger, giving *variable* line
+heights that the prefix-sum viewport stacks correctly.
+
+## Scrolling
+
+This paragraph exists to push content past the bottom of the window so the
+mouse wheel has something to do. Resize the window and the prose re-wraps to the
+new width, exactly like a browser would reflow it.
+
+```rust
+fn main() {
+    let editor = Editor::new(\"# hello\");
+    println!(\"{}\", editor.text());
+}
+```
+
+- a bulleted list item
+- another item with `inline code`
+- a third, slightly longer item so it wraps around when the window is narrow
+
+### Still to come
+
+Marker hiding (the real segment map), the cursor, selection, and inline git diff
+land in the next phases. For now this proves the render + scroll skeleton.
+";
 
 struct ActiveSurface {
     surface: RenderSurface<'static>,
     window: Arc<Window>,
     scale: f32,
-    /// The Phase 1 demo line, laid out to the current width. Rebuilt on resize.
-    line: Option<Layout<Brush>>,
 }
 
 struct App {
@@ -43,6 +78,8 @@ struct App {
     scene: Scene,
     text_engine: TextEngine,
     theme: EditorTheme,
+    editor: Editor,
+    doc: Option<DocLayout>,
 }
 
 impl App {
@@ -54,62 +91,33 @@ impl App {
             scene: Scene::new(),
             text_engine: TextEngine::new(),
             theme: EditorTheme::dracula(),
+            editor: Editor::new(SAMPLE_DOC),
+            doc: None,
         }
     }
 }
 
-/// Build the Phase 1 hard-coded, syntax-highlighted markdown line, wrapped to
-/// `device_width`. Stand-in for the real per-line pipeline (Phases 3+). Free
-/// function (not a method) so it borrows only `engine`+`theme`, leaving the
-/// caller free to keep its `&mut self.state` surface borrow alive.
-fn build_demo_line(
+/// Lay out the whole document at `device_width`. Free function so it borrows only
+/// the fields it needs, leaving the caller's `&mut self.state` borrow intact.
+fn rebuild_doc(
     engine: &mut TextEngine,
+    editor: &mut Editor,
     theme: &EditorTheme,
     device_width: f32,
     scale: f32,
-) -> Layout<Brush> {
-    let fg = peniko_color(theme.foreground);
-    let text = "Heading — the quick (brown) fox jumps over `lazy_dog()`, \
-                renders **bold** and *italic* prose, and wraps like a browser; \
-                e.g. it will not orphan a closing paren [see: writ].";
-
-    // Hand-built highlight spans (a real markdown+tree-sitter pass replaces this).
-    let mut runs = Vec::new();
-    let mut style = |needle: &str, f: &dyn Fn(&mut StyleRun)| {
-        if let Some(start) = text.find(needle) {
-            let mut run = StyleRun::new(start..start + needle.len(), fg);
-            f(&mut run);
-            runs.push(run);
-        }
-    };
-    style("Heading", &|r| r.color = peniko_color(theme.purple));
-    style("(brown)", &|r| r.color = peniko_color(theme.orange));
-    style("lazy_dog()", &|r| {
-        r.mono = true;
-        r.color = peniko_color(theme.green);
-    });
-    style("**bold**", &|r| {
-        r.bold = true;
-        r.color = peniko_color(theme.pink);
-    });
-    style("*italic*", &|r| {
-        r.italic = true;
-        r.color = peniko_color(theme.cyan);
-    });
-    style("[see: writ]", &|r| {
-        r.underline = true;
-        r.color = peniko_color(theme.yellow);
-    });
-
-    let max_advance = (device_width - 2.0 * PADDING * scale).max(1.0);
-    engine.build_line(
-        text,
+) -> DocLayout {
+    let snapshot = editor.state.buffer.render_snapshot();
+    DocLayout::build(
+        engine,
+        &snapshot,
+        theme,
+        device_width,
         scale,
+        PADDING,
+        PADDING,
+        PADDING * 2.0,
         FONT_SIZE,
         LINE_HEIGHT,
-        fg,
-        Some(max_advance),
-        &runs,
     )
 }
 
@@ -149,12 +157,18 @@ impl ApplicationHandler for App {
         );
 
         let scale = window.scale_factor() as f32;
-        let line = build_demo_line(&mut self.text_engine, &self.theme, size.width as f32, scale);
+        let doc = rebuild_doc(
+            &mut self.text_engine,
+            &mut self.editor,
+            &self.theme,
+            size.width as f32,
+            scale,
+        );
+        self.doc = Some(doc);
         self.state = Some(ActiveSurface {
             surface,
             window,
             scale,
-            line: Some(line),
         });
     }
 
@@ -170,27 +184,37 @@ impl ApplicationHandler for App {
                     size.width.max(1),
                     size.height.max(1),
                 );
-                let line = build_demo_line(
+                let doc = rebuild_doc(
                     &mut self.text_engine,
+                    &mut self.editor,
                     &self.theme,
                     size.width as f32,
                     state.scale,
                 );
-                state.line = Some(line);
+                self.doc = Some(doc);
                 state.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 state.scale = scale_factor as f32;
                 state.window.request_redraw();
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -y * WHEEL_LINE_STEP * state.scale,
+                    MouseScrollDelta::PixelDelta(p) => -p.y as f32,
+                };
+                if let Some(doc) = self.doc.as_mut() {
+                    let viewport_h = state.surface.config.height as f32;
+                    doc.scroll_by(dy, viewport_h);
+                    state.window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 self.scene.reset();
 
-                // Paint the demo line at (PADDING, PADDING) in device px.
-                if let Some(line) = state.line.as_ref() {
-                    let pad = PADDING * state.scale;
-                    self.text_engine
-                        .draw_line(&mut self.scene, line, (pad, pad));
+                if let Some(doc) = self.doc.as_ref() {
+                    let viewport_h = state.surface.config.height as f32;
+                    doc.draw(&self.text_engine, &mut self.scene, viewport_h);
                 }
 
                 let dev = &self.context.devices[state.surface.dev_id];
@@ -259,7 +283,16 @@ pub fn run() -> Result<()> {
     // Headless golden-image path: render one frame to a PNG and exit. Used to
     // verify the render offscreen (no compositor screenshot needed).
     if let Ok(path) = std::env::var("WRIT_SHELL_SNAPSHOT") {
-        return snapshot(&path, 1000, 400);
+        let env_f32 = |k: &str, d: f32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let w = env_f32("WRIT_SHELL_W", 1000.0) as u32;
+        let h = env_f32("WRIT_SHELL_H", 400.0) as u32;
+        let scroll = env_f32("WRIT_SHELL_SCROLL", 0.0);
+        return snapshot(&path, w, h, scroll);
     }
 
     let event_loop = EventLoop::new()?;
@@ -268,10 +301,10 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Render a single frame of the demo line to an offscreen texture and write it to
+/// Render a single frame of the document to an offscreen texture and write it to
 /// `path` as a PNG. Independent of any surface/window, so it runs headlessly and
 /// doubles as a golden-image harness for later phases.
-pub fn snapshot(path: &str, width: u32, height: u32) -> Result<()> {
+pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()> {
     use vello::wgpu::{
         BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d, MapMode, Origin3d,
         PollType, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
@@ -286,9 +319,11 @@ pub fn snapshot(path: &str, width: u32, height: u32) -> Result<()> {
 
     let mut engine = TextEngine::new();
     let theme = EditorTheme::dracula();
-    let line = build_demo_line(&mut engine, &theme, width as f32, 1.0);
+    let mut editor = Editor::new(SAMPLE_DOC);
+    let mut doc = rebuild_doc(&mut engine, &mut editor, &theme, width as f32, 1.0);
+    doc.scroll_by(scroll_y, height as f32);
     let mut scene = Scene::new();
-    engine.draw_line(&mut scene, &line, (PADDING, PADDING));
+    doc.draw(&engine, &mut scene, height as f32);
 
     let target = device.create_texture(&TextureDescriptor {
         label: Some("snapshot_target"),
