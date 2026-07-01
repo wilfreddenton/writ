@@ -21,10 +21,51 @@ use crate::cursor::Selection;
 use crate::diff::DiffState;
 use crate::editor::{Direction, EditorState};
 use crate::git::head_blob_text;
-use crate::github::{GitHubClient, GitHubValidationCache};
+use crate::github::{GitHubClient, GitHubValidationCache, IssueStatus};
 use crate::inline::{
-    GitHubContext, NakedUrl, RawGitHubMatch, detect_github_references_in_line, detect_naked_urls,
+    GitHubContext, GitHubRef, NakedUrl, RawGitHubMatch, detect_github_references_in_line,
+    detect_naked_urls,
 };
+
+/// The kind of autocomplete triggered at the cursor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AutocompleteTrigger {
+    /// Issue/PR autocomplete triggered by `#`.
+    Issue,
+    /// User autocomplete triggered by `@`.
+    User,
+}
+
+/// A single suggestion row. Built on the main thread from fetched GitHub data.
+#[derive(Clone)]
+pub enum AutocompleteSuggestion {
+    IssueOrPr {
+        number: u64,
+        /// Unicode symbol (● issue, ⎇ PR).
+        symbol: String,
+        status: IssueStatus,
+        title: String,
+    },
+    User {
+        login: String,
+        name: Option<String>,
+    },
+}
+
+/// State for the autocomplete popup while the cursor is inside a `#`/`@` token.
+#[derive(Clone)]
+pub struct AutocompleteState {
+    pub trigger: AutocompleteTrigger,
+    /// Byte offset of the trigger char (`#`/`@`) — replacement starts here.
+    pub trigger_offset: usize,
+    /// The text typed after the trigger (e.g. "123" for `#123`).
+    pub prefix: String,
+    pub suggestions: Vec<AutocompleteSuggestion>,
+    pub selected_index: usize,
+    pub loading: bool,
+    /// The prefix we last kicked off a fetch for (dedup).
+    pub fetched_prefix: Option<String>,
+}
 
 pub struct Editor {
     pub state: EditorState,
@@ -39,6 +80,8 @@ pub struct Editor {
     github_validation_cache: GitHubValidationCache,
     naked_urls_by_line: HashMap<usize, Vec<NakedUrl>>,
     github_refs_by_line: HashMap<usize, Vec<RawGitHubMatch>>,
+    /// Active `#`/`@` autocomplete popup, if the cursor is inside a trigger token.
+    autocomplete: Option<AutocompleteState>,
 
     // --- inline git diff against HEAD ---
     /// (raw HEAD text, rendered snapshot of it) reused as the diff base.
@@ -63,6 +106,7 @@ impl Editor {
             github_validation_cache: GitHubValidationCache::new(),
             naked_urls_by_line: HashMap::new(),
             github_refs_by_line: HashMap::new(),
+            autocomplete: None,
             head_base: None,
             diff_state: None,
             file_watcher: None,
@@ -331,6 +375,232 @@ impl Editor {
         self.naked_urls_by_line = urls;
     }
 
+    // --- GitHub autocomplete (#/@) ------------------------------------------
+
+    pub fn autocomplete(&self) -> Option<&AutocompleteState> {
+        self.autocomplete.as_ref()
+    }
+
+    pub fn close_autocomplete(&mut self) {
+        self.autocomplete = None;
+    }
+
+    /// Move the selection up/down (wrapping). No-op if no popup / no suggestions.
+    pub fn autocomplete_move(&mut self, forward: bool) {
+        if let Some(ac) = &mut self.autocomplete
+            && !ac.suggestions.is_empty()
+        {
+            let n = ac.suggestions.len();
+            ac.selected_index = if forward {
+                (ac.selected_index + 1) % n
+            } else {
+                (ac.selected_index + n - 1) % n
+            };
+        }
+    }
+
+    /// Set the selected suggestion index directly (mouse hover/click).
+    pub fn autocomplete_select(&mut self, index: usize) {
+        if let Some(ac) = &mut self.autocomplete
+            && index < ac.suggestions.len()
+        {
+            ac.selected_index = index;
+        }
+    }
+
+    /// Re-evaluate the popup against the current cursor. Returns true when the shell
+    /// should (re)fetch suggestions for the new trigger/prefix.
+    pub fn update_autocomplete_from_cursor(&mut self) -> bool {
+        if self.github_context.is_none() || self.github_client.is_none() {
+            self.autocomplete = None;
+            return false;
+        }
+
+        let cursor = self.state.cursor().offset;
+        let cursor_line = self.state.buffer.byte_to_line(cursor);
+
+        // Cursor inside an already-detected issue ref → offer that ref's number.
+        if let Some(refs) = self.github_refs_by_line.get(&cursor_line) {
+            for github_match in refs {
+                if cursor >= github_match.byte_range.start
+                    && cursor <= github_match.byte_range.end
+                    && let GitHubRef::Issue { number, .. } = &github_match.reference
+                {
+                    let prefix = number.to_string();
+                    let trigger_offset = github_match.byte_range.start;
+                    return self.set_autocomplete_state(
+                        AutocompleteTrigger::Issue,
+                        trigger_offset,
+                        prefix,
+                    );
+                }
+            }
+        }
+
+        // Otherwise scan back from the cursor for a `#`/`@` trigger.
+        if cursor > 0 {
+            let line_start = self.state.buffer.line_to_byte(cursor_line);
+            let line_text = self.state.buffer.slice_cow(line_start..cursor).into_owned();
+            if let Some((trigger, trigger_offset, prefix)) =
+                Self::detect_autocomplete_trigger(&line_text, line_start)
+            {
+                return self.set_autocomplete_state(trigger, trigger_offset, prefix);
+            }
+        }
+
+        self.autocomplete = None;
+        false
+    }
+
+    /// Scan `line_text` (from line start up to the cursor) for the rightmost valid
+    /// `#`/`@` trigger, returning its type, absolute offset, and typed prefix.
+    fn detect_autocomplete_trigger(
+        line_text: &str,
+        line_start: usize,
+    ) -> Option<(AutocompleteTrigger, usize, String)> {
+        let triggers = [
+            ('#', AutocompleteTrigger::Issue),
+            ('@', AutocompleteTrigger::User),
+        ];
+        let mut best: Option<(AutocompleteTrigger, usize, String)> = None;
+
+        for (trigger_char, trigger_type) in triggers {
+            let Some(pos) = line_text.rfind(trigger_char) else {
+                continue;
+            };
+            let at_boundary = pos == 0
+                || line_text
+                    .as_bytes()
+                    .get(pos - 1)
+                    .is_none_or(|&b| b == b' ' || b == b'\t' || b == b'\n');
+            if !at_boundary {
+                continue;
+            }
+            let prefix = line_text[pos + 1..].to_string();
+            let valid = match trigger_type {
+                // `# ` is a heading, not an issue ref.
+                AutocompleteTrigger::Issue => !prefix.starts_with([' ', '\t']),
+                AutocompleteTrigger::User => {
+                    prefix.is_empty()
+                        || (prefix.chars().all(|c| c.is_alphanumeric() || c == '-')
+                            && !prefix.starts_with('-'))
+                }
+            };
+            if !valid {
+                continue;
+            }
+            let trigger_offset = line_start + pos;
+            if best.as_ref().is_none_or(|(_, off, _)| trigger_offset > *off) {
+                best = Some((trigger_type, trigger_offset, prefix));
+            }
+        }
+        best
+    }
+
+    /// Update the popup for a detected trigger, preserving suggestions/selection when
+    /// only the prefix grew within the same trigger. Returns true if a fetch is needed.
+    fn set_autocomplete_state(
+        &mut self,
+        trigger: AutocompleteTrigger,
+        trigger_offset: usize,
+        prefix: String,
+    ) -> bool {
+        let changed = self
+            .autocomplete
+            .as_ref()
+            .map(|ac| ac.trigger != trigger || ac.prefix != prefix)
+            .unwrap_or(true);
+        if !changed {
+            return false;
+        }
+
+        let old = self.autocomplete.take();
+        let same_trigger = old.as_ref().map(|ac| ac.trigger == trigger).unwrap_or(false);
+        let should_fetch = match trigger {
+            AutocompleteTrigger::Issue => {
+                let already = old
+                    .as_ref()
+                    .filter(|_| same_trigger)
+                    .and_then(|ac| ac.fetched_prefix.as_ref())
+                    == Some(&prefix);
+                !already
+            }
+            AutocompleteTrigger::User => true,
+        };
+
+        self.autocomplete = Some(AutocompleteState {
+            trigger,
+            trigger_offset,
+            prefix,
+            suggestions: old
+                .as_ref()
+                .filter(|_| same_trigger)
+                .map(|ac| ac.suggestions.clone())
+                .unwrap_or_default(),
+            selected_index: old
+                .as_ref()
+                .filter(|_| same_trigger)
+                .map(|ac| ac.selected_index)
+                .unwrap_or(0),
+            loading: false,
+            fetched_prefix: old
+                .filter(|_| same_trigger)
+                .and_then(|ac| ac.fetched_prefix),
+        });
+        should_fetch
+    }
+
+    /// Mark the popup loading and return the (trigger, prefix) the shell should fetch.
+    pub fn begin_autocomplete_fetch(&mut self) -> Option<(AutocompleteTrigger, String)> {
+        let ac = self.autocomplete.as_mut()?;
+        ac.loading = true;
+        ac.fetched_prefix = Some(ac.prefix.clone());
+        Some((ac.trigger, ac.prefix.clone()))
+    }
+
+    /// Install fetched suggestions if the popup is still on the same trigger+prefix.
+    pub fn apply_autocomplete_suggestions(
+        &mut self,
+        trigger: AutocompleteTrigger,
+        prefix: &str,
+        suggestions: Vec<AutocompleteSuggestion>,
+    ) {
+        if let Some(ac) = &mut self.autocomplete
+            && ac.trigger == trigger
+            && ac.prefix == prefix
+        {
+            ac.suggestions = suggestions;
+            ac.loading = false;
+            ac.selected_index = 0;
+        }
+    }
+
+    /// Replace the trigger token (`#…`/`@…`) with the selected suggestion. Returns
+    /// true if a suggestion was accepted (buffer changed), closing the popup.
+    pub fn accept_autocomplete_suggestion(&mut self) -> bool {
+        let Some(ac) = self.autocomplete.take() else {
+            return false;
+        };
+        if ac.suggestions.is_empty() {
+            return false;
+        }
+        let replacement = match &ac.suggestions[ac.selected_index] {
+            AutocompleteSuggestion::IssueOrPr { number, .. } => format!("#{number}"),
+            AutocompleteSuggestion::User { login, .. } => format!("@{login}"),
+        };
+        let cursor = self.state.cursor().offset;
+        self.state
+            .buffer
+            .delete(ac.trigger_offset..cursor, cursor);
+        self.state
+            .buffer
+            .insert(ac.trigger_offset, &replacement, ac.trigger_offset);
+        let new_pos = ac.trigger_offset + replacement.len();
+        self.state.selection = Selection::new(new_pos, new_pos);
+        self.recompute_diff();
+        true
+    }
+
     // --- inline git diff ----------------------------------------------------
 
     pub fn diff_state(&self) -> Option<&DiffState> {
@@ -499,6 +769,72 @@ mod tests {
         // Reverting to match HEAD clears the diff.
         editor.set_text("line1\n");
         assert!(editor.diff_state().is_none(), "matching HEAD => no hunks");
+    }
+
+    fn ctx() -> GitHubContext {
+        GitHubContext {
+            owner: "rust-lang".into(),
+            repo: "rust".into(),
+        }
+    }
+
+    fn issue_suggestion(number: u64, title: &str) -> AutocompleteSuggestion {
+        AutocompleteSuggestion::IssueOrPr {
+            number,
+            symbol: "●".into(),
+            status: IssueStatus::Open,
+            title: title.into(),
+        }
+    }
+
+    #[test]
+    fn autocomplete_issue_trigger_and_accept() {
+        let mut editor = Editor::new("Working on #12\n");
+        editor.set_github_context(ctx());
+        editor.set_github_client(GitHubClient::new("dummy".into()));
+        editor.refresh_detection();
+        editor.set_cursor(14); // end of "#12"
+
+        // Cursor inside the detected issue ref opens Issue autocomplete for "12".
+        assert!(editor.update_autocomplete_from_cursor());
+        let ac = editor.autocomplete().expect("popup open");
+        assert_eq!(ac.trigger, AutocompleteTrigger::Issue);
+        assert_eq!(ac.prefix, "12");
+
+        // Install suggestions and accept a different one — the ref token is replaced.
+        editor.begin_autocomplete_fetch();
+        editor.apply_autocomplete_suggestions(
+            AutocompleteTrigger::Issue,
+            "12",
+            vec![issue_suggestion(999, "some issue")],
+        );
+        assert!(editor.accept_autocomplete_suggestion());
+        assert_eq!(editor.text(), "Working on #999\n");
+        assert!(editor.autocomplete().is_none(), "popup closes on accept");
+    }
+
+    #[test]
+    fn autocomplete_user_trigger() {
+        let mut editor = Editor::new("cc @tor\n");
+        editor.set_github_context(ctx());
+        editor.set_github_client(GitHubClient::new("dummy".into()));
+        editor.refresh_detection();
+        editor.set_cursor(7); // end of "@tor"
+
+        assert!(editor.update_autocomplete_from_cursor());
+        let ac = editor.autocomplete().expect("popup open");
+        assert_eq!(ac.trigger, AutocompleteTrigger::User);
+        assert_eq!(ac.prefix, "tor");
+    }
+
+    #[test]
+    fn autocomplete_needs_client_and_context() {
+        // Heading `# ` is not an issue trigger, and no client ⇒ never opens.
+        let mut editor = Editor::new("# heading\n");
+        editor.set_github_context(ctx());
+        editor.set_cursor(2);
+        assert!(!editor.update_autocomplete_from_cursor());
+        assert!(editor.autocomplete().is_none());
     }
 
     #[test]

@@ -15,6 +15,9 @@
 //! to render one frame headlessly instead.
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::Result;
 use vello::kurbo::{Affine, Rect};
@@ -34,12 +37,13 @@ use winit::event_loop::ControlFlow;
 use crate::buffer::Buffer;
 use crate::chrome::{BarRect, StatusInfo, draw_panel, draw_status_bar, draw_title_bar};
 use crate::config::Config;
-use crate::core::Editor;
+use crate::core::{AutocompleteState, AutocompleteSuggestion, AutocompleteTrigger, Editor};
 use crate::doc_layout::{DocLayout, GithubRenderData, LineCache, ScreenRect};
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
 use crate::github::{
-    GitHubClient, IssueStatus, ValidatedRefData, ValidationResult, ValidationState,
+    GitHubClient, IssueOrPr, IssueStatus, MentionableUser, ValidatedRefData, ValidationResult,
+    ValidationState,
 };
 use crate::inline::{GitHubContext, GitHubRef};
 use crate::marker::MarkerKind;
@@ -138,6 +142,19 @@ enum WritEvent {
     GithubUpdated,
 }
 
+/// Autocomplete results a tokio task fetched, handed back to the main thread (via a
+/// shared slot) where they're turned into `AutocompleteSuggestion`s and installed.
+enum FetchedSuggestions {
+    Issues {
+        prefix: String,
+        issues: Vec<IssueOrPr>,
+    },
+    Users {
+        prefix: String,
+        users: Vec<MentionableUser>,
+    },
+}
+
 struct ActiveSurface {
     surface: RenderSurface<'static>,
     window: Arc<Window>,
@@ -167,6 +184,12 @@ struct App {
     mouse_down: bool,
     /// GitHub ref under the pointer, if any (drives the hover popover).
     hovered: Option<HoverTarget>,
+    /// Screen rects of the currently-drawn autocomplete rows (for click routing).
+    ac_row_rects: Vec<ScreenRect>,
+    /// Monotonic generation for autocomplete-fetch debounce (latest wins).
+    ac_gen: Arc<AtomicU64>,
+    /// Slot a finished fetch task drops its results into for the main thread.
+    ac_slot: Arc<Mutex<Option<FetchedSuggestions>>>,
     /// Wakeup channel into the winit loop for finished tokio work.
     proxy: EventLoopProxy<WritEvent>,
     /// Handle to the process tokio runtime for spawning GitHub work.
@@ -193,6 +216,9 @@ impl App {
             mouse_pos: (0.0, 0.0),
             mouse_down: false,
             hovered: None,
+            ac_row_rects: Vec::new(),
+            ac_gen: Arc::new(AtomicU64::new(0)),
+            ac_slot: Arc::new(Mutex::new(None)),
             proxy,
             runtime,
         }
@@ -387,6 +413,97 @@ fn rebuild_doc(
     doc
 }
 
+/// Re-evaluate the autocomplete popup against the cursor and, if a fetch is needed,
+/// spawn a debounced (150ms) tokio task that fetches suggestions into the shared slot.
+fn sync_autocomplete(
+    editor: &mut Editor,
+    runtime: &tokio::runtime::Handle,
+    proxy: &EventLoopProxy<WritEvent>,
+    fetch_gen: &Arc<AtomicU64>,
+    slot: &Arc<Mutex<Option<FetchedSuggestions>>>,
+) {
+    if !editor.update_autocomplete_from_cursor() {
+        return;
+    }
+    let Some((trigger, prefix)) = editor.begin_autocomplete_fetch() else {
+        return;
+    };
+    let Some(client) = editor.github_client().cloned() else {
+        return;
+    };
+    let Some(context) = editor.github_context().cloned() else {
+        return;
+    };
+
+    let my_gen = fetch_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let fetch_gen = fetch_gen.clone();
+    let proxy = proxy.clone();
+    let slot = slot.clone();
+    runtime.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        if fetch_gen.load(Ordering::SeqCst) != my_gen {
+            return; // a newer keystroke superseded this fetch
+        }
+        let fetched = match trigger {
+            AutocompleteTrigger::Issue => {
+                let issues = client
+                    .issues_matching_prefix(&context.owner, &context.repo, &prefix, 8)
+                    .await;
+                FetchedSuggestions::Issues { prefix, issues }
+            }
+            AutocompleteTrigger::User => {
+                let users = client
+                    .users_matching_prefix(&context.owner, &context.repo, &prefix, 8)
+                    .await;
+                FetchedSuggestions::Users { prefix, users }
+            }
+        };
+        *slot.lock().unwrap() = Some(fetched);
+        let _ = proxy.send_event(WritEvent::GithubUpdated);
+    });
+}
+
+/// Turn fetched GitHub data into suggestion rows (and prime the validation cache with
+/// issue data so hovers are instant), then install them if the popup still matches.
+fn apply_fetched(editor: &mut Editor, fetched: FetchedSuggestions) {
+    match fetched {
+        FetchedSuggestions::Issues { prefix, issues } => {
+            let context = editor.github_context().cloned();
+            let cache = editor.github_validation_cache().clone();
+            let mut suggestions = Vec::with_capacity(issues.len());
+            for issue in issues {
+                if let Some(ctx) = &context {
+                    cache.set_valid(
+                        GitHubRef::Issue {
+                            owner: ctx.owner.clone(),
+                            repo: ctx.repo.clone(),
+                            number: issue.number,
+                        },
+                        Some(ValidatedRefData::Issue(issue.clone())),
+                    );
+                }
+                suggestions.push(AutocompleteSuggestion::IssueOrPr {
+                    number: issue.number,
+                    symbol: issue.symbol().to_string(),
+                    status: issue.status(),
+                    title: issue.title,
+                });
+            }
+            editor.apply_autocomplete_suggestions(AutocompleteTrigger::Issue, &prefix, suggestions);
+        }
+        FetchedSuggestions::Users { prefix, users } => {
+            let suggestions = users
+                .into_iter()
+                .map(|u| AutocompleteSuggestion::User {
+                    login: u.login,
+                    name: u.name,
+                })
+                .collect();
+            editor.apply_autocomplete_suggestions(AutocompleteTrigger::User, &prefix, suggestions);
+        }
+    }
+}
+
 /// Find the GitHub ref (regular or naked-URL) under a screen point, with its
 /// on-screen anchor rect. Returns None when the pointer isn't over a detected ref.
 fn find_hover_target(editor: &Editor, doc: &DocLayout, x: f32, y: f32) -> Option<HoverTarget> {
@@ -533,12 +650,142 @@ fn draw_hover_popover(
     engine.draw_line(scene, &layout, (x as f32 + pad, y as f32 + pad));
 }
 
+/// The colored text segments for one autocomplete row.
+fn suggestion_segments(
+    s: &AutocompleteSuggestion,
+    theme: &EditorTheme,
+) -> Vec<(String, vello::peniko::Color)> {
+    match s {
+        AutocompleteSuggestion::IssueOrPr {
+            number,
+            symbol,
+            status,
+            title,
+        } => {
+            let status_color = match status {
+                IssueStatus::Open => theme.green,
+                IssueStatus::Draft => theme.comment,
+                IssueStatus::Merged | IssueStatus::Closed => theme.purple,
+                IssueStatus::ClosedNotPlanned => theme.red,
+            };
+            vec![
+                (format!("{symbol} "), status_color),
+                (format!("#{number} "), theme.cyan),
+                (title.clone(), theme.foreground),
+            ]
+        }
+        AutocompleteSuggestion::User { login, name } => {
+            let mut v = vec![(format!("@{login}"), theme.cyan)];
+            if let Some(n) = name {
+                v.push((format!("  {n}"), theme.comment));
+            }
+            v
+        }
+    }
+}
+
+/// Draw the autocomplete dropdown anchored at the caret (flipping above if it would
+/// overflow the viewport bottom). Returns the screen rect of each row for click
+/// routing. Rows are stacked top-down; the selected row gets a highlight fill.
+#[allow(clippy::too_many_arguments)]
+fn draw_autocomplete(
+    engine: &mut TextEngine,
+    scene: &mut Scene,
+    theme: &EditorTheme,
+    ac: &AutocompleteState,
+    caret: ScreenRect,
+    viewport_w: f32,
+    viewport_h: f32,
+    scale: f32,
+) -> Vec<ScreenRect> {
+    let font_size = 14.0;
+    let pad_x = 10.0 * scale;
+    let pad_y = 5.0 * scale;
+    let panel_w = (viewport_w - 2.0 * PADDING * scale)
+        .min(480.0 * scale)
+        .max(140.0 * scale);
+    let max_text = panel_w - 2.0 * pad_x;
+
+    // Lay out every row first so the panel can be sized to their total height.
+    let mut rows = Vec::with_capacity(ac.suggestions.len());
+    for s in &ac.suggestions {
+        let segs = suggestion_segments(s, theme);
+        let mut text = String::new();
+        let mut runs = Vec::new();
+        for (seg, color) in &segs {
+            let start = text.len();
+            text.push_str(seg);
+            runs.push(StyleRun::new(start..text.len(), peniko_color(*color)));
+        }
+        let layout = engine.build_line(
+            &text,
+            scale,
+            font_size,
+            1.3,
+            peniko_color(theme.foreground),
+            Some(max_text),
+            &runs,
+        );
+        let h = layout.height() + 2.0 * pad_y;
+        rows.push((layout, h));
+    }
+    let panel_h: f32 = rows.iter().map(|(_, h)| *h).sum();
+
+    let gap = 4.0 * scale as f64;
+    let mut x = caret.0;
+    if x as f32 + panel_w > viewport_w {
+        x = (viewport_w - panel_w) as f64;
+    }
+    x = x.max(0.0);
+    let below_y = caret.3 + gap;
+    let y = if below_y as f32 + panel_h <= viewport_h {
+        below_y
+    } else {
+        (caret.1 - gap - panel_h as f64).max(0.0)
+    };
+
+    let panel = Rect::new(x, y, x + panel_w as f64, y + panel_h as f64);
+    draw_panel(
+        scene,
+        peniko_color(theme.background),
+        peniko_color(theme.comment),
+        &panel,
+        6.0 * scale as f64,
+        scale as f64,
+    );
+
+    let sel_color = peniko_color(theme.selection);
+    let mut rects = Vec::with_capacity(rows.len());
+    let mut row_top = y;
+    for (i, (layout, h)) in rows.iter().enumerate() {
+        let row_bottom = row_top + *h as f64;
+        if i == ac.selected_index {
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                sel_color,
+                None,
+                &Rect::new(x, row_top, x + panel_w as f64, row_bottom),
+            );
+        }
+        engine.draw_line(scene, layout, (x as f32 + pad_x, row_top as f32 + pad_y));
+        rects.push((x, row_top, x + panel_w as f64, row_bottom));
+        row_top = row_bottom;
+    }
+    rects
+}
+
 impl ApplicationHandler<WritEvent> for App {
     /// A tokio task finished (validation/suggestion). Results are already in the
     /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WritEvent) {
         match event {
             WritEvent::GithubUpdated => {
+                // Install any fetched autocomplete suggestions (built on this thread).
+                let fetched = self.ac_slot.lock().unwrap().take();
+                if let Some(fetched) = fetched {
+                    apply_fetched(&mut self.editor, fetched);
+                }
                 if let Some(state) = self.state.as_ref() {
                     let w = state.surface.config.width as f32;
                     let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
@@ -726,14 +973,44 @@ impl ApplicationHandler<WritEvent> for App {
                 ..
             } => {
                 self.mouse_down = true;
+                let w = state.surface.config.width as f32;
+                let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+
+                // Autocomplete row click: accept that suggestion, don't move the caret.
+                if self.editor.autocomplete().is_some()
+                    && let Some(row) = self.ac_row_rects.iter().position(|r| {
+                        let (x0, y0, x1, y1) = *r;
+                        (self.mouse_pos.0 as f64) >= x0
+                            && (self.mouse_pos.0 as f64) <= x1
+                            && (self.mouse_pos.1 as f64) >= y0
+                            && (self.mouse_pos.1 as f64) <= y1
+                    })
+                {
+                    self.editor.autocomplete_select(row);
+                    if self.editor.accept_autocomplete_suggestion() {
+                        self.hovered = None;
+                        refresh_doc(
+                            &mut self.text_engine,
+                            &mut self.line_cache,
+                            &mut self.editor,
+                            &self.theme,
+                            &mut self.doc,
+                            w,
+                            state.scale,
+                            vh,
+                        );
+                        spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
+
                 if let Some(off) = self
                     .doc
                     .as_ref()
                     .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
                 {
                     self.editor.click(off, self.modifiers.shift_key(), 1);
-                    let w = state.surface.config.width as f32;
-                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
                         &mut self.text_engine,
                         &mut self.line_cache,
@@ -743,6 +1020,14 @@ impl ApplicationHandler<WritEvent> for App {
                         w,
                         state.scale,
                         vh,
+                    );
+                    // Clicking into/out of a ref opens/closes the popup.
+                    sync_autocomplete(
+                        &mut self.editor,
+                        &self.runtime,
+                        &self.proxy,
+                        &self.ac_gen,
+                        &self.ac_slot,
                     );
                     state.window.request_redraw();
                 }
@@ -755,10 +1040,55 @@ impl ApplicationHandler<WritEvent> for App {
                 self.mouse_down = false;
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                let w = state.surface.config.width as f32;
+                let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+
+                // When the autocomplete popup is open, route navigation keys to it.
+                // `ac_has` is Some(has_suggestions) iff the popup is open.
+                let ac_has = self.editor.autocomplete().map(|ac| !ac.suggestions.is_empty());
+                if let Some(has) = ac_has {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            self.editor.close_autocomplete();
+                            state.window.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowUp) if has => {
+                            self.editor.autocomplete_move(false);
+                            state.window.request_redraw();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowDown) if has => {
+                            self.editor.autocomplete_move(true);
+                            state.window.request_redraw();
+                            return;
+                        }
+                        // `has` guarantees suggestions exist, so accept() always
+                        // succeeds here (it mutates as part of the guard).
+                        Key::Named(NamedKey::Enter | NamedKey::Tab)
+                            if has && self.editor.accept_autocomplete_suggestion() =>
+                        {
+                            self.hovered = None;
+                            refresh_doc(
+                                &mut self.text_engine,
+                                &mut self.line_cache,
+                                &mut self.editor,
+                                &self.theme,
+                                &mut self.doc,
+                                w,
+                                state.scale,
+                                vh,
+                            );
+                            spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
+                            state.window.request_redraw();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 if apply_key(&mut self.editor, self.modifiers, &event) {
                     self.hovered = None;
-                    let w = state.surface.config.width as f32;
-                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
                         &mut self.text_engine,
                         &mut self.line_cache,
@@ -770,6 +1100,13 @@ impl ApplicationHandler<WritEvent> for App {
                         vh,
                     );
                     spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
+                    sync_autocomplete(
+                        &mut self.editor,
+                        &self.runtime,
+                        &self.proxy,
+                        &self.ac_gen,
+                        &self.ac_slot,
+                    );
                     state.window.request_redraw();
                 }
             }
@@ -854,18 +1191,42 @@ impl ApplicationHandler<WritEvent> for App {
                         state.scale,
                     );
 
-                    // GitHub ref hover popover, on top of everything (unclipped).
-                    if let Some(target) = self.hovered.as_ref() {
-                        draw_hover_popover(
-                            &mut self.text_engine,
-                            &mut self.scene,
-                            &self.theme,
-                            &self.editor,
-                            target,
-                            width,
-                            height,
-                            state.scale,
-                        );
+                    // Overlays on top of everything (unclipped): the autocomplete
+                    // dropdown takes priority over the hover popover.
+                    let ac_open = self
+                        .editor
+                        .autocomplete()
+                        .is_some_and(|ac| !ac.suggestions.is_empty());
+                    if ac_open {
+                        if let Some(caret) =
+                            doc.caret_rect(self.editor.cursor_position(), CARET_WIDTH * state.scale)
+                        {
+                            let ac = self.editor.autocomplete().expect("open");
+                            self.ac_row_rects = draw_autocomplete(
+                                &mut self.text_engine,
+                                &mut self.scene,
+                                &self.theme,
+                                ac,
+                                caret,
+                                width,
+                                height,
+                                state.scale,
+                            );
+                        }
+                    } else {
+                        self.ac_row_rects.clear();
+                        if let Some(target) = self.hovered.as_ref() {
+                            draw_hover_popover(
+                                &mut self.text_engine,
+                                &mut self.scene,
+                                &self.theme,
+                                &self.editor,
+                                target,
+                                width,
+                                height,
+                                state.scale,
+                            );
+                        }
                     }
                 }
 
@@ -1050,6 +1411,37 @@ fn validate_all_blocking(editor: &mut Editor) {
     });
 }
 
+/// Synchronously fetch + install autocomplete suggestions for the open popup.
+/// Snapshot-only helper (the GUI fetches asynchronously with a debounce).
+fn fetch_autocomplete_blocking(editor: &mut Editor) {
+    let Some((trigger, prefix)) = editor.begin_autocomplete_fetch() else {
+        return;
+    };
+    let Some(client) = editor.github_client().cloned() else {
+        return;
+    };
+    let Some(context) = editor.github_context().cloned() else {
+        return;
+    };
+    let fetched = tokio::runtime::Handle::current().block_on(async {
+        match trigger {
+            AutocompleteTrigger::Issue => {
+                let issues = client
+                    .issues_matching_prefix(&context.owner, &context.repo, &prefix, 8)
+                    .await;
+                FetchedSuggestions::Issues { prefix, issues }
+            }
+            AutocompleteTrigger::User => {
+                let users = client
+                    .users_matching_prefix(&context.owner, &context.repo, &prefix, 8)
+                    .await;
+                FetchedSuggestions::Users { prefix, users }
+            }
+        }
+    });
+    apply_fetched(editor, fetched);
+}
+
 /// Render a single frame of the document to an offscreen texture and write it to
 /// `path` as a PNG. Independent of any surface/window, so it runs headlessly and
 /// doubles as a golden-image harness for later phases.
@@ -1104,6 +1496,13 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         editor.set_github_client(GitHubClient::new(token));
         editor.refresh_detection();
         validate_all_blocking(&mut editor);
+        // WRIT_SHELL_AUTOCOMPLETE opens the popup at the caret (WRIT_SHELL_CURSOR).
+        if std::env::var("WRIT_SHELL_AUTOCOMPLETE").is_ok() {
+            editor.update_autocomplete_from_cursor();
+            if editor.autocomplete().is_some() {
+                fetch_autocomplete_blocking(&mut editor);
+            }
+        }
     }
     let (content_top, editor_h) = chrome_metrics(1.0, height as f32);
     let mut cache = LineCache::new();
@@ -1195,6 +1594,22 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
             &theme,
             &editor,
             &t,
+            width as f32,
+            height as f32,
+            1.0,
+        );
+    }
+
+    // Optional autocomplete golden image (see WRIT_SHELL_AUTOCOMPLETE above).
+    if let Some(ac) = editor.autocomplete().filter(|ac| !ac.suggestions.is_empty())
+        && let Some(caret) = doc.caret_rect(editor.cursor_position(), 2.0)
+    {
+        draw_autocomplete(
+            &mut engine,
+            &mut scene,
+            &theme,
+            ac,
+            caret,
             width as f32,
             height as f32,
             1.0,
