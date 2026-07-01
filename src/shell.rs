@@ -1,29 +1,33 @@
 //! winit + wgpu + Vello application shell — the gpui replacement (see MIGRATION-PLAN.md).
 //!
-//! Phase 0–3a: opens a resizable window and renders a full markdown document
-//! (variable-height lines, tree-sitter highlighting, browser-grade wrapping) via
-//! Vello on the GPU, with mouse-wheel scrolling and resize re-wrap. Markers are
-//! still shown; marker-hiding + the display↔buffer segment map, the cursor, and
-//! inline diff land in later phases. Run with
+//! Phase 0–4: a working editor — renders a full markdown document (variable-height
+//! lines, tree-sitter highlighting, browser-grade wrapping, cursor-aware marker
+//! hiding) via Vello, with typing/arrows/backspace/enter/tab, click-to-place and
+//! drag selection (Parley hit-testing through the segment map), caret + selection
+//! painting, scroll (wheel + scroll-to-cursor), and minimal IME commit. Inline git
+//! diff and chrome (status/title bar, overlays) land in later phases. Run with
 //! `WGPU_BACKEND=vulkan cargo run --bin writ-next` on Asahi; set
-//! `WRIT_SHELL_SNAPSHOT=out.ppm` (+ optional `WRIT_SHELL_{W,H,SCROLL}`) to render
-//! one frame headlessly instead.
+//! `WRIT_SHELL_SNAPSHOT=out.ppm` (+ optional `WRIT_SHELL_{W,H,SCROLL,CURSOR,SEL_A,SEL_B}`)
+//! to render one frame headlessly instead.
 
 use std::sync::Arc;
 
 use anyhow::Result;
+use vello::kurbo::Rect;
+use vello::peniko::Fill;
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
 use vello::wgpu::CurrentSurfaceTexture;
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
-use winit::event::{MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::core::Editor;
 use crate::doc_layout::DocLayout;
-use crate::editor::EditorTheme;
+use crate::editor::{Direction, EditorTheme};
 use crate::text_engine::{TextEngine, peniko_color};
 
 const PADDING: f32 = 24.0;
@@ -31,6 +35,8 @@ const FONT_SIZE: f32 = 18.0;
 const LINE_HEIGHT: f32 = 1.5;
 /// Device px scrolled per mouse-wheel line notch.
 const WHEEL_LINE_STEP: f32 = 48.0;
+/// Caret width in logical px (scaled per display).
+const CARET_WIDTH: f32 = 2.0;
 
 /// Sample document shown until the shell loads real files (Phase 4+ wires input).
 const SAMPLE_DOC: &str = "\
@@ -80,6 +86,9 @@ struct App {
     theme: EditorTheme,
     editor: Editor,
     doc: Option<DocLayout>,
+    modifiers: ModifiersState,
+    mouse_pos: (f32, f32),
+    mouse_down: bool,
 }
 
 impl App {
@@ -93,8 +102,105 @@ impl App {
             theme: EditorTheme::dracula(),
             editor: Editor::new(SAMPLE_DOC),
             doc: None,
+            modifiers: ModifiersState::empty(),
+            mouse_pos: (0.0, 0.0),
+            mouse_down: false,
         }
     }
+}
+
+/// Translate a key press into an editor edit/move. Returns true if the editor
+/// changed (so the caller rebuilds + reveals the cursor).
+fn apply_key(
+    editor: &mut Editor,
+    modifiers: ModifiersState,
+    event: &winit::event::KeyEvent,
+) -> bool {
+    let shift = modifiers.shift_key();
+    let alt = modifiers.alt_key();
+    let ctrl = modifiers.control_key() || modifiers.super_key();
+    match &event.logical_key {
+        Key::Named(NamedKey::Enter) => {
+            if shift && alt {
+                editor.shift_alt_enter();
+            } else if shift {
+                editor.shift_enter();
+            } else {
+                editor.enter();
+            }
+            true
+        }
+        Key::Named(NamedKey::Backspace) => {
+            editor.backspace();
+            true
+        }
+        Key::Named(NamedKey::Delete) => {
+            editor.delete_forward();
+            true
+        }
+        Key::Named(NamedKey::Tab) => {
+            if shift {
+                editor.shift_tab();
+            } else {
+                editor.tab();
+            }
+            true
+        }
+        Key::Named(NamedKey::Space) => {
+            editor.insert_str(" ");
+            true
+        }
+        Key::Named(NamedKey::ArrowLeft) => {
+            editor.move_in_direction(Direction::Left, shift);
+            true
+        }
+        Key::Named(NamedKey::ArrowRight) => {
+            editor.move_in_direction(Direction::Right, shift);
+            true
+        }
+        Key::Named(NamedKey::ArrowUp) => {
+            editor.move_in_direction(Direction::Up, shift);
+            true
+        }
+        Key::Named(NamedKey::ArrowDown) => {
+            editor.move_in_direction(Direction::Down, shift);
+            true
+        }
+        _ => {
+            // Printable text (respects shift for capitals/symbols). Skip when a
+            // command modifier is held so shortcuts don't type characters.
+            if ctrl {
+                return false;
+            }
+            if let Some(text) = &event.text
+                && !text.is_empty()
+                && !text.chars().any(|c| c.is_control())
+            {
+                editor.insert_str(text);
+                return true;
+            }
+            false
+        }
+    }
+}
+
+/// Rebuild the document layout after an edit or cursor move (marker reveal is
+/// cursor-dependent), preserving scroll then revealing the cursor. Free function
+/// so it borrows only these fields, not all of `self` (the surface stays borrowed).
+fn refresh_doc(
+    engine: &mut TextEngine,
+    editor: &mut Editor,
+    theme: &EditorTheme,
+    doc: &mut Option<DocLayout>,
+    device_width: f32,
+    scale: f32,
+    viewport_h: f32,
+) {
+    let prev_scroll = doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
+    let mut new_doc = rebuild_doc(engine, editor, theme, device_width, scale);
+    new_doc.scroll_y = prev_scroll;
+    new_doc.scroll_to(editor.cursor_position(), viewport_h);
+    *doc = Some(new_doc);
 }
 
 /// Lay out the whole document at `device_width`. Free function so it borrows only
@@ -134,6 +240,7 @@ impl ApplicationHandler for App {
                 .create_window(attrs)
                 .expect("failed to create window"),
         );
+        window.set_ime_allowed(true);
         let size = window.inner_size();
 
         let surface = pollster::block_on(self.context.create_surface(
@@ -211,12 +318,138 @@ impl ApplicationHandler for App {
                     state.window.request_redraw();
                 }
             }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
+            }
+            // Minimal IME: insert committed text. Preedit (composition) rendering
+            // is a follow-up; committing already covers most Latin input methods.
+            WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
+                if !text.is_empty() {
+                    self.editor.insert_str(&text);
+                    let (w, vh) = (
+                        state.surface.config.width as f32,
+                        state.surface.config.height as f32,
+                    );
+                    refresh_doc(
+                        &mut self.text_engine,
+                        &mut self.editor,
+                        &self.theme,
+                        &mut self.doc,
+                        w,
+                        state.scale,
+                        vh,
+                    );
+                    state.window.request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_pos = (position.x as f32, position.y as f32);
+                if self.mouse_down
+                    && let Some(off) = self
+                        .doc
+                        .as_ref()
+                        .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
+                {
+                    self.editor.drag(off);
+                    let (w, vh) = (
+                        state.surface.config.width as f32,
+                        state.surface.config.height as f32,
+                    );
+                    refresh_doc(
+                        &mut self.text_engine,
+                        &mut self.editor,
+                        &self.theme,
+                        &mut self.doc,
+                        w,
+                        state.scale,
+                        vh,
+                    );
+                    state.window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.mouse_down = true;
+                if let Some(off) = self
+                    .doc
+                    .as_ref()
+                    .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
+                {
+                    self.editor.click(off, self.modifiers.shift_key(), 1);
+                    let (w, vh) = (
+                        state.surface.config.width as f32,
+                        state.surface.config.height as f32,
+                    );
+                    refresh_doc(
+                        &mut self.text_engine,
+                        &mut self.editor,
+                        &self.theme,
+                        &mut self.doc,
+                        w,
+                        state.scale,
+                        vh,
+                    );
+                    state.window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.mouse_down = false;
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if apply_key(&mut self.editor, self.modifiers, &event) {
+                    let (w, vh) = (
+                        state.surface.config.width as f32,
+                        state.surface.config.height as f32,
+                    );
+                    refresh_doc(
+                        &mut self.text_engine,
+                        &mut self.editor,
+                        &self.theme,
+                        &mut self.doc,
+                        w,
+                        state.scale,
+                        vh,
+                    );
+                    state.window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 self.scene.reset();
 
+                let viewport_h = state.surface.config.height as f32;
                 if let Some(doc) = self.doc.as_ref() {
-                    let viewport_h = state.surface.config.height as f32;
+                    // Selection under the glyphs, then glyphs, then the caret on top.
+                    if let Some(sel) = self.editor.selection_range() {
+                        let color = peniko_color(self.theme.selection);
+                        for (x0, y0, x1, y1) in doc.selection_rects(sel) {
+                            self.scene.fill(
+                                Fill::NonZero,
+                                vello::kurbo::Affine::IDENTITY,
+                                color,
+                                None,
+                                &Rect::new(x0, y0, x1, y1),
+                            );
+                        }
+                    }
                     doc.draw(&self.text_engine, &mut self.scene, viewport_h);
+                    if let Some((x0, y0, x1, y1)) =
+                        doc.caret_rect(self.editor.cursor_position(), CARET_WIDTH * state.scale)
+                    {
+                        self.scene.fill(
+                            Fill::NonZero,
+                            vello::kurbo::Affine::IDENTITY,
+                            peniko_color(self.theme.foreground),
+                            None,
+                            &Rect::new(x0, y0, x1.max(x0 + 1.0), y1),
+                        );
+                    }
                 }
 
                 let dev = &self.context.devices[state.surface.dev_id];
@@ -322,10 +555,39 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     let mut engine = TextEngine::new();
     let theme = EditorTheme::dracula();
     let mut editor = Editor::new(SAMPLE_DOC);
+    // Place the caret mid-document so the snapshot exercises caret geometry.
+    let env_usize = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
+    editor.set_cursor(env_usize("WRIT_SHELL_CURSOR").unwrap_or(0));
+    // Optional selection A..B (via click+drag) to exercise selection rendering.
+    if let (Some(a), Some(b)) = (env_usize("WRIT_SHELL_SEL_A"), env_usize("WRIT_SHELL_SEL_B")) {
+        editor.click(a, false, 1);
+        editor.drag(b);
+    }
     let mut doc = rebuild_doc(&mut engine, &mut editor, &theme, width as f32, 1.0);
     doc.scroll_by(scroll_y, height as f32);
     let mut scene = Scene::new();
+    if let Some(sel) = editor.selection_range() {
+        let color = peniko_color(theme.selection);
+        for (x0, y0, x1, y1) in doc.selection_rects(sel) {
+            scene.fill(
+                Fill::NonZero,
+                vello::kurbo::Affine::IDENTITY,
+                color,
+                None,
+                &Rect::new(x0, y0, x1, y1),
+            );
+        }
+    }
     doc.draw(&engine, &mut scene, height as f32);
+    if let Some((x0, y0, x1, y1)) = doc.caret_rect(editor.cursor_position(), 2.0) {
+        scene.fill(
+            Fill::NonZero,
+            vello::kurbo::Affine::IDENTITY,
+            peniko_color(theme.foreground),
+            None,
+            &Rect::new(x0, y0, x1.max(x0 + 1.0), y1),
+        );
+    }
 
     let target = device.create_texture(&TextureDescriptor {
         label: Some("snapshot_target"),
