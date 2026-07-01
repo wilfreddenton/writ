@@ -89,13 +89,24 @@ impl RenderSnapshot {
     /// Also injects a synthetic StyledRegion for any checkbox marker on the line.
     pub fn inline_styles_for_line(&self, line_idx: usize) -> Vec<StyledRegion> {
         let range = self.line_byte_range(line_idx);
-        let mut styles: Vec<StyledRegion> = styles_in_range(&self.inline_styles, &range)
+        let markers = self.line_markers(line_idx);
+        self.inline_styles_in_range(&range, &markers)
+    }
+
+    /// Inline styles for a line whose byte `range` and `markers` are already known.
+    /// Lets callers that hold both (e.g. `build_line_render`) skip recomputing the
+    /// markers — the redundant recompute was ~25% of the per-line render cost.
+    pub fn inline_styles_in_range(
+        &self,
+        range: &Range<usize>,
+        markers: &LineMarkers,
+    ) -> Vec<StyledRegion> {
+        let mut styles: Vec<StyledRegion> = styles_in_range(&self.inline_styles, range)
             .into_iter()
             .cloned()
             .collect();
 
         // Inject synthetic StyledRegion for checkbox markers
-        let markers = self.line_markers(line_idx);
         for marker in &markers.markers {
             if let crate::marker::MarkerKind::Checkbox { checked } = marker.kind {
                 // The checkbox marker range is "[ ] " (4 bytes), but we only

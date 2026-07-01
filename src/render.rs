@@ -59,10 +59,15 @@ pub fn build_line_render(
     let line_start = range.start;
 
     let rope = &snapshot.rope;
-    let raw = rope
-        .slice(rope.byte_to_char(range.start)..rope.byte_to_char(range.end))
+    // Slice once, excluding a trailing '\n', to avoid a second (trim) allocation.
+    let byte_end = if range.end > range.start && rope.get_byte(range.end - 1) == Some(b'\n') {
+        range.end - 1
+    } else {
+        range.end
+    };
+    let line_text = rope
+        .slice(rope.byte_to_char(range.start)..rope.byte_to_char(byte_end))
         .to_string();
-    let line_text = raw.trim_end_matches('\n').to_string();
     let line_end = line_start + line_text.len();
 
     let heading_level = markers.heading_level().unwrap_or(0);
@@ -74,7 +79,8 @@ pub fn build_line_render(
     };
     let in_code_block = markers.in_code_block || markers.is_fence();
 
-    let mut inline = snapshot.inline_styles_for_line(line_idx);
+    // Reuse the markers we already computed above (avoids a second line_markers scan).
+    let mut inline = snapshot.inline_styles_in_range(&range, &markers);
     inline.extend_from_slice(extra_regions);
 
     // Collect the buffer ranges hidden or collapsed on the way to the display.
