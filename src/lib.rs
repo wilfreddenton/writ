@@ -27,6 +27,7 @@
 pub use editor::{Direction, Editor, EditorAction, EditorConfig, EditorTheme};
 
 pub mod buffer;
+pub mod chrome;
 pub mod config;
 pub mod core;
 pub mod cursor;

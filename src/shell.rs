@@ -5,9 +5,11 @@
 //! wrapping, cursor-aware marker hiding) via Vello, with typing/arrows/backspace/
 //! enter/tab, click-to-place and drag selection (Parley hit-testing through the
 //! segment map), caret + selection painting, scroll (wheel + scroll-to-cursor),
-//! minimal IME commit, and inline diff vs HEAD (green added lines/words, red ghost
-//! deleted lines interleaved above). Chrome (status/title bar, overlays) lands in
-//! later phases. Run with
+//! minimal IME commit, inline diff vs HEAD (green added lines/words, red ghost
+//! deleted lines interleaved above), and chrome (a title bar + a status bar with
+//! nesting context and cursor position; the editor is inset + clipped between
+//! them). CSD (custom window frame) and the async-blocked overlays are deferred.
+//! Run with
 //! `WGPU_BACKEND=vulkan cargo run --bin writ-next` on Asahi; set
 //! `WRIT_SHELL_SNAPSHOT=out.ppm` (+ optional `WRIT_SHELL_{W,H,SCROLL,CURSOR,SEL_A,SEL_B}`)
 //! to render one frame headlessly instead.
@@ -15,7 +17,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use vello::kurbo::Rect;
+use vello::kurbo::{Affine, Rect};
 use vello::peniko::Fill;
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
@@ -27,9 +29,12 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::buffer::Buffer;
+use crate::chrome::{BarRect, StatusInfo, draw_status_bar, draw_title_bar};
 use crate::core::Editor;
 use crate::doc_layout::DocLayout;
 use crate::editor::{Direction, EditorTheme};
+use crate::marker::MarkerKind;
 use crate::text_engine::{TextEngine, peniko_color};
 
 const PADDING: f32 = 24.0;
@@ -39,6 +44,51 @@ const LINE_HEIGHT: f32 = 1.5;
 const WHEEL_LINE_STEP: f32 = 48.0;
 /// Caret width in logical px (scaled per display).
 const CARET_WIDTH: f32 = 2.0;
+/// Title/status bar heights in logical px.
+const TITLE_BAR_H: f32 = 34.0;
+const STATUS_BAR_H: f32 = 24.0;
+
+/// Chrome layout in device px: y where editor content begins, and its height.
+fn chrome_metrics(scale: f32, height_dev: f32) -> (f32, f32) {
+    let content_top = TITLE_BAR_H * scale;
+    let editor_h = (height_dev - (TITLE_BAR_H + STATUS_BAR_H) * scale).max(1.0);
+    (content_top, editor_h)
+}
+
+/// Nearest heading level at or above `line`, if any.
+fn heading_at(buffer: &Buffer, line: usize) -> Option<u8> {
+    for i in (0..=line).rev() {
+        for m in &buffer.line_markers(i).markers {
+            if let MarkerKind::Heading(level) = m.kind {
+                return Some(level);
+            }
+        }
+    }
+    None
+}
+
+/// Gather the status-bar inputs from the editor + viewport.
+fn build_status_info(editor: &Editor, doc: &DocLayout, editor_h: f32) -> StatusInfo {
+    let buffer = &editor.state.buffer;
+    let cursor = editor.cursor_position();
+    let line = buffer.byte_to_line(cursor);
+    let line_start = buffer.line_to_byte(line);
+    let rope = buffer.rope();
+    let col = rope
+        .byte_to_char(cursor)
+        .saturating_sub(rope.byte_to_char(line_start))
+        + 1;
+    let (first, last) = doc.visible_range(editor_h);
+    StatusInfo {
+        context: editor.state.build_nested_context(cursor),
+        heading_level: heading_at(buffer, line),
+        cursor_line: line + 1,
+        cursor_col: col,
+        total_lines: buffer.line_count(),
+        first_visible: first,
+        last_visible: last.saturating_sub(1),
+    }
+}
 
 /// Sample document shown until the shell loads real files (Phase 4+ wires input).
 const SAMPLE_DOC: &str = "\
@@ -196,12 +246,12 @@ fn refresh_doc(
     doc: &mut Option<DocLayout>,
     device_width: f32,
     scale: f32,
-    viewport_h: f32,
+    editor_h: f32,
 ) {
     let prev_scroll = doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
     let mut new_doc = rebuild_doc(engine, editor, theme, device_width, scale);
     new_doc.scroll_y = prev_scroll;
-    new_doc.scroll_to(editor.cursor_position(), viewport_h);
+    new_doc.scroll_to(editor.cursor_position(), editor_h);
     *doc = Some(new_doc);
 }
 
@@ -218,7 +268,7 @@ fn rebuild_doc(
     // Clone the diff before borrowing the buffer mutably for the snapshot.
     let diff = editor.diff_state().cloned();
     let snapshot = editor.state.buffer.render_snapshot();
-    DocLayout::build(
+    let mut doc = DocLayout::build(
         engine,
         &snapshot,
         theme,
@@ -231,7 +281,9 @@ fn rebuild_doc(
         PADDING * 2.0,
         FONT_SIZE,
         LINE_HEIGHT,
-    )
+    );
+    doc.set_content_top(TITLE_BAR_H * scale);
+    doc
 }
 
 impl ApplicationHandler for App {
@@ -318,8 +370,9 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(p) => -p.y as f32,
                 };
                 if let Some(doc) = self.doc.as_mut() {
-                    let viewport_h = state.surface.config.height as f32;
-                    doc.scroll_by(dy, viewport_h);
+                    let (_, editor_h) =
+                        chrome_metrics(state.scale, state.surface.config.height as f32);
+                    doc.scroll_by(dy, editor_h);
                     state.window.request_redraw();
                 }
             }
@@ -331,10 +384,8 @@ impl ApplicationHandler for App {
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 if !text.is_empty() {
                     self.editor.insert_str(&text);
-                    let (w, vh) = (
-                        state.surface.config.width as f32,
-                        state.surface.config.height as f32,
-                    );
+                    let w = state.surface.config.width as f32;
+                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
                         &mut self.text_engine,
                         &mut self.editor,
@@ -356,10 +407,8 @@ impl ApplicationHandler for App {
                         .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
                 {
                     self.editor.drag(off);
-                    let (w, vh) = (
-                        state.surface.config.width as f32,
-                        state.surface.config.height as f32,
-                    );
+                    let w = state.surface.config.width as f32;
+                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
                         &mut self.text_engine,
                         &mut self.editor,
@@ -384,10 +433,8 @@ impl ApplicationHandler for App {
                     .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
                 {
                     self.editor.click(off, self.modifiers.shift_key(), 1);
-                    let (w, vh) = (
-                        state.surface.config.width as f32,
-                        state.surface.config.height as f32,
-                    );
+                    let w = state.surface.config.width as f32;
+                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
                         &mut self.text_engine,
                         &mut self.editor,
@@ -409,10 +456,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if apply_key(&mut self.editor, self.modifiers, &event) {
-                    let (w, vh) = (
-                        state.surface.config.width as f32,
-                        state.surface.config.height as f32,
-                    );
+                    let w = state.surface.config.width as f32;
+                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     refresh_doc(
                         &mut self.text_engine,
                         &mut self.editor,
@@ -428,34 +473,83 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 self.scene.reset();
 
-                let viewport_h = state.surface.config.height as f32;
+                let width = state.surface.config.width as f32;
+                let height = state.surface.config.height as f32;
+                let (content_top, editor_h) = chrome_metrics(state.scale, height);
+
                 if let Some(doc) = self.doc.as_ref() {
+                    // Editor content, clipped to the region between the chrome bars.
+                    let clip = Rect::new(
+                        0.0,
+                        content_top as f64,
+                        width as f64,
+                        (content_top + editor_h) as f64,
+                    );
+                    self.scene
+                        .push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
                     // Draw order (all before glyphs): diff row/word bg, then selection.
-                    doc.draw_added_backgrounds(&mut self.scene, viewport_h);
+                    doc.draw_added_backgrounds(&mut self.scene, editor_h);
                     if let Some(sel) = self.editor.selection_range() {
                         let color = peniko_color(self.theme.selection);
                         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
                             self.scene.fill(
                                 Fill::NonZero,
-                                vello::kurbo::Affine::IDENTITY,
+                                Affine::IDENTITY,
                                 color,
                                 None,
                                 &Rect::new(x0, y0, x1, y1),
                             );
                         }
                     }
-                    doc.draw(&self.text_engine, &mut self.scene, viewport_h);
+                    doc.draw(&self.text_engine, &mut self.scene, editor_h);
                     if let Some((x0, y0, x1, y1)) =
                         doc.caret_rect(self.editor.cursor_position(), CARET_WIDTH * state.scale)
                     {
                         self.scene.fill(
                             Fill::NonZero,
-                            vello::kurbo::Affine::IDENTITY,
+                            Affine::IDENTITY,
                             peniko_color(self.theme.foreground),
                             None,
                             &Rect::new(x0, y0, x1.max(x0 + 1.0), y1),
                         );
                     }
+                    self.scene.pop_layer();
+
+                    // Chrome: title bar (top) + status bar (bottom).
+                    let info = build_status_info(&self.editor, doc, editor_h);
+                    let filename = self
+                        .editor
+                        .file_path()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "untitled".to_string());
+                    draw_title_bar(
+                        &mut self.text_engine,
+                        &mut self.scene,
+                        &self.theme,
+                        &BarRect {
+                            x0: 0.0,
+                            y0: 0.0,
+                            x1: width as f64,
+                            y1: content_top as f64,
+                        },
+                        &filename,
+                        self.editor.is_dirty(),
+                        state.scale,
+                    );
+                    draw_status_bar(
+                        &mut self.text_engine,
+                        &mut self.scene,
+                        &self.theme,
+                        &BarRect {
+                            x0: 0.0,
+                            y0: (content_top + editor_h) as f64,
+                            x1: width as f64,
+                            y1: height as f64,
+                        },
+                        &info,
+                        state.scale,
+                    );
                 }
 
                 let dev = &self.context.devices[state.surface.dev_id];
@@ -577,32 +671,74 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
             .replace("**whole document**", "**the document**");
         editor.set_head_base(&base);
     }
+    let (content_top, editor_h) = chrome_metrics(1.0, height as f32);
     let mut doc = rebuild_doc(&mut engine, &mut editor, &theme, width as f32, 1.0);
-    doc.scroll_by(scroll_y, height as f32);
+    doc.scroll_by(scroll_y, editor_h);
     let mut scene = Scene::new();
-    doc.draw_added_backgrounds(&mut scene, height as f32);
+    let clip = Rect::new(
+        0.0,
+        content_top as f64,
+        width as f64,
+        (content_top + editor_h) as f64,
+    );
+    scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+    doc.draw_added_backgrounds(&mut scene, editor_h);
     if let Some(sel) = editor.selection_range() {
         let color = peniko_color(theme.selection);
         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
             scene.fill(
                 Fill::NonZero,
-                vello::kurbo::Affine::IDENTITY,
+                Affine::IDENTITY,
                 color,
                 None,
                 &Rect::new(x0, y0, x1, y1),
             );
         }
     }
-    doc.draw(&engine, &mut scene, height as f32);
+    doc.draw(&engine, &mut scene, editor_h);
     if let Some((x0, y0, x1, y1)) = doc.caret_rect(editor.cursor_position(), 2.0) {
         scene.fill(
             Fill::NonZero,
-            vello::kurbo::Affine::IDENTITY,
+            Affine::IDENTITY,
             peniko_color(theme.foreground),
             None,
             &Rect::new(x0, y0, x1.max(x0 + 1.0), y1),
         );
     }
+    scene.pop_layer();
+    let info = build_status_info(&editor, &doc, editor_h);
+    let filename = editor
+        .file_path()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "untitled.md".to_string());
+    draw_title_bar(
+        &mut engine,
+        &mut scene,
+        &theme,
+        &BarRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: width as f64,
+            y1: content_top as f64,
+        },
+        &filename,
+        editor.is_dirty(),
+        1.0,
+    );
+    draw_status_bar(
+        &mut engine,
+        &mut scene,
+        &theme,
+        &BarRect {
+            x0: 0.0,
+            y0: (content_top + editor_h) as f64,
+            x1: width as f64,
+            y1: height as f64,
+        },
+        &info,
+        1.0,
+    );
 
     let target = device.create_texture(&TextureDescriptor {
         label: Some("snapshot_target"),

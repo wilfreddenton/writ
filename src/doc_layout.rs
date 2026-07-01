@@ -140,6 +140,8 @@ pub struct DocLayout {
     pub scroll_y: f32,
     /// Surface width in device px (for full-width diff row backgrounds).
     width: f32,
+    /// Device-px y where the editor content area begins (below the title bar).
+    content_top: f32,
     pad_top: f32,
     pad_bottom: f32,
     pad_x: f32,
@@ -250,10 +252,16 @@ impl DocLayout {
             tops: compute_tops(&heights, pad_top * scale),
             scroll_y: 0.0,
             width: device_width,
+            content_top: 0.0,
             pad_top: pad_top * scale,
             pad_bottom: pad_bottom * scale,
             pad_x: pad_x * scale,
         }
+    }
+
+    /// Set the device-px y where the editor content begins (below the title bar).
+    pub fn set_content_top(&mut self, content_top: f32) {
+        self.content_top = content_top;
     }
 
     /// The display↔buffer map for a line (Phase 4 cursor/click math).
@@ -288,7 +296,7 @@ impl DocLayout {
         let cursor = Cursor::from_byte_index(layout, display_off, Affinity::Downstream);
         let bb = cursor.geometry(layout, caret_width);
         let dx = self.pad_x as f64;
-        let dy = (self.real_top(line) - self.scroll_y) as f64;
+        let dy = (self.real_top(line) - self.scroll_y + self.content_top) as f64;
         Some((bb.x0 + dx, bb.y0 + dy, bb.x1 + dx, bb.y1 + dy))
     }
 
@@ -320,7 +328,7 @@ impl DocLayout {
                 Cursor::from_byte_index(layout, de, Affinity::Upstream),
             );
             let dx = self.pad_x as f64;
-            let dy = (self.real_top(line) - self.scroll_y) as f64;
+            let dy = (self.real_top(line) - self.scroll_y + self.content_top) as f64;
             for (bb, _) in sel.geometry(layout) {
                 rects.push((bb.x0 + dx, bb.y0 + dy, bb.x1 + dx, bb.y1 + dy));
             }
@@ -336,7 +344,7 @@ impl DocLayout {
         if n == 0 {
             return None;
         }
-        let cy = y + self.scroll_y;
+        let cy = y - self.content_top + self.scroll_y;
         let line = self.tops[..n]
             .partition_point(|&t| t <= cy)
             .saturating_sub(1)
@@ -440,7 +448,7 @@ impl DocLayout {
         let (first, last) = self.visible_range(viewport_h);
         for i in first..last {
             // Ghost (deleted) rows stacked in this line's ghost block.
-            let mut gy = self.tops[i] - self.scroll_y;
+            let mut gy = self.tops[i] - self.scroll_y + self.content_top;
             for ghost in &self.ghosts[i] {
                 let top = gy as f64;
                 let bottom = (gy + ghost.height) as f64;
@@ -475,8 +483,8 @@ impl DocLayout {
             if !d.is_addition {
                 continue;
             }
-            let top = (self.real_top(i) - self.scroll_y) as f64;
-            let bottom = (self.tops[i + 1] - self.scroll_y) as f64;
+            let top = (self.real_top(i) - self.scroll_y + self.content_top) as f64;
+            let bottom = (self.tops[i + 1] - self.scroll_y + self.content_top) as f64;
             scene.fill(
                 Fill::NonZero,
                 Affine::IDENTITY,
@@ -535,6 +543,7 @@ mod tests {
             tops: compute_tops(heights, pad_top),
             scroll_y: 0.0,
             width: 100.0,
+            content_top: 0.0,
             pad_top,
             pad_bottom,
             pad_x: 0.0,
