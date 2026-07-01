@@ -19,12 +19,41 @@ use vello::peniko::{Brush, Color, Fill};
 use crate::buffer::RenderSnapshot;
 use crate::diff::DiffState;
 use crate::editor::EditorTheme;
+use crate::github::GitHubValidationCache;
+use crate::inline::{
+    GitHubContext, NakedUrl, RawGitHubMatch, StyledRegion, github_refs_to_styled_regions,
+    naked_urls_to_styled_regions,
+};
 use crate::render::build_line_render;
 use crate::segment_map::SegmentMap;
 use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
 
 /// A screen-space rectangle (device px), already offset by padding + scroll.
 pub type ScreenRect = (f64, f64, f64, f64);
+
+/// GitHub autolink data threaded into layout so validated refs render as colored,
+/// possibly-shortened links. Borrowed from `core::Editor` for the build call.
+pub struct GithubRenderData<'a> {
+    pub refs_by_line: &'a HashMap<usize, Vec<RawGitHubMatch>>,
+    pub urls_by_line: &'a HashMap<usize, Vec<NakedUrl>>,
+    pub cache: &'a GitHubValidationCache,
+    pub context: Option<&'a GitHubContext>,
+}
+
+impl GithubRenderData<'_> {
+    /// The extra styled regions (validated refs + naked URLs) for one line.
+    fn extra_regions(&self, line: usize) -> Vec<StyledRegion> {
+        let mut v = self
+            .refs_by_line
+            .get(&line)
+            .map(|m| github_refs_to_styled_regions(m, self.cache))
+            .unwrap_or_default();
+        if let Some(urls) = self.urls_by_line.get(&line) {
+            v.extend(naked_urls_to_styled_regions(urls, self.cache, self.context));
+        }
+        v
+    }
+}
 
 /// Content hash identifying a laid-out line. Two lines with the same key produce
 /// byte-identical Parley layouts, so a cache can skip re-shaping.
@@ -136,7 +165,7 @@ fn build_ghosts_before(
         if old_line >= old.line_count() {
             break;
         }
-        let lr = build_line_render(old, old_line, theme, base_font_size, usize::MAX);
+        let lr = build_line_render(old, old_line, theme, base_font_size, usize::MAX, &[]);
         let layout = engine.build_line(
             &lr.text,
             scale,
@@ -219,6 +248,7 @@ impl DocLayout {
         snapshot: &RenderSnapshot,
         theme: &EditorTheme,
         diff: Option<&DiffState>,
+        github: Option<&GithubRenderData>,
         cursor_offset: usize,
         device_width: f32,
         scale: f32,
@@ -255,7 +285,8 @@ impl DocLayout {
             );
             let gh: f32 = line_ghosts.iter().map(|g| g.height).sum();
 
-            let lr = build_line_render(snapshot, i, theme, base_font_size, cursor_offset);
+            let extra = github.map(|g| g.extra_regions(i)).unwrap_or_default();
+            let lr = build_line_render(snapshot, i, theme, base_font_size, cursor_offset, &extra);
             let key = line_key(
                 &lr.text,
                 scale,
@@ -670,6 +701,7 @@ mod tests {
             &snapshot,
             &theme,
             None,
+            None,
             0,
             1200.0,
             1.0,
@@ -712,6 +744,7 @@ mod tests {
             &snapshot,
             &theme,
             Some(&diff),
+            None,
             usize::MAX,
             1200.0,
             1.0,
@@ -750,7 +783,8 @@ mod tests {
         let snapshot = buffer.render_snapshot();
         let build = |engine: &mut TextEngine, cache: &mut LineCache| {
             DocLayout::build(
-                engine, cache, &snapshot, &theme, None, 0, 1000.0, 1.0, 24.0, 24.0, 48.0, 18.0, 1.5,
+                engine, cache, &snapshot, &theme, None, None, 0, 1000.0, 1.0, 24.0, 24.0, 48.0,
+                18.0, 1.5,
             )
         };
         let t0 = Instant::now();

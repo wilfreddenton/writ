@@ -25,7 +25,7 @@ use vello::wgpu::CurrentSurfaceTexture;
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
@@ -35,9 +35,11 @@ use crate::buffer::Buffer;
 use crate::chrome::{BarRect, StatusInfo, draw_status_bar, draw_title_bar};
 use crate::config::Config;
 use crate::core::Editor;
-use crate::doc_layout::{DocLayout, LineCache};
+use crate::doc_layout::{DocLayout, GithubRenderData, LineCache};
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
+use crate::github::{GitHubClient, ValidationResult};
+use crate::inline::GitHubRef;
 use crate::marker::MarkerKind;
 use crate::text_engine::{TextEngine, peniko_color};
 
@@ -126,6 +128,14 @@ Marker hiding (the real segment map), the cursor, selection, and inline git diff
 land in the next phases. For now this proves the render + scroll skeleton.
 ";
 
+/// Wakeups sent from tokio worker tasks back into the winit loop. The work's
+/// results are already written to the shared `Arc<Mutex>` caches; the event just
+/// tells the loop to redraw (and, for autocomplete, drain the suggestion slot).
+#[derive(Debug, Clone)]
+enum WritEvent {
+    GithubUpdated,
+}
+
 struct ActiveSurface {
     surface: RenderSurface<'static>,
     window: Arc<Window>,
@@ -146,10 +156,18 @@ struct App {
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
     mouse_down: bool,
+    /// Wakeup channel into the winit loop for finished tokio work.
+    proxy: EventLoopProxy<WritEvent>,
+    /// Handle to the process tokio runtime for spawning GitHub work.
+    runtime: tokio::runtime::Handle,
 }
 
 impl App {
-    fn new(editor: Editor) -> Self {
+    fn new(
+        editor: Editor,
+        proxy: EventLoopProxy<WritEvent>,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             context: RenderContext::new(),
             renderer: None,
@@ -163,7 +181,57 @@ impl App {
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             mouse_down: false,
+            proxy,
+            runtime,
         }
+    }
+
+    /// Spawn async validation for every not-yet-cached GitHub ref currently detected.
+    /// Each finished task writes its result into the shared cache and wakes the loop.
+    fn spawn_validations(&self) {
+        spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
+    }
+}
+
+/// For each detected GitHub ref (from refs + naked URLs) with no cache entry yet,
+/// mark it pending and spawn a tokio task to validate it. Results land in the shared
+/// `GitHubValidationCache`; a `GithubUpdated` wakeup triggers a redraw.
+fn spawn_ref_validations(
+    editor: &Editor,
+    runtime: &tokio::runtime::Handle,
+    proxy: &EventLoopProxy<WritEvent>,
+) {
+    let Some(client) = editor.github_client() else {
+        return;
+    };
+    let cache = editor.github_validation_cache();
+
+    let mut refs: Vec<GitHubRef> = Vec::new();
+    for m in editor.github_refs_by_line().values().flatten() {
+        refs.push(m.reference.clone());
+    }
+    for u in editor.naked_urls_by_line().values().flatten() {
+        if let Some(r) = &u.github_ref {
+            refs.push(r.clone());
+        }
+    }
+
+    for reference in refs {
+        if cache.get(&reference).is_some() {
+            continue; // already pending/valid/invalid
+        }
+        cache.mark_pending(reference.clone());
+        let client = client.clone();
+        let cache = cache.clone();
+        let proxy = proxy.clone();
+        runtime.spawn(async move {
+            match client.validate_ref(&reference).await {
+                ValidationResult::ValidWithData(d) => cache.set_valid(reference, Some(d)),
+                ValidationResult::ValidNoData => cache.set_valid(reference, None),
+                ValidationResult::Invalid => cache.set_invalid(reference),
+            }
+            let _ = proxy.send_event(WritEvent::GithubUpdated);
+        });
     }
 }
 
@@ -255,6 +323,9 @@ fn refresh_doc(
     scale: f32,
     editor_h: f32,
 ) {
+    // Re-detect GitHub refs / naked URLs after the edit so coloring + validation
+    // spawning see the current buffer. Whole-buffer scan; cheap enough for now.
+    editor.refresh_detection();
     let prev_scroll = doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
     let mut new_doc = rebuild_doc(engine, cache, editor, theme, device_width, scale);
     new_doc.scroll_y = prev_scroll;
@@ -276,12 +347,21 @@ fn rebuild_doc(
     // Clone the diff before borrowing the buffer mutably for the snapshot.
     let diff = editor.diff_state().cloned();
     let snapshot = editor.state.buffer.render_snapshot();
+    // The snapshot is owned, so the mutable borrow above is released — now gather the
+    // GitHub autolink data (immutable borrows) to color validated refs.
+    let github = GithubRenderData {
+        refs_by_line: editor.github_refs_by_line(),
+        urls_by_line: editor.naked_urls_by_line(),
+        cache: editor.github_validation_cache(),
+        context: editor.github_context(),
+    };
     let mut doc = DocLayout::build(
         engine,
         cache,
         &snapshot,
         theme,
         diff.as_ref(),
+        Some(&github),
         cursor_offset,
         device_width,
         scale,
@@ -295,7 +375,37 @@ fn rebuild_doc(
     doc
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<WritEvent> for App {
+    /// A tokio task finished (validation/suggestion). Results are already in the
+    /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WritEvent) {
+        match event {
+            WritEvent::GithubUpdated => {
+                if let Some(state) = self.state.as_ref() {
+                    let w = state.surface.config.width as f32;
+                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                    let scale = state.scale;
+                    let window = state.window.clone();
+                    // Rebuild so freshly-validated refs recolor; detection is unchanged,
+                    // so skip it and preserve the current scroll (no viewport jump).
+                    let prev_scroll = self.doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
+                    let mut new_doc = rebuild_doc(
+                        &mut self.text_engine,
+                        &mut self.line_cache,
+                        &mut self.editor,
+                        &self.theme,
+                        w,
+                        scale,
+                    );
+                    new_doc.scroll_y = prev_scroll;
+                    new_doc.clamp_scroll(vh);
+                    self.doc = Some(new_doc);
+                    window.request_redraw();
+                }
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -346,6 +456,8 @@ impl ApplicationHandler for App {
             window,
             scale,
         });
+        // Validate refs already present in the loaded file.
+        self.spawn_validations();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -407,6 +519,7 @@ impl ApplicationHandler for App {
                         state.scale,
                         vh,
                     );
+                    spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
                     state.window.request_redraw();
                 }
             }
@@ -482,6 +595,7 @@ impl ApplicationHandler for App {
                         state.scale,
                         vh,
                     );
+                    spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
                     state.window.request_redraw();
                 }
             }
@@ -627,6 +741,8 @@ impl ApplicationHandler for App {
         {
             let w = state.surface.config.width as f32;
             let (_, editor_h) = chrome_metrics(state.scale, state.surface.config.height as f32);
+            let window = state.window.clone();
+            let scale = state.scale;
             refresh_doc(
                 &mut self.text_engine,
                 &mut self.line_cache,
@@ -634,10 +750,11 @@ impl ApplicationHandler for App {
                 &self.theme,
                 &mut self.doc,
                 w,
-                state.scale,
+                scale,
                 editor_h,
             );
-            state.window.request_redraw();
+            spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
+            window.request_redraw();
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(
             std::time::Instant::now() + std::time::Duration::from_millis(200),
@@ -671,8 +788,9 @@ pub fn run() -> Result<()> {
     }
 
     let editor = load_editor_from_cli();
-    let event_loop = EventLoop::new()?;
-    let mut app = App::new(editor);
+    let event_loop = EventLoop::<WritEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
+    let mut app = App::new(editor, proxy, runtime.handle().clone());
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -704,11 +822,44 @@ fn load_editor_from_cli() -> Editor {
     if let Some(ctx) = context {
         editor.set_github_context(ctx);
     }
+    if let Some(token) = config.github_token.clone() {
+        editor.set_github_client(GitHubClient::new(token));
+    }
+    // Populate github_refs_by_line / naked_urls_by_line so the first frame can color
+    // (and the shell can spawn validation for) any refs already in the file.
+    editor.refresh_detection();
 
     if let Err(e) = editor.watch_file() {
         eprintln!("[writ] file watch failed: {e}");
     }
     editor
+}
+
+/// Synchronously validate every detected GitHub ref (blocking on the current tokio
+/// runtime). Snapshot-only helper so a single headless frame shows final ref colors.
+fn validate_all_blocking(editor: &mut Editor) {
+    let Some(client) = editor.github_client().cloned() else {
+        return;
+    };
+    let cache = editor.github_validation_cache().clone();
+    let mut refs: Vec<GitHubRef> = Vec::new();
+    for m in editor.github_refs_by_line().values().flatten() {
+        refs.push(m.reference.clone());
+    }
+    for u in editor.naked_urls_by_line().values().flatten() {
+        if let Some(r) = &u.github_ref {
+            refs.push(r.clone());
+        }
+    }
+    tokio::runtime::Handle::current().block_on(async {
+        for r in refs {
+            match client.validate_ref(&r).await {
+                ValidationResult::ValidWithData(d) => cache.set_valid(r, Some(d)),
+                ValidationResult::ValidNoData => cache.set_valid(r, None),
+                ValidationResult::Invalid => cache.set_invalid(r),
+            }
+        }
+    });
 }
 
 /// Render a single frame of the document to an offscreen texture and write it to
@@ -749,6 +900,22 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
             .replace("## Scrolling\n\n", "")
             .replace("**whole document**", "**the document**");
         editor.set_head_base(&base);
+    }
+    // Optional GitHub golden-image check: wire a client from GITHUB_TOKEN +
+    // WRIT_SHELL_GITHUB_REPO, then *synchronously* validate every ref so the single
+    // frame shows final ref colors (the GUI does this asynchronously).
+    if let Ok(token) = std::env::var("GITHUB_TOKEN")
+        && std::env::var("WRIT_SHELL_GITHUB").is_ok()
+    {
+        if let Some(ctx) = std::env::var("WRIT_SHELL_GITHUB_REPO")
+            .ok()
+            .and_then(|s| parse_github_repo_string(&s))
+        {
+            editor.set_github_context(ctx);
+        }
+        editor.set_github_client(GitHubClient::new(token));
+        editor.refresh_detection();
+        validate_all_blocking(&mut editor);
     }
     let (content_top, editor_h) = chrome_metrics(1.0, height as f32);
     let mut cache = LineCache::new();

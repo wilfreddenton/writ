@@ -34,9 +34,8 @@ pub struct Editor {
     // --- GitHub autolink detection ---
     github_context: Option<GitHubContext>,
     github_client: Option<GitHubClient>,
-    /// Held for the async ref-validation port (Phase 4) which reads/writes it off
-    /// tokio; detection alone (this phase) doesn't touch it.
-    #[allow(dead_code)]
+    /// Shared (Arc<Mutex>) validation cache; the shell's tokio tasks write results
+    /// into it off-thread and the render path reads it to color validated refs.
     github_validation_cache: GitHubValidationCache,
     naked_urls_by_line: HashMap<usize, Vec<NakedUrl>>,
     github_refs_by_line: HashMap<usize, Vec<RawGitHubMatch>>,
@@ -244,6 +243,18 @@ impl Editor {
 
     pub fn set_github_client(&mut self, client: GitHubClient) {
         self.github_client = Some(client);
+    }
+
+    pub fn github_client(&self) -> Option<&GitHubClient> {
+        self.github_client.as_ref()
+    }
+
+    pub fn github_context(&self) -> Option<&GitHubContext> {
+        self.github_context.as_ref()
+    }
+
+    pub fn github_validation_cache(&self) -> &GitHubValidationCache {
+        &self.github_validation_cache
     }
 
     pub fn github_refs_by_line(&self) -> &HashMap<usize, Vec<RawGitHubMatch>> {

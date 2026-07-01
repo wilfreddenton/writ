@@ -12,6 +12,7 @@
 
 use crate::buffer::RenderSnapshot;
 use crate::editor::EditorTheme;
+use crate::inline::StyledRegion;
 use crate::marker::MarkerKind;
 use crate::segment_map::{SegmentMap, Special};
 use crate::text_engine::{StyleRun, peniko_color};
@@ -41,12 +42,17 @@ fn heading_scale(level: u8) -> f32 {
 /// region), a segment map back to buffer bytes, and style runs over the display,
 /// for `line_idx`. `cursor_offset` is the absolute buffer cursor position; markers
 /// on the cursor's own region/line stay revealed for editing.
+///
+/// `extra_regions` are additional inline styled regions to merge in (validated
+/// GitHub refs → cyan/underline links, and naked-URL shortening via `display_text`).
+/// They carry absolute buffer ranges, like the snapshot's own inline styles.
 pub fn build_line_render(
     snapshot: &RenderSnapshot,
     line_idx: usize,
     theme: &EditorTheme,
     base_font_size: f32,
     cursor_offset: usize,
+    extra_regions: &[StyledRegion],
 ) -> LineRender {
     let markers = snapshot.line_markers(line_idx);
     let range = markers.range.clone();
@@ -68,7 +74,8 @@ pub fn build_line_render(
     };
     let in_code_block = markers.in_code_block || markers.is_fence();
 
-    let inline = snapshot.inline_styles_for_line(line_idx);
+    let mut inline = snapshot.inline_styles_for_line(line_idx);
+    inline.extend_from_slice(extra_regions);
 
     // Collect the buffer ranges hidden or collapsed on the way to the display.
     // Code blocks and thematic breaks show their markers verbatim.
@@ -204,5 +211,58 @@ pub fn build_line_render(
         font_size,
         runs,
         map,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::Buffer;
+    use crate::inline::TextStyle;
+    use std::ops::Range;
+
+    fn link_region(range: Range<usize>) -> StyledRegion {
+        StyledRegion {
+            full_range: range.clone(),
+            content_range: range,
+            style: TextStyle::default(),
+            link_url: Some("https://github.com/o/r/issues/1".to_string()),
+            is_image: false,
+            checkbox: None,
+            display_text: None,
+        }
+    }
+
+    /// An extra region carrying `link_url` (a validated GitHub ref) colors its span
+    /// as an underlined link — the render half of the GitHub coloring feature.
+    #[test]
+    fn extra_link_region_styles_underlined_link() {
+        let mut buffer: Buffer = "See #1 today\n".parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+        let theme = EditorTheme::dracula();
+        // "#1" is bytes 4..6. Cursor off the line so nothing is revealed.
+        let extra = [link_region(4..6)];
+        let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &extra);
+        let link_run = lr
+            .runs
+            .iter()
+            .find(|r| r.underline)
+            .expect("a link run should exist");
+        assert_eq!(link_run.color, peniko_color(theme.cyan));
+        // The colored display range corresponds to "#1".
+        let ds = lr.map.buffer_to_display(4);
+        let de = lr.map.buffer_to_display(6);
+        assert_eq!(link_run.range, ds..de);
+    }
+
+    /// Without any extra regions the same line has no link run (unvalidated refs
+    /// stay plain text).
+    #[test]
+    fn no_extra_regions_no_link() {
+        let mut buffer: Buffer = "See #1 today\n".parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+        let theme = EditorTheme::dracula();
+        let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &[]);
+        assert!(!lr.runs.iter().any(|r| r.underline));
     }
 }
