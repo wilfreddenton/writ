@@ -16,7 +16,7 @@ use std::sync::mpsc;
 static NEXT_EDITOR_ID: AtomicUsize = AtomicUsize::new(0);
 
 use gpui::{
-    AnyElement, App, Context, Corner, CursorStyle, DragMoveEvent, Empty, FocusHandle, Focusable,
+    AnyElement, Anchor, App, Context, CursorStyle, DragMoveEvent, Empty, FocusHandle, Focusable,
     Hsla, IntoElement, KeyDownEvent, ListAlignment, ListState, ModifiersChangedEvent, MouseButton,
     ReadGlobal, Render, Rgba, TextRun, Window, anchored, div, font, list, point, prelude::*, px,
 };
@@ -1932,7 +1932,7 @@ impl Editor {
         let ref_for_task = reference.clone();
         cx.spawn(async move |weak, cx| {
             let result = client.validate_ref(&ref_for_task).await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(editor) = weak.upgrade() {
                     editor.update(cx, |editor, cx| {
                         match result {
@@ -1970,7 +1970,7 @@ impl Editor {
                 .await;
 
             // Now do the actual fetch
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(editor) = weak.upgrade() {
                     editor.update(cx, |editor, cx| {
                         editor.fetch_autocomplete_suggestions(cx);
@@ -2041,7 +2041,7 @@ impl Editor {
                 })
                 .collect();
 
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(editor) = weak.upgrade() {
                     editor.update(cx, |editor, cx| {
                         // Add fetched issues to validation cache with full data
@@ -2132,7 +2132,7 @@ impl Editor {
                 })
                 .collect();
 
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(editor) = weak.upgrade() {
                     editor.update(cx, |editor, cx| {
                         // Only update if autocomplete is still active with the same prefix
@@ -2229,8 +2229,7 @@ impl Editor {
                         } else {
                             false
                         }
-                    })
-                    .unwrap_or(false);
+                    });
 
                 if !continue_loop {
                     break;
@@ -2593,13 +2592,13 @@ impl Editor {
 
         let (popup_y, anchor_corner) = if space_below >= popup_max_height + gap {
             // Enough space below - position popup below cursor
-            (cursor_pos.y + line_height + gap, Corner::TopLeft)
+            (cursor_pos.y + line_height + gap, Anchor::TopLeft)
         } else if space_above >= popup_max_height + gap {
             // Not enough below but enough above - flip to above cursor
-            (cursor_pos.y - gap, Corner::BottomLeft)
+            (cursor_pos.y - gap, Anchor::BottomLeft)
         } else {
             // Not enough space either way - default to below
-            (cursor_pos.y + line_height + gap, Corner::TopLeft)
+            (cursor_pos.y + line_height + gap, Anchor::TopLeft)
         };
 
         // Build suggestion items
@@ -2820,9 +2819,9 @@ impl Editor {
         // Position below the ref, or above if not enough space
         let space_below = viewport.origin.y + viewport.size.height - (pos.y + line_height);
         let (popup_y, anchor_corner) = if space_below >= popup_max_height + gap {
-            (pos.y + line_height + gap, Corner::TopLeft)
+            (pos.y + line_height + gap, Anchor::TopLeft)
         } else {
-            (pos.y - gap, Corner::BottomLeft)
+            (pos.y - gap, Anchor::BottomLeft)
         };
 
         // Build popup content based on validation state
@@ -3827,9 +3826,9 @@ impl Render for Editor {
             // from Line click handlers will be routed to THIS editor.
             // Don't focus if input is blocked (read-only mode).
             .capture_any_mouse_down(cx.listener(
-                |editor, _event: &gpui::MouseDownEvent, window, _cx| {
+                |editor, _event: &gpui::MouseDownEvent, window, cx| {
                     if !editor.input_blocked {
-                        editor.focus_handle.focus(window);
+                        editor.focus_handle.focus(window, cx);
                     }
                 },
             ))

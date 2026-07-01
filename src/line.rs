@@ -1109,7 +1109,7 @@ impl Line {
                 let cursor_height = cursor_font_size * 1.2;
                 let y_offset = (line_height - cursor_height) / 2.0;
                 let cursor_pos = point(pos.x, pos.y + y_offset);
-                let _ = shaped_cursor.paint(cursor_pos, cursor_height, window, cx);
+                let _ = shaped_cursor.paint(cursor_pos, cursor_height, gpui::TextAlign::Left, None, window, cx);
             },
         )
         .absolute()
@@ -1173,7 +1173,7 @@ impl Line {
                 let cursor_height = cursor_font_size * 1.2;
                 let y_offset = (line_height - cursor_height) / 2.0;
                 let cursor_pos = point(bounds.origin.x + x_pos, bounds.origin.y + y_offset);
-                let _ = shaped_cursor.paint(cursor_pos, cursor_height, window, cx);
+                let _ = shaped_cursor.paint(cursor_pos, cursor_height, gpui::TextAlign::Left, None, window, cx);
             },
         )
         .absolute()
@@ -1334,7 +1334,15 @@ impl RenderOnce for Line {
             let mut line_wrapper = window
                 .text_system()
                 .line_wrapper(self.theme.text_font.clone(), font_size);
-            line_wrapper.truncate_line(display_text.into(), truncate_width, "…", &mut runs)
+            let (truncated, truncated_runs) = line_wrapper.truncate_line(
+                display_text.into(),
+                truncate_width,
+                "…",
+                &runs,
+                gpui::TruncateFrom::End,
+            );
+            runs = truncated_runs.into_owned();
+            truncated
         } else {
             display_text.into()
         };

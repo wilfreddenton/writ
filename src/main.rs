@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use gpui::{
-    Application, Bounds, Entity, FocusHandle, Focusable, KeyBinding, Point, Rems, Size, Timer,
-    Window, WindowBounds, WindowDecorations, WindowOptions, div, prelude::*, px,
+    Bounds, Entity, FocusHandle, Focusable, KeyBinding, Point, Rems, Size, Window, WindowBounds,
+    WindowDecorations, WindowOptions, div, prelude::*, px,
 };
 use writ::{
     buffer::Buffer,
@@ -34,7 +34,7 @@ fn run_demo(editor: Entity<Editor>, cx: &mut gpui::App) {
 
     cx.spawn(async move |cx| {
         let run = |cx: &gpui::AsyncApp, action: EditorAction| {
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(wh) = cx.windows().first().copied() {
                     let _ = cx.update_window(wh, |_, window, cx| {
                         editor.update(cx, |editor, cx| editor.execute(&action, window, cx));
@@ -43,28 +43,28 @@ fn run_demo(editor: Entity<Editor>, cx: &mut gpui::App) {
             });
         };
 
-        Timer::after(Duration::from_millis(500)).await;
+        cx.background_executor().timer(Duration::from_millis(500)).await;
 
         for step in script {
             match step {
                 DemoStep::Type(text) => {
                     for c in text.chars() {
                         run(cx, EditorAction::Type(c));
-                        Timer::after(timing.char_delay).await;
+                        cx.background_executor().timer(timing.char_delay).await;
                     }
                 }
                 DemoStep::Wait(ms) => {
-                    Timer::after(Duration::from_millis(ms)).await;
+                    cx.background_executor().timer(Duration::from_millis(ms)).await;
                 }
                 DemoStep::Action(action) => {
                     run(cx, action);
-                    Timer::after(timing.key_delay).await;
+                    cx.background_executor().timer(timing.key_delay).await;
                 }
             }
         }
 
-        Timer::after(Duration::from_millis(500)).await;
-        let _ = cx.update(|cx| {
+        cx.background_executor().timer(Duration::from_millis(500)).await;
+        cx.update(|cx| {
             if let Some(wh) = cx.windows().first().copied() {
                 let _ = cx.update_window(wh, |_, _, cx| {
                     editor.update(cx, |editor, _| editor.set_input_blocked(false));
@@ -133,7 +133,7 @@ fn main() {
         load_file(&file_path)
     };
 
-    let app = Application::new().with_http_client(http::Client::new());
+    let app = gpui_platform::application().with_http_client(http::Client::new());
 
     app.run(move |cx| {
         cx.set_global(FileInfo {
@@ -150,7 +150,7 @@ fn main() {
             KeyBinding::new("cmd-w", CloseWindow, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _window_id| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -224,7 +224,7 @@ fn main() {
                 });
 
                 // Focus the document editor so it receives keyboard input
-                document_editor.focus_handle(cx).focus(window);
+                document_editor.focus_handle(cx).focus(window, cx);
 
                 // Start demo if in demo mode
                 if demo_mode {
