@@ -269,7 +269,15 @@ mod tests {
             underline: false,
             strikethrough: false,
         };
-        let full = engine.build_line(text, 1.0, 16.0, 1.4, Color::WHITE, None, &[mono.clone()]);
+        let full = engine.build_line(
+            text,
+            1.0,
+            16.0,
+            1.4,
+            Color::WHITE,
+            None,
+            std::slice::from_ref(&mono),
+        );
         let full_width = full.width();
         // Force several wraps.
         let layout = engine.build_line(

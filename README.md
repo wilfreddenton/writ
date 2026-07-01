@@ -18,23 +18,13 @@ cargo install writ --locked
 writ --file path/to/document.md
 ```
 
-To try writ without a file, use demo mode which opens and "plays" scripted input:
+Run without arguments to open a built-in sample document.
 
-```bash
-writ --demo
-```
+writ is rendered on [winit](https://github.com/rust-windowing/winit) + [wgpu](https://wgpu.rs) + [Vello](https://github.com/linebender/vello) + [Parley](https://github.com/linebender/parley) (GPU 2D rendering and text layout). On Linux/Mesa (including Asahi) select the Vulkan backend with `WGPU_BACKEND=vulkan`. Fonts are resolved via [Fontique](https://github.com/linebender/parley) with fontconfig loaded at runtime — no `-dev` headers needed.
 
-Fonts can be configured via command line arguments or environment variables:
+### Inline git diff
 
-```bash
-writ --file doc.md --text-font "Iosevka Aile" --code-font "Iosevka"
-```
-
-```bash
-WRIT_TEXT_FONT="Iosevka Aile" WRIT_CODE_FONT="Iosevka" writ --file doc.md
-```
-
-The default fonts are platform-specific: Segoe UI and Consolas on Windows, the system font and Menlo on macOS, and Liberation Sans and Liberation Mono on Linux.
+When the open file lives in a git repository, writ renders a live inline diff against `HEAD`: added lines and words are tinted green, deleted lines appear as red "ghost" rows above their position, all with the same markdown rendering as the rest of the document. writ watches the file, so edits made by an external tool (e.g. an AI agent) reload and re-diff live.
 
 ### GhostText Integration
 
@@ -110,82 +100,39 @@ Full selection support with click, drag, shift+arrow keys, double-click to selec
 
 ## Library Usage
 
-writ can be embedded as a GPUI component in your own application. Add it as a dependency:
-
-```bash
-cargo add writ
-```
-
-### Basic Usage
+The editing engine is a headless, renderer-free `core::Editor`: a rope buffer,
+cursor/selection, tree-sitter markdown parsing, and an inline git-diff model, with
+no window or GPU dependency. It's the core the Vello shell drives, and it can be
+used directly.
 
 ```rust
-use gpui::{prelude::*, Rems};
-use writ::{Editor, EditorConfig, EditorTheme};
+use std::path::Path;
+use writ::core::Editor;
 
-// Create with default configuration
-let editor = cx.new(|cx| Editor::new("# Hello, world!", cx));
+// Open a file (loads content and the git-HEAD diff base)…
+let mut editor = Editor::open(Path::new("notes.md"));
+// …or start from a string.
+let mut editor = Editor::new("# Hello, world!");
 
-// Or with custom configuration
-let config = EditorConfig {
-    theme: EditorTheme::dracula(),
-    text_font: "Inter".to_string(),
-    code_font: "JetBrains Mono".to_string(),
-    base_path: Some("/path/to/markdown/file".into()),
-    padding_x: Rems(2.0),  // Horizontal padding
-    padding_y: Rems(1.5),  // Vertical padding (scrolls with content)
-};
-let editor = cx.new(|cx| Editor::with_config("# Hello", config, cx));
+// Edit.
+editor.type_char('x');
+editor.enter();
+editor.backspace();
 
-// Access content
-let text = editor.read(cx).text();
-let is_dirty = editor.read(cx).is_dirty();
+// Query.
+editor.text();
+editor.cursor_position();     // cursor byte offset
+editor.selection_range();     // None if collapsed
+editor.is_dirty();
+editor.diff_state();          // inline diff vs HEAD, if any
 
-// Modify content
-editor.update(cx, |e, cx| e.insert("new text", cx));
-editor.update(cx, |e, cx| e.set_text("replacement", cx));
+// Persist.
+editor.save().unwrap();
 ```
 
-### Streaming Support
-
-For AI chat applications that stream markdown responses token by token:
-
-```rust
-// Start streaming (blocks user input, pins cursor to end)
-editor.update(cx, |e, cx| e.begin_streaming(cx));
-
-// Append tokens as they arrive
-for token in ai_response_stream {
-    editor.update(cx, |e, cx| e.append(&token, cx));
-}
-
-// End streaming (restores normal editing)
-editor.update(cx, |e, cx| e.end_streaming(cx));
-```
-
-### Programmatic Actions
-
-Execute editor actions programmatically:
-
-```rust
-use writ::{EditorAction, Direction};
-
-editor.update(cx, |e, cx| {
-    e.execute(EditorAction::Type('x'), window, cx);
-    e.execute(EditorAction::Move(Direction::Left), window, cx);
-    e.execute(EditorAction::Backspace, window, cx);
-    e.execute(EditorAction::Enter, window, cx);
-});
-```
-
-### State Queries
-
-```rust
-editor.read(cx).cursor_position();    // Current cursor byte offset
-editor.read(cx).selection_range();    // None if collapsed, Some(Range) if selecting
-editor.read(cx).is_dirty();           // Modified since last mark_clean()
-editor.read(cx).can_undo();
-editor.read(cx).can_redo();
-```
+Rendering that model to a window — Parley layout with browser-grade line breaking,
+cursor-aware marker hiding, and the inline diff — lives in the `render`,
+`doc_layout`, `text_engine`, and `shell` modules.
 
 ## Architecture
 
@@ -193,7 +140,7 @@ The buffer stores raw markdown text using ropey, a rope data structure that prov
 
 Line information is derived from the parse tree. A preorder traversal collects all nodes in document order, then for each line, binary search finds the relevant nodes and extracts markers. Each line has a list of markers representing block-level syntax elements—a task item inside a blockquote has two markers: `[Checkbox, BlockQuote]` (innermost to outermost). Each marker knows its byte range (the bytes to hide when the cursor is away), its visual substitution (e.g., `-` becomes `•`), and its continuation text for smart enter.
 
-The line component renders each line independently. It determines whether to show or hide markers based on cursor position: if the cursor is on the line, raw markdown syntax is visible for editing; otherwise, markers are hidden and substitutions are shown. For inline styles like bold or italic, the same logic applies per-span. Click handling maps visual positions back to buffer offsets by accounting for hidden characters.
+The renderer lays out each line independently with Parley. It determines whether to show or hide markers based on cursor position: if the cursor is on the line, raw markdown syntax is visible for editing; otherwise, markers are hidden and substitutions are shown. For inline styles like bold or italic, the same logic applies per-span. A per-line display↔buffer segment map translates between the laid-out *display* string (markers hidden) and *buffer* byte offsets, so cursor placement, click hit-testing, and diff highlights all stay aligned.
 
 ### Incremental Parsing
 
