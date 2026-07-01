@@ -43,7 +43,9 @@ fn run_demo(editor: Entity<Editor>, cx: &mut gpui::App) {
             });
         };
 
-        cx.background_executor().timer(Duration::from_millis(500)).await;
+        cx.background_executor()
+            .timer(Duration::from_millis(500))
+            .await;
 
         for step in script {
             match step {
@@ -54,7 +56,9 @@ fn run_demo(editor: Entity<Editor>, cx: &mut gpui::App) {
                     }
                 }
                 DemoStep::Wait(ms) => {
-                    cx.background_executor().timer(Duration::from_millis(ms)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(ms))
+                        .await;
                 }
                 DemoStep::Action(action) => {
                     run(cx, action);
@@ -63,7 +67,9 @@ fn run_demo(editor: Entity<Editor>, cx: &mut gpui::App) {
             }
         }
 
-        cx.background_executor().timer(Duration::from_millis(500)).await;
+        cx.background_executor()
+            .timer(Duration::from_millis(500))
+            .await;
         cx.update(|cx| {
             if let Some(wh) = cx.windows().first().copied() {
                 let _ = cx.update_window(wh, |_, _, cx| {

@@ -16,7 +16,7 @@ use std::sync::mpsc;
 static NEXT_EDITOR_ID: AtomicUsize = AtomicUsize::new(0);
 
 use gpui::{
-    AnyElement, Anchor, App, Context, CursorStyle, DragMoveEvent, Empty, FocusHandle, Focusable,
+    Anchor, AnyElement, App, Context, CursorStyle, DragMoveEvent, Empty, FocusHandle, Focusable,
     Hsla, IntoElement, KeyDownEvent, ListAlignment, ListState, ModifiersChangedEvent, MouseButton,
     ReadGlobal, Render, Rgba, TextRun, Window, anchored, div, font, list, point, prelude::*, px,
 };
@@ -2211,25 +2211,24 @@ impl Editor {
                     .timer(std::time::Duration::from_millis(100))
                     .await;
 
-                let continue_loop = cx
-                    .update(|cx| {
-                        if let Some(editor) = weak.upgrade() {
-                            editor.update(cx, |editor, cx| {
-                                if let Some(rx) = &editor.file_watcher_rx {
-                                    let mut changed = false;
-                                    while rx.try_recv().is_ok() {
-                                        changed = true;
-                                    }
-                                    if changed {
-                                        editor.reload_file(cx);
-                                    }
+                let continue_loop = cx.update(|cx| {
+                    if let Some(editor) = weak.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            if let Some(rx) = &editor.file_watcher_rx {
+                                let mut changed = false;
+                                while rx.try_recv().is_ok() {
+                                    changed = true;
                                 }
-                            });
-                            true
-                        } else {
-                            false
-                        }
-                    });
+                                if changed {
+                                    editor.reload_file(cx);
+                                }
+                            }
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                });
 
                 if !continue_loop {
                     break;
