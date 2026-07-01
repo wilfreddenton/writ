@@ -225,6 +225,16 @@ pub fn peniko_color(c: gpui::Rgba) -> Color {
     )
 }
 
+/// A gpui `Rgba` at an explicit alpha (0..1) — for translucent diff backgrounds.
+pub fn peniko_color_alpha(c: gpui::Rgba, alpha: f32) -> Color {
+    Color::from_rgba8(
+        (c.r * 255.0).round() as u8,
+        (c.g * 255.0).round() as u8,
+        (c.b * 255.0).round() as u8,
+        (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

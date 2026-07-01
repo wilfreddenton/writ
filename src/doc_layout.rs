@@ -11,9 +11,10 @@ use std::ops::Range;
 
 use parley::{Affinity, Cursor, Selection};
 use vello::Scene;
-use vello::peniko::Brush;
+use vello::peniko::{Brush, Color};
 
 use crate::buffer::RenderSnapshot;
+use crate::diff::DiffState;
 use crate::editor::EditorTheme;
 use crate::render::build_line_render;
 use crate::segment_map::SegmentMap;
@@ -21,6 +22,14 @@ use crate::text_engine::{TextEngine, peniko_color};
 
 /// A screen-space rectangle (device px), already offset by padding + scroll.
 pub type ScreenRect = (f64, f64, f64, f64);
+
+/// Inline git-diff decorations for one real line (added-line bg + word ranges).
+#[derive(Default)]
+struct LineDiff {
+    is_addition: bool,
+    /// Display byte ranges of word-level additions within the line.
+    inline: Vec<Range<usize>>,
+}
 
 /// Prefix-sum tops for `heights`: `out[0] = pad_top`, `out[i+1] = out[i] +
 /// heights[i]`. Length is `heights.len() + 1`.
@@ -41,9 +50,13 @@ pub struct DocLayout {
     maps: Vec<SegmentMap>,
     /// Per-line buffer byte ranges (incl. trailing newline), parallel to `layouts`.
     line_ranges: Vec<Range<usize>>,
+    /// Per-line inline git-diff decorations, parallel to `layouts`.
+    line_diffs: Vec<LineDiff>,
     /// Top y of each line; length `layouts.len() + 1`. Device px.
     tops: Vec<f32>,
     pub scroll_y: f32,
+    /// Surface width in device px (for full-width diff row backgrounds).
+    width: f32,
     pad_top: f32,
     pad_bottom: f32,
     pad_x: f32,
@@ -57,6 +70,7 @@ impl DocLayout {
         engine: &mut TextEngine,
         snapshot: &RenderSnapshot,
         theme: &EditorTheme,
+        diff: Option<&DiffState>,
         cursor_offset: usize,
         device_width: f32,
         scale: f32,
@@ -72,6 +86,7 @@ impl DocLayout {
         let mut layouts = Vec::with_capacity(n);
         let mut maps = Vec::with_capacity(n);
         let mut line_ranges = Vec::with_capacity(n);
+        let mut line_diffs = Vec::with_capacity(n);
         let mut heights = Vec::with_capacity(n);
         for i in 0..n {
             let lr = build_line_render(snapshot, i, theme, base_font_size, cursor_offset);
@@ -84,17 +99,46 @@ impl DocLayout {
                 Some(max_advance),
                 &lr.runs,
             );
+            let range = snapshot.line_markers(i).range;
+            // Inline diff: map added word ranges (line-relative buffer bytes) through
+            // this line's segment map into display ranges.
+            let line_diff = match diff {
+                Some(d) if d.is_addition(i) => {
+                    let inline = d
+                        .new_inline_changes(i)
+                        .map(|changes| {
+                            changes
+                                .iter()
+                                .filter_map(|c| {
+                                    let dr = lr.map.buffer_range_to_display(
+                                        range.start + c.range.start..range.start + c.range.end,
+                                    );
+                                    (!dr.is_empty()).then_some(dr)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    LineDiff {
+                        is_addition: true,
+                        inline,
+                    }
+                }
+                _ => LineDiff::default(),
+            };
             heights.push(layout.height());
             layouts.push(layout);
             maps.push(lr.map);
-            line_ranges.push(snapshot.line_markers(i).range);
+            line_ranges.push(range);
+            line_diffs.push(line_diff);
         }
         Self {
             layouts,
             maps,
             line_ranges,
+            line_diffs,
             tops: compute_tops(&heights, pad_top * scale),
             scroll_y: 0.0,
+            width: device_width,
             pad_top: pad_top * scale,
             pad_bottom: pad_bottom * scale,
             pad_x: pad_x * scale,
@@ -243,6 +287,58 @@ impl DocLayout {
             engine.draw_line(scene, &self.layouts[i], (self.pad_x, y));
         }
     }
+
+    /// Paint inline-diff backgrounds for added lines (faint full-row bg + stronger
+    /// word-change bg). Call BEFORE `draw` so glyphs sit on top.
+    pub fn draw_added_backgrounds(
+        &self,
+        scene: &mut Scene,
+        viewport_h: f32,
+        row_bg: Color,
+        inline_bg: Color,
+    ) {
+        use vello::kurbo::{Affine, Rect};
+        use vello::peniko::Fill;
+
+        let (first, last) = self.visible_range(viewport_h);
+        for i in first..last {
+            let d = &self.line_diffs[i];
+            if !d.is_addition {
+                continue;
+            }
+            let top = (self.tops[i] - self.scroll_y) as f64;
+            let bottom = (self.tops[i + 1] - self.scroll_y) as f64;
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                row_bg,
+                None,
+                &Rect::new(0.0, top, self.width as f64, bottom),
+            );
+            // Word-level additions, via the same per-visual-row geometry as selection.
+            let layout = &self.layouts[i];
+            for r in &d.inline {
+                let sel = Selection::new(
+                    Cursor::from_byte_index(layout, r.start, Affinity::Downstream),
+                    Cursor::from_byte_index(layout, r.end, Affinity::Upstream),
+                );
+                for (bb, _) in sel.geometry(layout) {
+                    scene.fill(
+                        Fill::NonZero,
+                        Affine::IDENTITY,
+                        inline_bg,
+                        None,
+                        &Rect::new(
+                            bb.x0 + self.pad_x as f64,
+                            bb.y0 + top,
+                            bb.x1 + self.pad_x as f64,
+                            bb.y1 + top,
+                        ),
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -273,8 +369,10 @@ mod tests {
                 .map(|_| SegmentMap::identity("", 0).1)
                 .collect(),
             line_ranges: heights.iter().map(|_| 0..0).collect(),
+            line_diffs: heights.iter().map(|_| LineDiff::default()).collect(),
             tops: compute_tops(heights, pad_top),
             scroll_y: 0.0,
+            width: 100.0,
             pad_top,
             pad_bottom,
             pad_x: 0.0,
@@ -324,6 +422,7 @@ mod tests {
             &mut engine,
             &snapshot,
             &theme,
+            None,
             0,
             1200.0,
             1.0,

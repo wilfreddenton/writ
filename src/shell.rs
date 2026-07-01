@@ -28,7 +28,7 @@ use winit::window::{Window, WindowId};
 use crate::core::Editor;
 use crate::doc_layout::DocLayout;
 use crate::editor::{Direction, EditorTheme};
-use crate::text_engine::{TextEngine, peniko_color};
+use crate::text_engine::{TextEngine, peniko_color, peniko_color_alpha};
 
 const PADDING: f32 = 24.0;
 const FONT_SIZE: f32 = 18.0;
@@ -213,11 +213,14 @@ fn rebuild_doc(
     scale: f32,
 ) -> DocLayout {
     let cursor_offset = editor.cursor_position();
+    // Clone the diff before borrowing the buffer mutably for the snapshot.
+    let diff = editor.diff_state().cloned();
     let snapshot = editor.state.buffer.render_snapshot();
     DocLayout::build(
         engine,
         &snapshot,
         theme,
+        diff.as_ref(),
         cursor_offset,
         device_width,
         scale,
@@ -425,7 +428,13 @@ impl ApplicationHandler for App {
 
                 let viewport_h = state.surface.config.height as f32;
                 if let Some(doc) = self.doc.as_ref() {
-                    // Selection under the glyphs, then glyphs, then the caret on top.
+                    // Draw order (all before glyphs): diff row/word bg, then selection.
+                    doc.draw_added_backgrounds(
+                        &mut self.scene,
+                        viewport_h,
+                        peniko_color_alpha(self.theme.green, 0.05),
+                        peniko_color_alpha(self.theme.green, 0.25),
+                    );
                     if let Some(sel) = self.editor.selection_range() {
                         let color = peniko_color(self.theme.selection);
                         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
@@ -563,9 +572,23 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         editor.click(a, false, 1);
         editor.drag(b);
     }
+    // Optional diff: set a HEAD base that differs from the current doc so additions
+    // (green) + a word-level change render. Exercises the inline-diff path.
+    if std::env::var("WRIT_SHELL_DIFF").is_ok() {
+        let base = SAMPLE_DOC
+            .replace("## Scrolling\n\n", "")
+            .replace("**whole document**", "**the document**");
+        editor.set_head_base(&base);
+    }
     let mut doc = rebuild_doc(&mut engine, &mut editor, &theme, width as f32, 1.0);
     doc.scroll_by(scroll_y, height as f32);
     let mut scene = Scene::new();
+    doc.draw_added_backgrounds(
+        &mut scene,
+        height as f32,
+        peniko_color_alpha(theme.green, 0.05),
+        peniko_color_alpha(theme.green, 0.25),
+    );
     if let Some(sel) = editor.selection_range() {
         let color = peniko_color(theme.selection);
         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
