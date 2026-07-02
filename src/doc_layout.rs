@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::rc::Rc;
 
 use parley::{Affinity, Cursor, Selection};
 use vello::Scene;
@@ -87,7 +88,7 @@ fn line_key(
 /// touched in a frame are swept so it stays bounded to the current document.
 #[derive(Default)]
 pub struct LineCache {
-    map: HashMap<u64, parley::Layout<Brush>>,
+    map: HashMap<u64, Rc<parley::Layout<Brush>>>,
     used: HashSet<u64>,
 }
 
@@ -100,13 +101,18 @@ impl LineCache {
         self.used.clear();
     }
 
+    /// Returns a shared handle to the (cached) layout. `Rc::clone` is a refcount
+    /// bump, not a deep copy of the shaped glyphs — the win for large documents.
     fn get_or_build(
         &mut self,
         key: u64,
         build: impl FnOnce() -> parley::Layout<Brush>,
-    ) -> parley::Layout<Brush> {
+    ) -> Rc<parley::Layout<Brush>> {
         self.used.insert(key);
-        self.map.entry(key).or_insert_with(build).clone()
+        self.map
+            .entry(key)
+            .or_insert_with(|| Rc::new(build()))
+            .clone()
     }
 
     fn sweep(&mut self) {
@@ -146,7 +152,7 @@ fn cursor_key_for(range: &Range<usize>, cursor: usize) -> usize {
 /// don't bump the buffer version) recompute only the handful of lines that changed.
 #[derive(Default)]
 pub struct RenderCache {
-    map: HashMap<u64, LineRender>,
+    map: HashMap<u64, Rc<LineRender>>,
     used: HashSet<u64>,
 }
 
@@ -159,9 +165,18 @@ impl RenderCache {
         self.used.clear();
     }
 
-    fn get_or_build(&mut self, key: u64, build: impl FnOnce() -> LineRender) -> LineRender {
+    /// Returns a shared handle. `Rc::clone` avoids deep-copying the `LineRender`
+    /// (its `String` + style runs + `SegmentMap`) on every cache hit.
+    fn get_or_build(
+        &mut self,
+        key: u64,
+        build: impl FnOnce() -> LineRender,
+    ) -> Rc<LineRender> {
         self.used.insert(key);
-        self.map.entry(key).or_insert_with(build).clone()
+        self.map
+            .entry(key)
+            .or_insert_with(|| Rc::new(build()))
+            .clone()
     }
 
     fn sweep(&mut self) {
@@ -268,9 +283,10 @@ fn compute_tops(heights: &[f32], pad_top: f32) -> Vec<f32> {
 }
 
 pub struct DocLayout {
-    layouts: Vec<parley::Layout<Brush>>,
-    /// Per-line display↔buffer maps, parallel to `layouts` (Phase 4 cursor/click).
-    maps: Vec<SegmentMap>,
+    layouts: Vec<Rc<parley::Layout<Brush>>>,
+    /// Per-line render results (shared with the RenderCache via `Rc`), parallel to
+    /// `layouts`. Their `.map` is the display↔buffer map for cursor/click math.
+    renders: Vec<Rc<LineRender>>,
     /// Per-line buffer byte ranges (incl. trailing newline), parallel to `layouts`.
     line_ranges: Vec<Range<usize>>,
     /// Per-line inline git-diff decorations, parallel to `layouts`.
@@ -321,7 +337,7 @@ impl DocLayout {
         cache.begin();
         render_cache.begin();
         let mut layouts = Vec::with_capacity(n);
-        let mut maps = Vec::with_capacity(n);
+        let mut renders = Vec::with_capacity(n);
         let mut line_ranges = Vec::with_capacity(n);
         let mut line_diffs = Vec::with_capacity(n);
         let mut ghosts = Vec::with_capacity(n);
@@ -354,7 +370,14 @@ impl DocLayout {
                     build_line_render(snapshot, i, theme, base_font_size, cursor_offset, &[])
                 })
             } else {
-                build_line_render(snapshot, i, theme, base_font_size, cursor_offset, &extra)
+                Rc::new(build_line_render(
+                    snapshot,
+                    i,
+                    theme,
+                    base_font_size,
+                    cursor_offset,
+                    &extra,
+                ))
             };
             let key = line_key(
                 &lr.text,
@@ -403,7 +426,7 @@ impl DocLayout {
             };
             heights.push(gh + layout.height());
             layouts.push(layout);
-            maps.push(lr.map);
+            renders.push(lr);
             line_ranges.push(range);
             line_diffs.push(line_diff);
             ghosts.push(line_ghosts);
@@ -419,7 +442,7 @@ impl DocLayout {
         };
         Self {
             layouts,
-            maps,
+            renders,
             line_ranges,
             line_diffs,
             ghosts,
@@ -442,7 +465,7 @@ impl DocLayout {
 
     /// The display↔buffer map for a line (Phase 4 cursor/click math).
     pub fn line_map(&self, line: usize) -> Option<&SegmentMap> {
-        self.maps.get(line)
+        self.renders.get(line).map(|r| &r.map)
     }
 
     /// Buffer line index containing `buffer_off` (clamped to the last line).
@@ -468,7 +491,7 @@ impl DocLayout {
     pub fn caret_rect(&self, buffer_off: usize, caret_width: f32) -> Option<ScreenRect> {
         let line = self.line_of(buffer_off);
         let layout = self.layouts.get(line)?;
-        let display_off = self.maps[line].buffer_to_display(buffer_off);
+        let display_off = self.renders[line].map.buffer_to_display(buffer_off);
         let cursor = Cursor::from_byte_index(layout, display_off, Affinity::Downstream);
         let bb = cursor.geometry(layout, caret_width);
         let dx = self.pad_x as f64;
@@ -492,7 +515,7 @@ impl DocLayout {
             if s >= e {
                 continue;
             }
-            let map = &self.maps[line];
+            let map = &self.renders[line].map;
             let ds = map.buffer_to_display(s);
             let de = map.buffer_to_display(e);
             if ds >= de {
@@ -534,7 +557,7 @@ impl DocLayout {
         let lx = (x - self.pad_x).max(0.0);
         let ly = (cy - real_top).max(0.0);
         let display_off = Cursor::from_point(layout, lx, ly).index();
-        Some(self.maps[line].display_to_buffer(display_off))
+        Some(self.renders[line].map.display_to_buffer(display_off))
     }
 
     /// Scroll the minimum amount so the line containing `buffer_off` is visible.
@@ -701,10 +724,17 @@ mod tests {
     /// without a GPU/font stack.
     fn fixture(heights: &[f32], pad_top: f32, pad_bottom: f32) -> DocLayout {
         DocLayout {
-            layouts: heights.iter().map(|_| parley::Layout::new()).collect(),
-            maps: heights
+            layouts: heights.iter().map(|_| Rc::new(parley::Layout::new())).collect(),
+            renders: heights
                 .iter()
-                .map(|_| SegmentMap::identity("", 0).1)
+                .map(|_| {
+                    Rc::new(LineRender {
+                        text: String::new(),
+                        font_size: 18.0,
+                        runs: Vec::new(),
+                        map: SegmentMap::identity("", 0).1,
+                    })
+                })
                 .collect(),
             line_ranges: heights.iter().map(|_| 0..0).collect(),
             line_diffs: heights.iter().map(|_| LineDiff::default()).collect(),
