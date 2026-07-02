@@ -322,7 +322,10 @@ impl Editor {
         let snapshot = self.state.buffer.render_snapshot();
         let mut github_matches_by_line = HashMap::new();
         let mut urls_by_line = HashMap::new();
+        // Bucket inline styles once (O(n + styles)); per-line lookup was O(n²) here too.
+        let styles_by_line = snapshot.inline_styles_by_line();
 
+        #[allow(clippy::needless_range_loop)]
         for line_idx in start_line..end_line.min(snapshot.line_count()) {
             let line = snapshot.line_markers(line_idx);
             let line_range = line.range.clone();
@@ -334,7 +337,7 @@ impl Editor {
                 )
                 .to_string();
 
-            let inline_styles = snapshot.inline_styles_for_line(line_idx);
+            let inline_styles = &styles_by_line[line_idx];
             let code_ranges: Vec<_> = inline_styles
                 .iter()
                 .filter(|s| s.style.code)

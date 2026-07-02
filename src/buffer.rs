@@ -85,6 +85,37 @@ impl RenderSnapshot {
         line_markers_from(&self.parsed, &self.rope, line_idx)
     }
 
+    /// Tree inline styles bucketed per line (index = line), in one O(n + styles)
+    /// pass — the whole-document replacement for calling `inline_styles_in_range`
+    /// per line, which is O(n²) because `styles_in_range` scans all earlier styles.
+    /// No synthetic checkbox regions (callers that need them inject per line).
+    pub fn inline_styles_by_line(&self) -> Vec<Vec<StyledRegion>> {
+        let n = self.line_count;
+        let mut buckets: Vec<Vec<StyledRegion>> = vec![Vec::new(); n];
+        if n == 0 {
+            return buckets;
+        }
+        let line_starts: Vec<usize> = (0..n).map(|i| self.line_byte_range(i).start).collect();
+        // Line containing byte `off` (the last line whose start is <= off).
+        let line_of = |off: usize| line_starts.partition_point(|&s| s <= off).saturating_sub(1);
+
+        for region in self.inline_styles.iter() {
+            let first = line_of(region.full_range.start).min(n - 1);
+            // A region overlaps a line iff region.end > line.start, so the last line
+            // it touches is the one containing its last byte (end - 1).
+            let last_byte = region
+                .full_range
+                .end
+                .saturating_sub(1)
+                .max(region.full_range.start);
+            let last = line_of(last_byte).max(first).min(n - 1);
+            for bucket in buckets.iter_mut().take(last + 1).skip(first) {
+                bucket.push(region.clone());
+            }
+        }
+        buckets
+    }
+
     /// Get inline styles for a specific line. O(log n) binary search.
     /// Also injects a synthetic StyledRegion for any checkbox marker on the line.
     pub fn inline_styles_for_line(&self, line_idx: usize) -> Vec<StyledRegion> {
@@ -786,6 +817,37 @@ impl FromStr for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The linear `inline_styles_by_line` bucketing must match the original
+    /// per-line `styles_in_range` (tree styles only), including multi-line emphasis
+    /// that spans a soft line break and an enclosing region over nested ones.
+    #[test]
+    fn inline_styles_by_line_matches_styles_in_range() {
+        let src = "**bold** and *italic*\n\
+                   a `code` span here\n\
+                   soft **wrapped\n\
+                   emphasis** across lines\n\
+                   plain final line\n";
+        let mut buf: Buffer = src.parse().unwrap();
+        let snap = buf.render_snapshot();
+        let buckets = snap.inline_styles_by_line();
+        assert_eq!(buckets.len(), snap.line_count());
+        for (i, bucket) in buckets.iter().enumerate() {
+            let range = snap.line_byte_range(i);
+            let expected: Vec<StyledRegion> = styles_in_range(&snap.inline_styles, &range)
+                .into_iter()
+                .cloned()
+                .collect();
+            assert_eq!(*bucket, expected, "line {i} bucket mismatch (range {range:?})");
+        }
+        // The multi-line emphasis must appear in both spanned lines' buckets.
+        let spans_line2 = buckets[2].iter().any(|s| s.style.bold);
+        let spans_line3 = buckets[3].iter().any(|s| s.style.bold);
+        assert!(
+            spans_line2 && spans_line3,
+            "multi-line bold should bucket into both lines"
+        );
+    }
 
     #[test]
     fn test_new_buffer_is_empty() {

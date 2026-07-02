@@ -217,6 +217,7 @@ struct DiffColors {
 fn build_ghosts_before(
     engine: &mut TextEngine,
     diff: Option<&DiffState>,
+    old_line_styles: Option<&[Vec<StyledRegion>]>,
     new_line: usize,
     theme: &EditorTheme,
     scale: f32,
@@ -235,7 +236,11 @@ fn build_ghosts_before(
         if old_line >= old.line_count() {
             break;
         }
-        let lr = build_line_render(old, old_line, theme, base_font_size, usize::MAX, &[]);
+        let styles = old_line_styles
+            .and_then(|s| s.get(old_line))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let lr = build_line_render(old, old_line, theme, base_font_size, usize::MAX, styles, &[]);
         let layout = engine.build_line(
             &lr.text,
             scale,
@@ -336,6 +341,11 @@ impl DocLayout {
         let n = snapshot.line_count();
         cache.begin();
         render_cache.begin();
+        // Bucket inline styles per line once (O(n + styles)) instead of the O(n²)
+        // per-line `styles_in_range` scan — the dominant per-keystroke cost on large
+        // docs. Ghosts get the HEAD snapshot's buckets (only computed if a diff exists).
+        let line_styles = snapshot.inline_styles_by_line();
+        let old_line_styles = diff.map(|d| d.old_snapshot.inline_styles_by_line());
         let mut layouts = Vec::with_capacity(n);
         let mut renders = Vec::with_capacity(n);
         let mut line_ranges = Vec::with_capacity(n);
@@ -344,11 +354,14 @@ impl DocLayout {
         let mut ghost_height = Vec::with_capacity(n);
         // Each line's total height = its ghost block above + the real line.
         let mut heights = Vec::with_capacity(n);
+        // `i` indexes several parallel per-line inputs (styles, markers, diff).
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
             let line_ghosts = build_ghosts_before(
                 engine,
                 diff,
+                old_line_styles.as_deref(),
                 i,
                 theme,
                 scale,
@@ -367,7 +380,15 @@ impl DocLayout {
                 let range = snapshot.line_byte_range(i);
                 let key = render_key(version, i, cursor_key_for(&range, cursor_offset));
                 render_cache.get_or_build(key, || {
-                    build_line_render(snapshot, i, theme, base_font_size, cursor_offset, &[])
+                    build_line_render(
+                        snapshot,
+                        i,
+                        theme,
+                        base_font_size,
+                        cursor_offset,
+                        &line_styles[i],
+                        &[],
+                    )
                 })
             } else {
                 Rc::new(build_line_render(
@@ -376,6 +397,7 @@ impl DocLayout {
                     theme,
                     base_font_size,
                     cursor_offset,
+                    &line_styles[i],
                     &extra,
                 ))
             };

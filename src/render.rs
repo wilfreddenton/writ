@@ -12,7 +12,7 @@
 
 use crate::buffer::RenderSnapshot;
 use crate::editor::EditorTheme;
-use crate::inline::StyledRegion;
+use crate::inline::{StyledRegion, TextStyle};
 use crate::marker::MarkerKind;
 use crate::segment_map::{SegmentMap, Special};
 use crate::text_engine::{StyleRun, peniko_color};
@@ -47,12 +47,17 @@ fn heading_scale(level: u8) -> f32 {
 /// `extra_regions` are additional inline styled regions to merge in (validated
 /// GitHub refs → cyan/underline links, and naked-URL shortening via `display_text`).
 /// They carry absolute buffer ranges, like the snapshot's own inline styles.
+/// `line_styles` are this line's tree inline styles (bucketed by the caller via
+/// `RenderSnapshot::inline_styles_by_line`, without checkbox regions — this fn
+/// injects those from `markers`). Passing them in avoids the O(n²) per-line
+/// `styles_in_range` scan when laying out a whole document.
 pub fn build_line_render(
     snapshot: &RenderSnapshot,
     line_idx: usize,
     theme: &EditorTheme,
     base_font_size: f32,
     cursor_offset: usize,
+    line_styles: &[StyledRegion],
     extra_regions: &[StyledRegion],
 ) -> LineRender {
     let markers = snapshot.line_markers(line_idx);
@@ -80,8 +85,25 @@ pub fn build_line_render(
     };
     let in_code_block = markers.in_code_block || markers.is_fence();
 
-    // Reuse the markers we already computed above (avoids a second line_markers scan).
-    let mut inline = snapshot.inline_styles_in_range(&range, &markers);
+    // Pre-bucketed tree styles + a synthetic checkbox region (from markers), sorted
+    // by start to match the old `inline_styles_in_range` order; then GitHub extras.
+    let mut inline: Vec<StyledRegion> = line_styles.to_vec();
+    for marker in &markers.markers {
+        if let MarkerKind::Checkbox { checked } = marker.kind {
+            // The checkbox marker range is "[ ] " (4 bytes); style only "[ ]" (3).
+            let checkbox_range = marker.range.start..marker.range.start + 3;
+            inline.push(StyledRegion {
+                full_range: checkbox_range.clone(),
+                content_range: checkbox_range,
+                style: TextStyle::default(),
+                link_url: None,
+                is_image: false,
+                checkbox: Some(checked),
+                display_text: None,
+            });
+        }
+    }
+    inline.sort_by_key(|s| s.full_range.start);
     inline.extend_from_slice(extra_regions);
 
     // Collect the buffer ranges hidden or collapsed on the way to the display.
@@ -249,7 +271,7 @@ mod tests {
         let theme = EditorTheme::dracula();
         // "#1" is bytes 4..6. Cursor off the line so nothing is revealed.
         let extra = [link_region(4..6)];
-        let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &extra);
+        let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &[], &extra);
         let link_run = lr
             .runs
             .iter()
@@ -269,7 +291,7 @@ mod tests {
         let mut buffer: Buffer = "See #1 today\n".parse().unwrap();
         let snapshot = buffer.render_snapshot();
         let theme = EditorTheme::dracula();
-        let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &[]);
+        let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &[], &[]);
         assert!(!lr.runs.iter().any(|r| r.underline));
     }
 }
