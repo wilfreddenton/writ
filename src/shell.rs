@@ -354,11 +354,34 @@ fn apply_key(
             true
         }
         _ => {
-            // Printable text (respects shift for capitals/symbols). Skip when a
-            // command modifier is held so shortcuts don't type characters.
+            // Command shortcuts (Ctrl or Super held). Any other Ctrl+key is swallowed
+            // so it doesn't type a character.
             if ctrl {
+                if let Key::Character(c) = &event.logical_key {
+                    let c = c.as_str();
+                    if c.eq_ignore_ascii_case("s") {
+                        if let Err(e) = editor.save() {
+                            eprintln!("[writ] save failed: {e}");
+                        }
+                        return true; // redraw so the title's dirty marker clears
+                    }
+                    if c.eq_ignore_ascii_case("z") {
+                        // Ctrl+Shift+Z = redo, Ctrl+Z = undo.
+                        if shift {
+                            editor.redo();
+                        } else {
+                            editor.undo();
+                        }
+                        return true;
+                    }
+                    if c.eq_ignore_ascii_case("y") {
+                        editor.redo();
+                        return true;
+                    }
+                }
                 return false;
             }
+            // Printable text (respects shift for capitals/symbols).
             if let Some(text) = &event.text
                 && !text.is_empty()
                 && !text.chars().any(|c| c.is_control())
