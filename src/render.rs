@@ -270,15 +270,16 @@ pub fn build_line_render(
                 continue;
             }
             let style = &region.style;
-            let color = if region.link_url.is_some() {
-                peniko_color(theme.cyan)
-            } else if style.code {
-                peniko_color(theme.green)
-            } else {
-                fg
+            let color = match region.checkbox {
+                // A checked box reads as "done" (green); an empty box is muted.
+                Some(true) => peniko_color(theme.green),
+                Some(false) => peniko_color(theme.comment),
+                None if region.link_url.is_some() => peniko_color(theme.cyan),
+                None if style.code => peniko_color(theme.green),
+                None => fg,
             };
             let mut run = StyleRun::new(r, color);
-            run.bold = style.bold || heading_level > 0;
+            run.bold = style.bold || heading_level > 0 || region.checkbox == Some(true);
             run.italic = style.italic;
             run.mono = style.code;
             run.strikethrough = style.strikethrough;
