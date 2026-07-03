@@ -105,51 +105,35 @@ pub struct LineMarkers {
 }
 
 impl LineMarkers {
+    /// Combined byte span of the markers matching `pred`, in one pass. Markers are
+    /// stored outermost-first, so the first match carries the widest right edge and
+    /// the last match the leftmost start — mirroring the old filter-to-Vec then
+    /// `last().start .. first().end`, without the intermediate allocation.
+    fn span_of(&self, pred: impl Fn(&Marker) -> bool) -> Option<Range<usize>> {
+        let mut iter = self.markers.iter().filter(|m| pred(m));
+        let first = iter.next()?;
+        let end = first.range.end;
+        let start = iter.last().map_or(first.range.start, |m| m.range.start);
+        Some(start..end)
+    }
+
     /// Returns the combined byte range of spacer markers (excluding Checkbox).
     /// Checkbox markers are rendered inline, not as spacers, so they don't
     /// contribute to wrap indent.
     pub fn marker_range(&self) -> Option<Range<usize>> {
-        // Filter out Checkbox markers - they're rendered inline, not as spacers
-        let spacer_markers: Vec<_> = self
-            .markers
-            .iter()
-            .filter(|m| !matches!(m.kind, MarkerKind::Checkbox { .. }))
-            .collect();
-
-        if spacer_markers.is_empty() {
-            return None;
-        }
-        let start = spacer_markers.last()?.range.start;
-        let end = spacer_markers.first()?.range.end;
-        Some(start..end)
+        self.span_of(|m| !matches!(m.kind, MarkerKind::Checkbox { .. }))
     }
 
     /// Returns the combined byte range of ALL markers (including Checkbox).
     /// Used for determining where content actually starts.
     pub fn full_marker_range(&self) -> Option<Range<usize>> {
-        if self.markers.is_empty() {
-            return None;
-        }
-        let start = self.markers.last()?.range.start;
-        let end = self.markers.first()?.range.end;
-        Some(start..end)
+        self.span_of(|_| true)
     }
 
     /// Returns the range of prefix markers (Indent, BlockQuote) that are rendered as spacers.
     /// Excludes CodeBlockFence markers. Used by fence lines to know where fence content starts.
     pub fn prefix_marker_range(&self) -> Option<Range<usize>> {
-        let prefix_markers: Vec<_> = self
-            .markers
-            .iter()
-            .filter(|m| matches!(m.kind, MarkerKind::Indent | MarkerKind::BlockQuote))
-            .collect();
-
-        if prefix_markers.is_empty() {
-            return None;
-        }
-        let start = prefix_markers.last()?.range.start;
-        let end = prefix_markers.first()?.range.end;
-        Some(start..end)
+        self.span_of(|m| matches!(m.kind, MarkerKind::Indent | MarkerKind::BlockQuote))
     }
 
     /// Returns the byte offset where content starts (after all markers).

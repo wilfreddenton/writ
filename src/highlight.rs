@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -40,6 +41,17 @@ pub const HIGHLIGHT_NAMES: &[&str] = &[
 pub struct HighlightSpan {
     pub range: Range<usize>,
     pub highlight_id: usize,
+}
+
+/// Language keys are stored lowercase. Only allocate when the input actually has an
+/// uppercase byte — the overwhelmingly common case (already-lowercase fence infos)
+/// borrows unchanged.
+fn normalized_lang(lang: &str) -> Cow<'_, str> {
+    if lang.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(lang.to_lowercase())
+    } else {
+        Cow::Borrowed(lang)
+    }
 }
 
 struct LanguageConfig {
@@ -126,12 +138,11 @@ impl Highlighter {
     }
 
     pub fn supports_language(&self, lang: &str) -> bool {
-        self.languages.contains_key(&lang.to_lowercase())
+        self.languages.contains_key(normalized_lang(lang).as_ref())
     }
 
     pub fn highlight(&mut self, code: &str, language: &str) -> Vec<HighlightSpan> {
-        let lang_lower = language.to_lowercase();
-        let Some(lang_config) = self.languages.get(&lang_lower) else {
+        let Some(lang_config) = self.languages.get(normalized_lang(language).as_ref()) else {
             return Vec::new();
         };
 
@@ -147,18 +158,28 @@ impl Highlighter {
         };
 
         // Convert events to spans
-        let mut spans = Vec::new();
+        let mut spans: Vec<HighlightSpan> = Vec::new();
         let mut current_highlight: Option<usize> = None;
 
         for event in highlights {
             match event {
                 Ok(HighlightEvent::Source { start, end }) => {
                     if let Some(highlight_id) = current_highlight {
-                        // We have an active highlight - record this span
-                        spans.push(HighlightSpan {
-                            range: start..end,
-                            highlight_id,
-                        });
+                        // Coalesce with the previous span when it carries the same id and
+                        // butts right up against this one — tree-sitter emits Source events
+                        // token-by-token, so a run of one color arrives as many adjacent spans.
+                        match spans.last_mut() {
+                            Some(last)
+                                if last.highlight_id == highlight_id
+                                    && last.range.end == start =>
+                            {
+                                last.range.end = end;
+                            }
+                            _ => spans.push(HighlightSpan {
+                                range: start..end,
+                                highlight_id,
+                            }),
+                        }
                     }
                 }
                 Ok(HighlightEvent::HighlightStart(Highlight(id))) => {

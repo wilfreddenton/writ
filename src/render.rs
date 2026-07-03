@@ -10,12 +10,22 @@
 //! through that map. Still verbatim: list/blockquote prefix markers (they want
 //! bullet/bar rendering, a later chrome concern).
 
+use std::borrow::Cow;
+use std::ops::Range;
+
 use crate::buffer::RenderSnapshot;
 use crate::editor::EditorTheme;
 use crate::inline::{StyledRegion, TextStyle};
 use crate::marker::MarkerKind;
 use crate::segment_map::{SegmentMap, Special};
 use crate::text_engine::{StyleRun, peniko_color};
+
+/// Half-open-on-the-left, closed-on-the-right containment: the cursor is "in" a
+/// region when sitting anywhere from its start through its end (so a cursor at the
+/// closing delimiter still reveals the region for editing).
+fn cursor_in(range: &Range<usize>, cursor: usize) -> bool {
+    cursor >= range.start && cursor <= range.end
+}
 
 /// Fully-resolved styling for one line, ready to hand to `TextEngine::build_line`.
 #[derive(Clone)]
@@ -78,33 +88,47 @@ pub fn build_line_render(
 
     let heading_level = markers.heading_level().unwrap_or(0);
     let font_size = base_font_size * heading_scale(heading_level);
-    let cursor_on_line = if range.start == range.end {
-        cursor_offset == range.start
-    } else {
-        cursor_offset >= range.start && cursor_offset <= range.end
-    };
+    let cursor_on_line = cursor_in(&range, cursor_offset);
     let in_code_block = markers.in_code_block || markers.is_fence();
 
-    // Pre-bucketed tree styles + a synthetic checkbox region (from markers), sorted
-    // by start to match the old `inline_styles_in_range` order; then GitHub extras.
-    let mut inline: Vec<StyledRegion> = line_styles.to_vec();
-    for marker in &markers.markers {
-        if let MarkerKind::Checkbox { checked } = marker.kind {
-            // The checkbox marker range is "[ ] " (4 bytes); style only "[ ]" (3).
-            let checkbox_range = marker.range.start..marker.range.start + 3;
-            inline.push(StyledRegion {
-                full_range: checkbox_range.clone(),
-                content_range: checkbox_range,
-                style: TextStyle::default(),
-                link_url: None,
-                is_image: false,
-                checkbox: Some(checked),
-                display_text: None,
-            });
+    // Pre-bucketed tree styles (already sorted by start, since `inline_styles` is)
+    // plus a synthetic checkbox region from markers, then GitHub extras. The common
+    // case — no checkbox, no extras — borrows `line_styles` untouched, skipping the
+    // per-line clone+sort on every laid-out line.
+    let has_checkbox_style = markers
+        .markers
+        .iter()
+        .any(|m| matches!(m.kind, MarkerKind::Checkbox { .. }));
+    let inline: Cow<[StyledRegion]> = if !has_checkbox_style && extra_regions.is_empty() {
+        Cow::Borrowed(line_styles)
+    } else {
+        let mut inline: Vec<StyledRegion> = line_styles.to_vec();
+        for marker in &markers.markers {
+            if let MarkerKind::Checkbox { checked } = marker.kind {
+                // The checkbox marker range is "[ ] " (4 bytes); style only "[ ]" (3).
+                let checkbox_range = marker.range.start..marker.range.start + 3;
+                inline.push(StyledRegion {
+                    full_range: checkbox_range.clone(),
+                    content_range: checkbox_range,
+                    style: TextStyle::default(),
+                    link_url: None,
+                    is_image: false,
+                    checkbox: Some(checked),
+                    display_text: None,
+                });
+            }
         }
-    }
-    inline.sort_by_key(|s| s.full_range.start);
-    inline.extend_from_slice(extra_regions);
+        inline.sort_by_key(|s| s.full_range.start);
+        inline.extend_from_slice(extra_regions);
+        Cow::Owned(inline)
+    };
+
+    // Each region's cursor-inside verdict, computed once and reused by the specials
+    // and style-run passes below (both would otherwise recompute it).
+    let cursor_inside: Vec<bool> = inline
+        .iter()
+        .map(|r| cursor_in(&r.full_range, cursor_offset))
+        .collect();
 
     // Collect the buffer ranges hidden or collapsed on the way to the display.
     // Code blocks and thematic breaks show their markers verbatim.
@@ -148,10 +172,8 @@ pub fn build_line_render(
                 });
             }
         }
-        for region in &inline {
-            let cursor_inside =
-                cursor_offset >= region.full_range.start && cursor_offset <= region.full_range.end;
-            if cursor_inside {
+        for (i, region) in inline.iter().enumerate() {
+            if cursor_inside[i] {
                 continue; // reveal the whole region (markers included) for editing
             }
             if let Some(dt) = &region.display_text {
@@ -204,11 +226,9 @@ pub fn build_line_render(
             h.bold = true;
             runs.push(h);
         }
-        for region in &inline {
-            let cursor_inside =
-                cursor_offset >= region.full_range.start && cursor_offset <= region.full_range.end;
+        for (i, region) in inline.iter().enumerate() {
             // Style the visible content; when revealed, style the whole region.
-            let style_range = if cursor_inside {
+            let style_range = if cursor_inside[i] {
                 region.full_range.clone()
             } else {
                 region.content_range.clone()
