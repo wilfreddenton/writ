@@ -219,6 +219,9 @@ struct App {
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
     mouse_down: bool,
+    /// System clipboard for copy/cut/paste. Held for the app's lifetime (on Wayland the
+    /// instance keeps serving the copied data). `None` if the platform init failed.
+    clipboard: Option<arboard::Clipboard>,
     /// Last title pushed to the native window (filename + dirty marker); re-set only
     /// when it changes, so the OS decoration carries the document name.
     title: String,
@@ -260,6 +263,7 @@ impl App {
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             mouse_down: false,
+            clipboard: arboard::Clipboard::new().ok(),
             title,
             hovered: None,
             ac_row_rects: Vec::new(),
@@ -1181,10 +1185,27 @@ impl ApplicationHandler<WritEvent> for App {
                         state.window.request_redraw();
                         return;
                     }
+                    // A click on an image block hit-tests to the line start (the image
+                    // has no text). Note the line first; after the click reveals its raw
+                    // markdown, re-place the caret at the clicked x on the revealed row
+                    // (its short row no longer sits under the original click y).
+                    let image_line = self.doc_engine.doc.as_ref().and_then(|d| {
+                        let line = self.doc_engine.editor.line_of(off);
+                        d.is_image_line(line).then_some(line)
+                    });
                     self.doc_engine
                         .editor
                         .click(off, self.modifiers.shift_key(), 1);
                     self.doc_engine.refresh(w, state.scale, vh);
+                    if let Some(line) = image_line
+                        && let Some(off2) = self
+                            .doc_engine
+                            .doc
+                            .as_ref()
+                            .and_then(|d| d.offset_in_line_at_x(line, self.mouse_pos.0))
+                    {
+                        self.doc_engine.editor.set_cursor(off2);
+                    }
                     // Clicking into/out of a ref opens/closes the popup.
                     sync_autocomplete(
                         &mut self.doc_engine.editor,
@@ -1214,6 +1235,56 @@ impl ApplicationHandler<WritEvent> for App {
                 }
                 let w = state.surface.config.width as f32;
                 let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+
+                // Clipboard: Ctrl/Super + C copy, X cut, V paste.
+                if cmd && let Key::Character(c) = &event.logical_key {
+                    match c.as_str().to_ascii_lowercase().as_str() {
+                        "c" | "x" if self.doc_engine.editor.selected_text().is_some() => {
+                            if let Some(sel) = self.doc_engine.editor.selected_text()
+                                && let Some(cb) = self.clipboard.as_mut()
+                            {
+                                let _ = cb.set_text(sel);
+                            }
+                            if c.as_str().eq_ignore_ascii_case("x") {
+                                self.doc_engine.editor.backspace(); // delete the selection
+                                self.doc_engine.refresh(w, state.scale, vh);
+                                spawn_ref_validations(
+                                    &self.doc_engine.editor,
+                                    &self.runtime,
+                                    &self.proxy,
+                                );
+                                sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                                state.window.request_redraw();
+                            }
+                            return;
+                        }
+                        "v" => {
+                            if let Some(cb) = self.clipboard.as_mut()
+                                && let Ok(text) = cb.get_text()
+                                && !text.is_empty()
+                            {
+                                self.doc_engine.editor.insert_str(&text);
+                                self.doc_engine.refresh(w, state.scale, vh);
+                                spawn_ref_validations(
+                                    &self.doc_engine.editor,
+                                    &self.runtime,
+                                    &self.proxy,
+                                );
+                                sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                                sync_autocomplete(
+                                    &mut self.doc_engine.editor,
+                                    &self.runtime,
+                                    &self.proxy,
+                                    &self.ac_gen,
+                                    &self.ac_slot,
+                                );
+                                state.window.request_redraw();
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
 
                 // When the autocomplete popup is open, route navigation keys to it.
                 // `ac_has` is Some(has_suggestions) iff the popup is open.

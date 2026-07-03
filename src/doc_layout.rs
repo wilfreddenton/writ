@@ -722,6 +722,25 @@ impl DocLayout {
         self.tops[line] + self.ghost_height[line]
     }
 
+    /// True if `line` currently renders as a standalone image block (its markdown text
+    /// is hidden). Used before a click so the caret can be re-placed once the click
+    /// reveals the raw text (whose short row no longer sits under the click's y).
+    pub fn is_image_line(&self, line: usize) -> bool {
+        self.renders
+            .get(line)
+            .is_some_and(|r| r.image.is_some())
+    }
+
+    /// Buffer offset for horizontal position `x` (device px) within `line`, at its first
+    /// row. Unlike `hit_test`, the caller names the line, so a click on a tall image
+    /// block can be re-mapped onto the short text row it reveals, at the same `x`.
+    pub fn offset_in_line_at_x(&self, line: usize, x: f32) -> Option<usize> {
+        let layout = self.layouts.get(line)?;
+        let lx = (x - self.pad_x).max(0.0);
+        let display_off = Cursor::from_point(layout, lx, 0.0).index();
+        Some(self.renders[line].map.display_to_buffer(display_off))
+    }
+
     /// Screen-space caret rectangle for a buffer offset, or None if empty doc.
     /// `caret_width` is in device px.
     pub fn caret_rect(&self, buffer_off: usize, caret_width: f32) -> Option<ScreenRect> {

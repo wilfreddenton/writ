@@ -162,8 +162,19 @@ impl Editor {
         (!selection.is_collapsed()).then(|| selection.range())
     }
 
+    /// The currently selected text, if any (for clipboard copy/cut).
+    pub fn selected_text(&self) -> Option<String> {
+        self.selection_range()
+            .map(|r| self.state.buffer.slice_cow(r).into_owned())
+    }
+
     pub fn set_cursor(&mut self, offset: usize) {
         self.state.set_cursor(offset);
+    }
+
+    /// Line index containing buffer `offset`.
+    pub fn line_of(&self, offset: usize) -> usize {
+        self.state.buffer.byte_to_line(offset)
     }
 
     pub fn is_dirty(&self) -> bool {
