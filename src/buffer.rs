@@ -339,32 +339,63 @@ impl BufferContent {
         }
         self.tree = self.parser.parse_rope(&self.text, self.tree.as_ref());
 
-        self.normalize_ordered_lists();
+        // Renumbering only matters when the edit lands inside an ordered list, which
+        // is the uncommon case — skip the tree walk + reparse otherwise.
+        if self.edit_in_ordered_list(offset, offset + insert_len) {
+            self.normalize_ordered_lists();
+        }
         self.update_caches();
         self.code_highlight_cache.valid = false;
         self.version += 1;
     }
 
-    /// Normalize ordered list numbering - ensure sequential numbers (1, 2, 3...).
-    /// Modifies the rope directly and re-parses if changes were made.
-    fn normalize_ordered_lists(&mut self) -> bool {
+    /// True if the byte range `start..end` lies within (or on the boundary of) an
+    /// ordered list node in the current tree. Used to gate `normalize_ordered_lists`.
+    fn edit_in_ordered_list(&self, start: usize, end: usize) -> bool {
         let Some(tree) = &self.tree else {
             return false;
         };
+        let root = tree.block_tree().root_node();
+        let Some(node) = root.descendant_for_byte_range(start, end) else {
+            return false;
+        };
+        let mut current = Some(node);
+        while let Some(n) = current {
+            if n.kind() == "list" && self.is_ordered_list(&n) {
+                return true;
+            }
+            current = n.parent();
+        }
+        false
+    }
 
-        let corrections = self.find_ordered_list_corrections(tree.block_tree().root_node());
+    /// Normalize ordered list numbering - ensure sequential numbers (1, 2, 3...).
+    /// Modifies the rope directly and re-parses incrementally if changes were made.
+    fn normalize_ordered_lists(&mut self) -> bool {
+        let corrections = {
+            let Some(tree) = &self.tree else {
+                return false;
+            };
+            self.find_ordered_list_corrections(tree.block_tree().root_node())
+        };
 
         if corrections.is_empty() {
             return false;
         }
 
-        // Apply corrections in reverse order to preserve byte offsets
+        // Apply corrections in reverse order to preserve byte offsets. Each marker
+        // rewrite is fed to `tree.edit` so the follow-up parse stays incremental.
         for (marker_range, correct_number, is_parenthesis) in corrections.into_iter().rev() {
             let new_marker = if is_parenthesis {
-                format!("{}) ", correct_number)
+                format!("{correct_number}) ")
             } else {
-                format!("{}. ", correct_number)
+                format!("{correct_number}. ")
             };
+            let new_len = new_marker.len();
+
+            let start_point = self.byte_to_point(marker_range.start);
+            let old_end_point = self.byte_to_point(marker_range.end);
+            let new_end_point = self.compute_new_end_point(start_point, &new_marker);
 
             let char_start = self.text.byte_to_char(marker_range.start);
             let char_end = self.text.byte_to_char(marker_range.end);
@@ -372,9 +403,20 @@ impl BufferContent {
 
             let char_offset = self.text.byte_to_char(marker_range.start);
             self.text.insert(char_offset, &new_marker);
+
+            if let Some(tree) = self.tree.as_mut() {
+                tree.edit(&InputEdit {
+                    start_byte: marker_range.start,
+                    old_end_byte: marker_range.end,
+                    new_end_byte: marker_range.start + new_len,
+                    start_position: start_point,
+                    old_end_position: old_end_point,
+                    new_end_position: new_end_point,
+                });
+            }
         }
 
-        self.tree = self.parser.parse_rope(&self.text, None);
+        self.tree = self.parser.parse_rope(&self.text, self.tree.as_ref());
         true
     }
 
@@ -393,45 +435,34 @@ impl BufferContent {
         node: &tree_sitter::Node,
         corrections: &mut Vec<(Range<usize>, usize, bool)>,
     ) {
-        if node.kind() == "list" {
-            let is_ordered = self.is_ordered_list(node);
-
-            if is_ordered {
-                let mut item_number = 1;
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32)
-                        && child.kind() == "list_item"
-                        && let Some((marker_range, current_number, is_parenthesis)) =
-                            self.extract_ordered_marker(&child)
-                    {
-                        if current_number != item_number {
-                            corrections.push((marker_range, item_number, is_parenthesis));
-                        }
-                        item_number += 1;
+        if node.kind() == "list" && self.is_ordered_list(node) {
+            let mut item_number = 1;
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "list_item"
+                    && let Some((marker_range, current_number, is_parenthesis)) =
+                        self.extract_ordered_marker(&child)
+                {
+                    if current_number != item_number {
+                        corrections.push((marker_range, item_number, is_parenthesis));
                     }
+                    item_number += 1;
                 }
             }
         }
 
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                self.collect_list_corrections(&child, corrections);
-            }
+        for child in node.children(&mut node.walk()) {
+            self.collect_list_corrections(&child, corrections);
         }
     }
 
     fn is_ordered_list(&self, list_node: &tree_sitter::Node) -> bool {
-        for i in 0..list_node.child_count() {
-            if let Some(child) = list_node.child(i as u32)
-                && child.kind() == "list_item"
+        for child in list_node.children(&mut list_node.walk()) {
+            if child.kind() == "list_item"
+                && let Some(marker) = child.children(&mut child.walk()).next()
             {
-                for j in 0..child.child_count() {
-                    if let Some(marker) = child.child(j as u32) {
-                        return marker.kind().starts_with("list_marker_decimal")
-                            || marker.kind() == "list_marker_dot"
-                            || marker.kind() == "list_marker_parenthesis";
-                    }
-                }
+                return marker.kind().starts_with("list_marker_decimal")
+                    || marker.kind() == "list_marker_dot"
+                    || marker.kind() == "list_marker_parenthesis";
             }
         }
         false
@@ -442,11 +473,10 @@ impl BufferContent {
         &self,
         list_item: &tree_sitter::Node,
     ) -> Option<(Range<usize>, usize, bool)> {
-        for i in 0..list_item.child_count() {
-            if let Some(marker) = list_item.child(i as u32)
-                && (marker.kind().starts_with("list_marker_decimal")
-                    || marker.kind() == "list_marker_dot"
-                    || marker.kind() == "list_marker_parenthesis")
+        for marker in list_item.children(&mut list_item.walk()) {
+            if marker.kind().starts_with("list_marker_decimal")
+                || marker.kind() == "list_marker_dot"
+                || marker.kind() == "list_marker_parenthesis"
             {
                 let start = marker.start_byte();
                 let end = marker.end_byte();
@@ -1159,6 +1189,38 @@ mod tests {
     fn test_unordered_list_unchanged() {
         let buf: Buffer = "- First\n- Second\n- Third\n".parse().unwrap();
         assert_eq!(buf.text(), "- First\n- Second\n- Third\n");
+    }
+
+    #[test]
+    fn edit_in_ordered_list_renumbers() {
+        // A non-sequential list gets renumbered when the edit lands inside it.
+        let mut buf: Buffer = "1. a\n5. b\n".parse().unwrap();
+        let off = buf.text().find('a').unwrap() + 1;
+        buf.insert(off, "X", off);
+        assert_eq!(buf.text(), "1. aX\n2. b\n", "in-list edit renumbers");
+    }
+
+    #[test]
+    fn edit_outside_ordered_list_does_not_renumber() {
+        // Editing a paragraph after a non-sequential list must not perturb its numbers.
+        let mut buf: Buffer = "1. a\n5. b\n\nhello\n".parse().unwrap();
+        let off = buf.text().find("hello").unwrap() + 5;
+        buf.insert(off, "X", off);
+        assert_eq!(
+            buf.text(),
+            "1. a\n5. b\n\nhelloX\n",
+            "out-of-list edit leaves list numbering untouched"
+        );
+    }
+
+    #[test]
+    fn delete_in_ordered_list_renumbers() {
+        // Deleting a middle item renumbers the remainder (empty edit range inside list).
+        let mut buf: Buffer = "1. a\n2. b\n3. c\n".parse().unwrap();
+        let start = buf.text().find("2.").unwrap();
+        let end = buf.text().find("3.").unwrap();
+        buf.delete(start..end, start);
+        assert_eq!(buf.text(), "1. a\n2. c\n", "in-list delete renumbers");
     }
 
     // Line extraction tests (moved from lines.rs)
