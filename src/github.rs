@@ -4,11 +4,18 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use crate::inline::GitHubRef;
 
 const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
+
+/// GraphQL field selection shared by every issue/PR query. The first line has no
+/// leading indentation; callers supply it via a 24-space-indented placeholder.
+const ISSUE_PR_FIELDS: &str = "__typename
+                        ... on Issue { number title state stateReason }
+                        ... on PullRequest { number title state merged isDraft }";
 
 // ============================================================================
 // GraphQL request/response types
@@ -281,57 +288,43 @@ impl GitHubValidationCache {
 // Autocomplete caches
 // ============================================================================
 
-/// Cache for issue/PR autocomplete results.
-#[derive(Clone, Default)]
-pub struct IssueCache {
-    cache: Arc<Mutex<HashMap<String, Vec<IssueOrPr>>>>,
+/// Thread-safe key/value cache shared across clones.
+#[derive(Clone)]
+pub struct Cache<K, V> {
+    cache: Arc<Mutex<HashMap<K, V>>>,
 }
 
-impl IssueCache {
+impl<K: Eq + Hash, V: Clone> Default for Cache<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: Eq + Hash, V: Clone> Cache<K, V> {
     pub fn new() -> Self {
         Self {
             cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<Vec<IssueOrPr>> {
+    pub fn get(&self, key: &K) -> Option<V> {
         self.cache.lock().unwrap().get(key).cloned()
     }
 
-    pub fn set(&self, key: String, issues: Vec<IssueOrPr>) {
-        self.cache.lock().unwrap().insert(key, issues);
+    pub fn set(&self, key: K, value: V) {
+        self.cache.lock().unwrap().insert(key, value);
     }
 
     pub fn clear(&self) {
         self.cache.lock().unwrap().clear();
     }
 }
+
+/// Cache for issue/PR autocomplete results.
+pub type IssueCache = Cache<String, Vec<IssueOrPr>>;
 
 /// Cache for user autocomplete results.
-#[derive(Clone, Default)]
-pub struct UserCache {
-    cache: Arc<Mutex<HashMap<String, Vec<MentionableUser>>>>,
-}
-
-impl UserCache {
-    pub fn new() -> Self {
-        Self {
-            cache: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    pub fn get(&self, key: &str) -> Option<Vec<MentionableUser>> {
-        self.cache.lock().unwrap().get(key).cloned()
-    }
-
-    pub fn set(&self, key: String, users: Vec<MentionableUser>) {
-        self.cache.lock().unwrap().insert(key, users);
-    }
-
-    pub fn clear(&self) {
-        self.cache.lock().unwrap().clear();
-    }
-}
+pub type UserCache = Cache<String, Vec<MentionableUser>>;
 
 // ============================================================================
 // GitHub client
@@ -451,24 +444,24 @@ impl GitHubClient {
             None => format!("repo:{}/{} type:issue type:pr sort:updated", owner, repo),
         };
 
-        let graphql_query = r#"
-            query($query: String!, $limit: Int!) {
-                search(query: $query, type: ISSUE, first: $limit) {
-                    nodes {
-                        __typename
-                        ... on Issue { number title state stateReason }
-                        ... on PullRequest { number title state merged isDraft }
-                    }
-                }
-            }
-        "#;
+        let graphql_query = format!(
+            r#"
+            query($query: String!, $limit: Int!) {{
+                search(query: $query, type: ISSUE, first: $limit) {{
+                    nodes {{
+                        {ISSUE_PR_FIELDS}
+                    }}
+                }}
+            }}
+        "#
+        );
 
         let variables = serde_json::json!({
             "query": search_query,
             "limit": limit
         });
 
-        let data: Option<IssueSearchData> = self.graphql(graphql_query, Some(variables)).await;
+        let data: Option<IssueSearchData> = self.graphql(&graphql_query, Some(variables)).await;
 
         data.map(|d| d.search.nodes).unwrap_or_default()
     }
@@ -487,24 +480,22 @@ impl GitHubClient {
             owner, repo, search_text
         );
 
-        let graphql_query = r#"
-            query($owner: String!, $repo: String!, $number: Int!, $query: String!, $limit: Int!) {
-                repository(owner: $owner, name: $repo) {
-                    issueOrPullRequest(number: $number) {
-                        __typename
-                        ... on Issue { number title state stateReason }
-                        ... on PullRequest { number title state merged isDraft }
-                    }
-                }
-                search(query: $query, type: ISSUE, first: $limit) {
-                    nodes {
-                        __typename
-                        ... on Issue { number title state stateReason }
-                        ... on PullRequest { number title state merged isDraft }
-                    }
-                }
-            }
-        "#;
+        let graphql_query = format!(
+            r#"
+            query($owner: String!, $repo: String!, $number: Int!, $query: String!, $limit: Int!) {{
+                repository(owner: $owner, name: $repo) {{
+                    issueOrPullRequest(number: $number) {{
+                        {ISSUE_PR_FIELDS}
+                    }}
+                }}
+                search(query: $query, type: ISSUE, first: $limit) {{
+                    nodes {{
+                        {ISSUE_PR_FIELDS}
+                    }}
+                }}
+            }}
+        "#
+        );
 
         let variables = serde_json::json!({
             "owner": owner,
@@ -514,7 +505,7 @@ impl GitHubClient {
             "limit": limit
         });
 
-        let data: Option<IssueSearchData> = self.graphql(graphql_query, Some(variables)).await;
+        let data: Option<IssueSearchData> = self.graphql(&graphql_query, Some(variables)).await;
 
         let Some(data) = data else {
             return vec![];
@@ -625,17 +616,17 @@ impl GitHubClient {
     }
 
     async fn validate_issue(&self, owner: &str, repo: &str, number: u64) -> Option<IssueOrPr> {
-        let query = r#"
-            query($owner: String!, $repo: String!, $number: Int!) {
-                repository(owner: $owner, name: $repo) {
-                    issueOrPullRequest(number: $number) {
-                        __typename
-                        ... on Issue { number title state stateReason }
-                        ... on PullRequest { number title state merged isDraft }
-                    }
-                }
-            }
-        "#;
+        let query = format!(
+            r#"
+            query($owner: String!, $repo: String!, $number: Int!) {{
+                repository(owner: $owner, name: $repo) {{
+                    issueOrPullRequest(number: $number) {{
+                        {ISSUE_PR_FIELDS}
+                    }}
+                }}
+            }}
+        "#
+        );
 
         let variables = serde_json::json!({
             "owner": owner,
@@ -643,7 +634,7 @@ impl GitHubClient {
             "number": number
         });
 
-        let data: Option<IssueValidationData> = self.graphql(query, Some(variables)).await;
+        let data: Option<IssueValidationData> = self.graphql(&query, Some(variables)).await;
 
         data.and_then(|d| d.repository)
             .and_then(|r| r.issue_or_pull_request)
