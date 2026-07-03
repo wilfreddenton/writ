@@ -310,6 +310,21 @@ impl Editor {
         &self.naked_urls_by_line
     }
 
+    /// All GitHub references detected across the document: inline refs plus the
+    /// github-ref-bearing naked URLs.
+    pub fn detected_refs(&self) -> Vec<GitHubRef> {
+        let mut refs: Vec<GitHubRef> = Vec::new();
+        for m in self.github_refs_by_line().values().flatten() {
+            refs.push(m.reference.clone());
+        }
+        for u in self.naked_urls_by_line().values().flatten() {
+            if let Some(r) = &u.github_ref {
+                refs.push(r.clone());
+            }
+        }
+        refs
+    }
+
     /// Detect GitHub refs and naked URLs across a line range, returning both keyed
     /// by line index. Pure scan over the render snapshot (no network).
     pub fn detect_links(

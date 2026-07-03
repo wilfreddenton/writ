@@ -20,8 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
+use parley::Layout;
 use vello::kurbo::{Affine, Rect};
-use vello::peniko::Fill;
+use vello::peniko::{Brush, Fill};
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
 use vello::wgpu::CurrentSurfaceTexture;
@@ -267,17 +268,7 @@ fn spawn_ref_validations(
     };
     let cache = editor.github_validation_cache();
 
-    let mut refs: Vec<GitHubRef> = Vec::new();
-    for m in editor.github_refs_by_line().values().flatten() {
-        refs.push(m.reference.clone());
-    }
-    for u in editor.naked_urls_by_line().values().flatten() {
-        if let Some(r) = &u.github_ref {
-            refs.push(r.clone());
-        }
-    }
-
-    for reference in refs {
+    for reference in editor.detected_refs() {
         if cache.get(&reference).is_some() {
             continue; // already pending/valid/invalid
         }
@@ -603,6 +594,97 @@ fn hover_target_at_offset(editor: &Editor, doc: &DocLayout, off: usize) -> Optio
     None
 }
 
+/// Text color for an issue/PR status badge.
+fn status_color(status: IssueStatus, theme: &EditorTheme) -> vello::peniko::Color {
+    match status {
+        IssueStatus::Open => theme.green,
+        IssueStatus::Draft => theme.comment,
+        IssueStatus::Merged | IssueStatus::Closed => theme.purple,
+        IssueStatus::ClosedNotPlanned => theme.red,
+    }
+}
+
+/// Colored segments for an issue/PR: `<symbol> #<number> <title>`.
+fn issue_segments(
+    symbol: &str,
+    number: u64,
+    title: &str,
+    status: IssueStatus,
+    theme: &EditorTheme,
+) -> Vec<(String, vello::peniko::Color)> {
+    vec![
+        (format!("{symbol} "), status_color(status, theme)),
+        (format!("#{number} "), theme.cyan),
+        (title.to_string(), theme.foreground),
+    ]
+}
+
+/// Colored segments for a user: `@login` and, if present, its display name.
+fn user_segments(
+    login: &str,
+    name: Option<&str>,
+    theme: &EditorTheme,
+) -> Vec<(String, vello::peniko::Color)> {
+    let mut v = vec![(format!("@{login}"), theme.cyan)];
+    if let Some(name) = name {
+        v.push((format!("  {name}"), theme.comment));
+    }
+    v
+}
+
+/// Lay out colored `segments` into a single styled line.
+fn segments_to_line(
+    engine: &mut TextEngine,
+    segments: &[(String, vello::peniko::Color)],
+    scale: f32,
+    font_size: f32,
+    max_text: f32,
+    theme: &EditorTheme,
+) -> Layout<Brush> {
+    let mut text = String::new();
+    let mut runs = Vec::new();
+    for (s, color) in segments {
+        let start = text.len();
+        text.push_str(s);
+        runs.push(StyleRun::new(start..text.len(), peniko_color(*color)));
+    }
+    engine.build_line(
+        &text,
+        scale,
+        font_size,
+        1.3,
+        peniko_color(theme.foreground),
+        Some(max_text),
+        &runs,
+    )
+}
+
+/// Position a `panel_w`×`panel_h` panel near `anchor`, preferring below it but
+/// flipping above when it would overflow the viewport, and clamping horizontally.
+/// Returns the panel's top-left (x, y).
+fn place_panel(
+    anchor: ScreenRect,
+    panel_w: f32,
+    panel_h: f32,
+    viewport: (f32, f32),
+    gap: f64,
+) -> (f64, f64) {
+    let (viewport_w, viewport_h) = viewport;
+    let (ax0, ay0, _ax1, ay1) = anchor;
+    let mut x = ax0;
+    if x as f32 + panel_w > viewport_w {
+        x = (viewport_w - panel_w) as f64;
+    }
+    x = x.max(0.0);
+    let below_y = ay1 + gap;
+    let y = if below_y as f32 + panel_h <= viewport_h {
+        below_y
+    } else {
+        (ay0 - gap - panel_h as f64).max(0.0)
+    };
+    (x, y)
+}
+
 /// The colored text segments shown in a ref's hover popover, per validation state.
 fn hover_segments(
     reference: &GitHubRef,
@@ -611,25 +693,15 @@ fn hover_segments(
     theme: &EditorTheme,
 ) -> Vec<(String, vello::peniko::Color)> {
     match state {
-        Some(ValidationState::Valid(Some(ValidatedRefData::Issue(issue)))) => {
-            let status_color = match issue.status() {
-                IssueStatus::Open => theme.green,
-                IssueStatus::Draft => theme.comment,
-                IssueStatus::Merged | IssueStatus::Closed => theme.purple,
-                IssueStatus::ClosedNotPlanned => theme.red,
-            };
-            vec![
-                (format!("{} ", issue.symbol()), status_color),
-                (format!("#{} ", issue.number), theme.cyan),
-                (issue.title.clone(), theme.foreground),
-            ]
-        }
+        Some(ValidationState::Valid(Some(ValidatedRefData::Issue(issue)))) => issue_segments(
+            issue.symbol(),
+            issue.number,
+            &issue.title,
+            issue.status(),
+            theme,
+        ),
         Some(ValidationState::Valid(Some(ValidatedRefData::User(user)))) => {
-            let mut v = vec![(format!("@{}", user.login), theme.cyan)];
-            if let Some(name) = &user.name {
-                v.push((format!("  {name}"), theme.comment));
-            }
-            v
+            user_segments(&user.login, user.name.as_deref(), theme)
         }
         Some(ValidationState::Valid(None)) => vec![
             ("✓ ".to_string(), theme.green),
@@ -662,43 +734,22 @@ fn draw_hover_popover(
     let state = editor.github_validation_cache().get(&target.reference);
     let segs = hover_segments(&target.reference, &state, editor.github_context(), theme);
 
-    let mut text = String::new();
-    let mut runs = Vec::new();
-    for (s, color) in &segs {
-        let start = text.len();
-        text.push_str(s);
-        runs.push(StyleRun::new(start..text.len(), peniko_color(*color)));
-    }
-
     let font_size = 14.0;
     // Cap the panel width (long issue titles) so it doesn't run off-screen.
     let max_text = (viewport_w - 2.0 * PADDING * scale).min(480.0 * scale);
-    let layout = engine.build_line(
-        &text,
-        scale,
-        font_size,
-        1.3,
-        peniko_color(theme.foreground),
-        Some(max_text),
-        &runs,
-    );
+    let layout = segments_to_line(engine, &segs, scale, font_size, max_text, theme);
     let pad = 8.0 * scale;
     let panel_w = layout.width() + pad * 2.0;
     let panel_h = layout.height() + pad * 2.0;
 
-    let (ax0, ay0, _ax1, ay1) = target.anchor;
     let gap = 4.0 * scale as f64;
-    let mut x = ax0;
-    if x as f32 + panel_w > viewport_w {
-        x = (viewport_w - panel_w) as f64;
-    }
-    x = x.max(0.0);
-    let below_y = ay1 + gap;
-    let y = if below_y as f32 + panel_h <= viewport_h {
-        below_y
-    } else {
-        (ay0 - gap - panel_h as f64).max(0.0)
-    };
+    let (x, y) = place_panel(
+        target.anchor,
+        panel_w,
+        panel_h,
+        (viewport_w, viewport_h),
+        gap,
+    );
 
     let rect = Rect::new(x, y, x + panel_w as f64, y + panel_h as f64);
     draw_panel(
@@ -723,25 +774,9 @@ fn suggestion_segments(
             symbol,
             status,
             title,
-        } => {
-            let status_color = match status {
-                IssueStatus::Open => theme.green,
-                IssueStatus::Draft => theme.comment,
-                IssueStatus::Merged | IssueStatus::Closed => theme.purple,
-                IssueStatus::ClosedNotPlanned => theme.red,
-            };
-            vec![
-                (format!("{symbol} "), status_color),
-                (format!("#{number} "), theme.cyan),
-                (title.clone(), theme.foreground),
-            ]
-        }
+        } => issue_segments(symbol, *number, title, *status, theme),
         AutocompleteSuggestion::User { login, name } => {
-            let mut v = vec![(format!("@{login}"), theme.cyan)];
-            if let Some(n) = name {
-                v.push((format!("  {n}"), theme.comment));
-            }
-            v
+            user_segments(login, name.as_deref(), theme)
         }
     }
 }
@@ -772,39 +807,14 @@ fn draw_autocomplete(
     let mut rows = Vec::with_capacity(ac.suggestions.len());
     for s in &ac.suggestions {
         let segs = suggestion_segments(s, theme);
-        let mut text = String::new();
-        let mut runs = Vec::new();
-        for (seg, color) in &segs {
-            let start = text.len();
-            text.push_str(seg);
-            runs.push(StyleRun::new(start..text.len(), peniko_color(*color)));
-        }
-        let layout = engine.build_line(
-            &text,
-            scale,
-            font_size,
-            1.3,
-            peniko_color(theme.foreground),
-            Some(max_text),
-            &runs,
-        );
+        let layout = segments_to_line(engine, &segs, scale, font_size, max_text, theme);
         let h = layout.height() + 2.0 * pad_y;
         rows.push((layout, h));
     }
     let panel_h: f32 = rows.iter().map(|(_, h)| *h).sum();
 
     let gap = 4.0 * scale as f64;
-    let mut x = caret.0;
-    if x as f32 + panel_w > viewport_w {
-        x = (viewport_w - panel_w) as f64;
-    }
-    x = x.max(0.0);
-    let below_y = caret.3 + gap;
-    let y = if below_y as f32 + panel_h <= viewport_h {
-        below_y
-    } else {
-        (caret.1 - gap - panel_h as f64).max(0.0)
-    };
+    let (x, y) = place_panel(caret, panel_w, panel_h, (viewport_w, viewport_h), gap);
 
     let panel = Rect::new(x, y, x + panel_w as f64, y + panel_h as f64);
     draw_panel(
@@ -1499,15 +1509,7 @@ fn validate_all_blocking(editor: &mut Editor) {
         return;
     };
     let cache = editor.github_validation_cache().clone();
-    let mut refs: Vec<GitHubRef> = Vec::new();
-    for m in editor.github_refs_by_line().values().flatten() {
-        refs.push(m.reference.clone());
-    }
-    for u in editor.naked_urls_by_line().values().flatten() {
-        if let Some(r) = &u.github_ref {
-            refs.push(r.clone());
-        }
-    }
+    let refs = editor.detected_refs();
     tokio::runtime::Handle::current().block_on(async {
         for r in refs {
             match client.validate_ref(&r).await {
