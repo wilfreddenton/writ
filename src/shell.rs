@@ -368,7 +368,16 @@ fn refresh_doc(
     // spawning see the current buffer. Whole-buffer scan; cheap enough for now.
     editor.refresh_detection();
     let prev_scroll = doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
-    let mut new_doc = rebuild_doc(engine, cache, render_cache, editor, theme, device_width, scale);
+    let mut new_doc = rebuild_doc(
+        engine,
+        cache,
+        render_cache,
+        editor,
+        theme,
+        device_width,
+        scale,
+        prev_scroll + editor_h,
+    );
     new_doc.scroll_y = prev_scroll;
     new_doc.scroll_to(editor.cursor_position(), editor_h);
     *doc = Some(new_doc);
@@ -384,6 +393,9 @@ fn rebuild_doc(
     theme: &EditorTheme,
     device_width: f32,
     scale: f32,
+    // Device-px depth (scroll_y + viewport_h) that must be fully laid out; deeper
+    // lines are height-estimated. `f32::INFINITY` lays out the whole document.
+    measure_to_y: f32,
 ) -> DocLayout {
     let cursor_offset = editor.cursor_position();
     let version = editor.state.buffer.version();
@@ -415,6 +427,7 @@ fn rebuild_doc(
         PADDING * 2.0,
         FONT_SIZE,
         LINE_HEIGHT,
+        measure_to_y,
     );
     doc.set_content_top(TITLE_BAR_H * scale);
     doc
@@ -809,6 +822,7 @@ impl ApplicationHandler<WritEvent> for App {
                         &self.theme,
                         w,
                         scale,
+                        prev_scroll + vh,
                     );
                     new_doc.scroll_y = prev_scroll;
                     new_doc.clamp_scroll(vh);
@@ -855,6 +869,7 @@ impl ApplicationHandler<WritEvent> for App {
         );
 
         let scale = window.scale_factor() as f32;
+        let (_, editor_h) = chrome_metrics(scale, size.height as f32);
         let doc = rebuild_doc(
             &mut self.text_engine,
             &mut self.line_cache,
@@ -863,6 +878,7 @@ impl ApplicationHandler<WritEvent> for App {
             &self.theme,
             size.width as f32,
             scale,
+            editor_h,
         );
         self.doc = Some(doc);
         self.state = Some(ActiveSurface {
@@ -886,6 +902,7 @@ impl ApplicationHandler<WritEvent> for App {
                     size.width.max(1),
                     size.height.max(1),
                 );
+                let (_, editor_h) = chrome_metrics(state.scale, size.height as f32);
                 let doc = rebuild_doc(
                     &mut self.text_engine,
                     &mut self.line_cache,
@@ -894,6 +911,7 @@ impl ApplicationHandler<WritEvent> for App {
                     &self.theme,
                     size.width as f32,
                     state.scale,
+                    editor_h,
                 );
                 self.doc = Some(doc);
                 state.window.request_redraw();
@@ -907,11 +925,34 @@ impl ApplicationHandler<WritEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => -y * WHEEL_LINE_STEP * state.scale,
                     MouseScrollDelta::PixelDelta(p) => -p.y as f32,
                 };
-                if let Some(doc) = self.doc.as_mut() {
-                    let (_, editor_h) =
-                        chrome_metrics(state.scale, state.surface.config.height as f32);
+                let (_, editor_h) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                let remeasure = if let Some(doc) = self.doc.as_mut() {
                     doc.scroll_by(dy, editor_h);
-                    self.hovered = None; // stored anchor goes stale on scroll
+                    doc.needs_remeasure(editor_h)
+                } else {
+                    false
+                };
+                self.hovered = None; // stored anchor goes stale on scroll
+                // Wheel-scrolled into height-estimated lines → rebuild to lay them out.
+                if remeasure {
+                    let w = state.surface.config.width as f32;
+                    let scale = state.scale;
+                    let new_scroll = self.doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
+                    let mut nd = rebuild_doc(
+                        &mut self.text_engine,
+                        &mut self.line_cache,
+                        &mut self.render_cache,
+                        &mut self.editor,
+                        &self.theme,
+                        w,
+                        scale,
+                        new_scroll + editor_h,
+                    );
+                    nd.scroll_y = new_scroll;
+                    nd.clamp_scroll(editor_h);
+                    self.doc = Some(nd);
+                }
+                if self.doc.is_some() {
                     state.window.request_redraw();
                 }
             }
@@ -1532,6 +1573,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         &theme,
         width as f32,
         1.0,
+        scroll_y + editor_h,
     );
     doc.scroll_by(scroll_y, editor_h);
     let mut scene = Scene::new();

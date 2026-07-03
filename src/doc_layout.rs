@@ -287,6 +287,13 @@ fn compute_tops(heights: &[f32], pad_top: f32) -> Vec<f32> {
     tops
 }
 
+/// Extra device px measured past the viewport bottom so gentle wheel-scrolling stays
+/// on materialized lines before a rebuild extends the range.
+const MEASURE_OVERSCAN_PX: f32 = 800.0;
+/// Extra lines materialized past the cursor line (so scroll-to-cursor lands on a real
+/// layout even when the cursor briefly outruns the scroll position).
+const MEASURE_OVERSCAN_LINES: usize = 30;
+
 pub struct DocLayout {
     layouts: Vec<Rc<parley::Layout<Brush>>>,
     /// Per-line render results (shared with the RenderCache via `Rc`), parallel to
@@ -303,6 +310,9 @@ pub struct DocLayout {
     /// Top y of each line's *ghost block*; the real line begins at
     /// `tops[i] + ghost_height[i]`. Length `layouts.len() + 1`. Device px.
     tops: Vec<f32>,
+    /// Number of lines from the top that are fully laid out; `[measured_count..]` are
+    /// height-estimated placeholders. Equals `line_count()` when nothing was estimated.
+    measured_count: usize,
     diff_colors: DiffColors,
     pub scroll_y: f32,
     /// Surface width in device px (for full-width diff row backgrounds).
@@ -335,12 +345,40 @@ impl DocLayout {
         pad_bottom: f32,
         base_font_size: f32,
         line_height: f32,
+        // Materialize (fully lay out) lines from the top until their cumulative height
+        // reaches `measure_to_y` (device px, = scroll_y + viewport_h) + overscan; the
+        // rest of the document is cheaply height-*estimated* and left un-laid-out.
+        // Pass `f32::INFINITY` to force laying out every line (the old behavior).
+        measure_to_y: f32,
     ) -> Self {
         let fg = peniko_color(theme.foreground);
         let max_advance = (device_width - 2.0 * pad_x * scale).max(1.0);
         let n = snapshot.line_count();
         cache.begin();
         render_cache.begin();
+        // Off-screen height estimate: average glyph advance (device px/char) from one
+        // unwrapped sample line, and the body row height. Predicts soft-wrap row count
+        // from a line's byte length without laying it out (see writ-virtualization-plan).
+        let cal_text = "the quick brown fox jumps over the lazy dog and then runs along";
+        let cal = engine.build_line(cal_text, scale, base_font_size, line_height, fg, None, &[]);
+        let k = (cal.width() / cal_text.chars().count().max(1) as f32).max(0.1);
+        let min_row = base_font_size * line_height * scale;
+        let cursor_line = snapshot
+            .rope
+            .byte_to_line(cursor_offset.min(snapshot.rope.len_bytes()));
+        // Shared placeholders for estimated (un-laid-out) lines. They're never drawn or
+        // cursor-queried (only visible lines are, and those are always materialized), so
+        // an empty layout / identity render is safe; `Rc::clone` keeps it O(1).
+        let empty_layout: Rc<parley::Layout<Brush>> = Rc::new(parley::Layout::new());
+        let empty_render: Rc<LineRender> = Rc::new(LineRender {
+            text: String::new(),
+            font_size: base_font_size,
+            runs: Vec::new(),
+            map: SegmentMap::identity("", 0).1,
+        });
+        let mut measured_y = pad_top * scale; // tops-space y consumed by materialized lines
+        let mut estimating = false;
+        let mut measured_count = n;
         // Bucket inline styles per line once (O(n + styles)) instead of the O(n²)
         // per-line `styles_in_range` scan — the dominant per-keystroke cost on large
         // docs. Ghosts get the HEAD snapshot's buckets (only computed if a diff exists).
@@ -357,6 +395,29 @@ impl DocLayout {
         // `i` indexes several parallel per-line inputs (styles, markers, diff).
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
+            // Once we've materialized enough height to cover the viewport (+overscan)
+            // and passed the cursor's line, estimate the remaining lines instead of
+            // laying them out — the O(visible) win on large documents.
+            if !estimating
+                && measured_y >= measure_to_y + MEASURE_OVERSCAN_PX
+                && i > cursor_line + MEASURE_OVERSCAN_LINES
+            {
+                estimating = true;
+                measured_count = i;
+            }
+            if estimating {
+                let range = snapshot.line_byte_range(i);
+                let byte_len = range.len().saturating_sub(1) as f32; // minus trailing '\n'
+                let est_rows = (byte_len * k / max_advance).ceil().max(1.0);
+                heights.push(est_rows * min_row);
+                layouts.push(empty_layout.clone());
+                renders.push(empty_render.clone());
+                line_ranges.push(range);
+                line_diffs.push(LineDiff::default());
+                ghosts.push(Vec::new());
+                ghost_height.push(0.0);
+                continue;
+            }
             // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
             let line_ghosts = build_ghosts_before(
                 engine,
@@ -446,7 +507,9 @@ impl DocLayout {
                 }
                 _ => LineDiff::default(),
             };
-            heights.push(gh + layout.height());
+            let total_h = gh + layout.height();
+            measured_y += total_h;
+            heights.push(total_h);
             layouts.push(layout);
             renders.push(lr);
             line_ranges.push(range);
@@ -471,6 +534,7 @@ impl DocLayout {
             ghost_height,
             diff_colors,
             tops: compute_tops(&heights, pad_top * scale),
+            measured_count,
             scroll_y: 0.0,
             width: device_width,
             content_top: 0.0,
@@ -598,6 +662,13 @@ impl DocLayout {
 
     pub fn line_count(&self) -> usize {
         self.layouts.len()
+    }
+
+    /// True if the viewport now reaches into height-estimated (un-laid-out) lines —
+    /// i.e. a wheel-scroll outran the materialized range and the shell should rebuild
+    /// with a larger `measure_to_y` before this frame draws blanks.
+    pub fn needs_remeasure(&self, viewport_h: f32) -> bool {
+        self.measured_count < self.layouts.len() && self.visible_range(viewport_h).1 > self.measured_count
     }
 
     /// Total document height in device px (last line bottom + bottom padding).
@@ -762,6 +833,7 @@ mod tests {
             line_diffs: heights.iter().map(|_| LineDiff::default()).collect(),
             ghosts: heights.iter().map(|_| Vec::new()).collect(),
             ghost_height: heights.iter().map(|_| 0.0).collect(),
+            measured_count: heights.len(),
             diff_colors: DiffColors {
                 added_bg: Color::TRANSPARENT,
                 added_inline: Color::TRANSPARENT,
@@ -834,6 +906,7 @@ mod tests {
             48.0,
             18.0,
             1.5,
+            f32::INFINITY,
         );
         // Several buffer offsets (incl. second line) should map to a caret rect
         // whose center hit-tests back to the same offset.
@@ -879,6 +952,7 @@ mod tests {
             48.0,
             18.0,
             1.5,
+            f32::INFINITY,
         );
         // Line 0's changed version has a deleted ghost stacked above it.
         assert!(doc.ghost_height[0] > 0.0, "expected a ghost above line 0");
@@ -910,7 +984,7 @@ mod tests {
         let build = |engine: &mut TextEngine, cache: &mut LineCache| {
             DocLayout::build(
                 engine, cache, &mut RenderCache::new(), 0, &snapshot, &theme, None, None, 0, 1000.0,
-                1.0, 24.0, 24.0, 48.0, 18.0, 1.5,
+                1.0, 24.0, 24.0, 48.0, 18.0, 1.5, f32::INFINITY,
             )
         };
         let t0 = Instant::now();
@@ -949,7 +1023,7 @@ mod tests {
             |engine: &mut TextEngine, lc: &mut LineCache, rc: &mut RenderCache, cursor: usize| {
                 DocLayout::build(
                     engine, lc, rc, 7, &snapshot, &theme, None, None, cursor, 1200.0, 1.0, 24.0,
-                    24.0, 48.0, 18.0, 1.5,
+                    24.0, 48.0, 18.0, 1.5, f32::INFINITY,
                 )
             };
 
@@ -968,5 +1042,69 @@ mod tests {
             2,
             "cursor on the heading must recompute it (not serve the stale hidden render)"
         );
+    }
+
+    /// Virtualization: with a small `measure_to_y`, a large doc materializes only the
+    /// top band, leaves the rest height-estimated, keeps the visible range inside the
+    /// materialized set (no blank draws), and still round-trips caret↔hit-test on-screen.
+    #[test]
+    fn virtualized_build_materializes_only_visible() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let text: String = (0..3000)
+            .map(|i| format!("Line {i}: the quick brown fox jumps over the lazy dog.\n"))
+            .collect();
+        let mut buffer: Buffer = text.parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+        let viewport_h = 600.0f32;
+        let doc = DocLayout::build(
+            &mut engine,
+            &mut LineCache::new(),
+            &mut RenderCache::new(),
+            1,
+            &snapshot,
+            &theme,
+            None,
+            None,
+            0,
+            1000.0,
+            1.0,
+            24.0,
+            24.0,
+            48.0,
+            18.0,
+            1.5,
+            viewport_h, // measure_to_y = just the first viewport
+        );
+        let n = doc.line_count();
+        assert!(n >= 3000);
+        assert!(
+            doc.measured_count < n,
+            "should estimate the tail, got measured_count={} of {n}",
+            doc.measured_count
+        );
+        assert!(
+            doc.measured_count >= 10,
+            "should materialize at least the visible band, got {}",
+            doc.measured_count
+        );
+        // The viewport never reaches into estimated lines at the top.
+        assert!(!doc.needs_remeasure(viewport_h));
+        let (first, last) = doc.visible_range(viewport_h);
+        assert_eq!(first, 0);
+        assert!(
+            last <= doc.measured_count,
+            "visible range {last} must stay within materialized {}",
+            doc.measured_count
+        );
+        // Caret at the top round-trips through a materialized line.
+        let (x0, y0, x1, y1) = doc.caret_rect(0, 2.0).expect("caret");
+        let got = doc
+            .hit_test(((x0 + x1) / 2.0) as f32, ((y0 + y1) / 2.0) as f32)
+            .expect("hit");
+        assert_eq!(got, 0);
+        // Total content height is finite (estimated tail contributes real numbers).
+        assert!(doc.content_height().is_finite() && doc.content_height() > 0.0);
     }
 }
