@@ -18,7 +18,7 @@ use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Brush, Color, Fill};
 
 use crate::buffer::RenderSnapshot;
-use crate::diff::DiffState;
+use crate::diff::{DiffState, InlineChange};
 use crate::editor::EditorTheme;
 use crate::github::GitHubValidationCache;
 use crate::inline::{
@@ -251,17 +251,7 @@ fn build_ghosts_before(
         let line_start = old.line_markers(old_line).range.start;
         let inline = d
             .old_inline_changes(old_line)
-            .map(|changes| {
-                changes
-                    .iter()
-                    .filter_map(|c| {
-                        let dr = lr.map.buffer_range_to_display(
-                            line_start + c.range.start..line_start + c.range.end,
-                        );
-                        (!dr.is_empty()).then_some(dr)
-                    })
-                    .collect()
-            })
+            .map(|changes| map_changes_to_display(&lr.map, line_start, changes))
             .unwrap_or_default();
         out.push(Ghost {
             height: layout.height(),
@@ -270,6 +260,22 @@ fn build_ghosts_before(
         });
     }
     out
+}
+
+/// Map line-relative inline-change byte ranges through a line's segment map into
+/// non-empty display ranges. `base` is the line's buffer start byte.
+fn map_changes_to_display(
+    map: &SegmentMap,
+    base: usize,
+    changes: &[InlineChange],
+) -> Vec<Range<usize>> {
+    changes
+        .iter()
+        .filter_map(|c| {
+            let dr = map.buffer_range_to_display(base + c.range.start..base + c.range.end);
+            (!dr.is_empty()).then_some(dr)
+        })
+        .collect()
 }
 
 /// Prefix-sum tops for `heights`: `out[0] = pad_top`, `out[i+1] = out[i] +
@@ -482,17 +488,7 @@ impl DocLayout {
                 Some(d) if d.is_addition(i) => {
                     let inline = d
                         .new_inline_changes(i)
-                        .map(|changes| {
-                            changes
-                                .iter()
-                                .filter_map(|c| {
-                                    let dr = lr.map.buffer_range_to_display(
-                                        range.start + c.range.start..range.start + c.range.end,
-                                    );
-                                    (!dr.is_empty()).then_some(dr)
-                                })
-                                .collect()
-                        })
+                        .map(|changes| map_changes_to_display(&lr.map, range.start, changes))
                         .unwrap_or_default();
                     LineDiff {
                         is_addition: true,
