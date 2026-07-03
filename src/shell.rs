@@ -1145,6 +1145,14 @@ impl ApplicationHandler<WritEvent> for App {
                 self.mouse_down = false;
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                // Ctrl-W / Super-W closes the window (does not auto-save; use Ctrl-S).
+                let cmd = self.modifiers.control_key() || self.modifiers.super_key();
+                if cmd
+                    && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("w"))
+                {
+                    event_loop.exit();
+                    return;
+                }
                 let w = state.surface.config.width as f32;
                 let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
 
