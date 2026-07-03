@@ -39,7 +39,9 @@ use crate::buffer::Buffer;
 use crate::chrome::{BarRect, StatusInfo, draw_panel, draw_status_bar};
 use crate::config::Config;
 use crate::core::{AutocompleteState, AutocompleteSuggestion, AutocompleteTrigger, Editor};
-use crate::doc_layout::{DocLayout, GithubRenderData, LineCache, RenderCache, ScreenRect};
+use crate::doc_layout::{
+    DocLayout, GithubRenderData, LayoutParams, LineCache, RenderCache, ScreenRect,
+};
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
 use crate::github::{
@@ -445,6 +447,16 @@ fn rebuild_doc(
         cache: editor.github_validation_cache(),
         context: editor.github_context(),
     };
+    let params = LayoutParams {
+        device_width,
+        scale,
+        pad_x: PADDING,
+        pad_top: PADDING,
+        pad_bottom: PADDING * 2.0,
+        base_font_size: FONT_SIZE,
+        line_height: LINE_HEIGHT,
+        fg: peniko_color(theme.foreground),
+    };
     DocLayout::build(
         engine,
         cache,
@@ -455,13 +467,7 @@ fn rebuild_doc(
         diff.as_ref(),
         Some(&github),
         cursor_offset,
-        device_width,
-        scale,
-        PADDING,
-        PADDING,
-        PADDING * 2.0,
-        FONT_SIZE,
-        LINE_HEIGHT,
+        &params,
         measure_to_y,
     )
 }

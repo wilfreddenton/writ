@@ -27,7 +27,7 @@ use crate::inline::{
 };
 use crate::render::{LineRender, build_line_render};
 use crate::segment_map::SegmentMap;
-use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
+use crate::text_engine::{StyleRun, TextEngine, peniko_color_alpha};
 
 /// A screen-space rectangle (device px), already offset by padding + scroll.
 pub type ScreenRect = (f64, f64, f64, f64);
@@ -210,21 +210,39 @@ struct DiffColors {
     deleted_inline: Color,
 }
 
+/// Stable per-frame layout constants: padding and font in logical px, plus
+/// `device_width`, `scale`, and the theme foreground baked to a `Color`. Bundled
+/// so `DocLayout::build` isn't a wall of `f32`s; all are fixed for a given surface
+/// and theme. Viewport state (`measure_to_y`) is deliberately kept a separate arg.
+pub struct LayoutParams {
+    pub device_width: f32,
+    pub scale: f32,
+    pub pad_x: f32,
+    pub pad_top: f32,
+    pub pad_bottom: f32,
+    pub base_font_size: f32,
+    pub line_height: f32,
+    pub fg: Color,
+}
+
 /// Build the ghost (deleted) lines that render above buffer line `new_line`,
 /// laying out each from the HEAD snapshot. `usize::MAX` cursor keeps every marker
 /// hidden in ghosts (the cursor is never "on" a ghost line).
-#[allow(clippy::too_many_arguments)]
 fn build_ghosts_before(
     engine: &mut TextEngine,
     diff: Option<&DiffState>,
     new_line: usize,
     theme: &EditorTheme,
-    scale: f32,
-    base_font_size: f32,
-    line_height: f32,
+    params: &LayoutParams,
     max_advance: f32,
-    fg: Color,
 ) -> Vec<Ghost> {
+    let LayoutParams {
+        scale,
+        base_font_size,
+        line_height,
+        fg,
+        ..
+    } = *params;
     let Some(d) = diff else { return Vec::new() };
     let Some(old_range) = d.ghost_lines_before(new_line) else {
         return Vec::new();
@@ -340,20 +358,23 @@ impl DocLayout {
         diff: Option<&DiffState>,
         github: Option<&GithubRenderData>,
         cursor_offset: usize,
-        device_width: f32,
-        scale: f32,
-        pad_x: f32,
-        pad_top: f32,
-        pad_bottom: f32,
-        base_font_size: f32,
-        line_height: f32,
+        params: &LayoutParams,
         // Materialize (fully lay out) lines from the top until their cumulative height
         // reaches `measure_to_y` (device px, = scroll_y + viewport_h) + overscan; the
         // rest of the document is cheaply height-*estimated* and left un-laid-out.
         // Pass `f32::INFINITY` to force laying out every line (the old behavior).
         measure_to_y: f32,
     ) -> Self {
-        let fg = peniko_color(theme.foreground);
+        let LayoutParams {
+            device_width,
+            scale,
+            pad_x,
+            pad_top,
+            pad_bottom,
+            base_font_size,
+            line_height,
+            fg,
+        } = *params;
         let max_advance = (device_width - 2.0 * pad_x * scale).max(1.0);
         let n = snapshot.line_count();
         cache.begin();
@@ -420,17 +441,7 @@ impl DocLayout {
                 continue;
             }
             // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
-            let line_ghosts = build_ghosts_before(
-                engine,
-                diff,
-                i,
-                theme,
-                scale,
-                base_font_size,
-                line_height,
-                max_advance,
-                fg,
-            );
+            let line_ghosts = build_ghosts_before(engine, diff, i, theme, params, max_advance);
             let gh: f32 = line_ghosts.iter().map(|g| g.height).sum();
 
             let extra = github.map(|g| g.extra_regions(i)).unwrap_or_default();
@@ -782,6 +793,21 @@ impl DocLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_engine::peniko_color;
+
+    /// Frame constants for the headless tests (scale 1.0, the shell's PADDING/FONT).
+    fn test_params(theme: &EditorTheme, device_width: f32) -> LayoutParams {
+        LayoutParams {
+            device_width,
+            scale: 1.0,
+            pad_x: 24.0,
+            pad_top: 24.0,
+            pad_bottom: 48.0,
+            base_font_size: 18.0,
+            line_height: 1.5,
+            fg: peniko_color(theme.foreground),
+        }
+    }
 
     #[test]
     fn tops_prefix_sum_has_n_plus_one() {
@@ -872,6 +898,7 @@ mod tests {
         let theme = EditorTheme::dracula();
         let mut buffer: Buffer = "hello world\nsecond line here\n".parse().unwrap();
         let snapshot = buffer.render_snapshot();
+        let params = test_params(&theme, 1200.0);
         let doc = DocLayout::build(
             &mut engine,
             &mut LineCache::new(),
@@ -882,13 +909,7 @@ mod tests {
             None,
             None,
             0,
-            1200.0,
-            1.0,
-            24.0,
-            24.0,
-            48.0,
-            18.0,
-            1.5,
+            &params,
             f32::INFINITY,
         );
         // Several buffer offsets (incl. second line) should map to a caret rect
@@ -918,6 +939,7 @@ mod tests {
 
         let mut buf: Buffer = new_text.parse().unwrap();
         let snapshot = buf.render_snapshot();
+        let params = test_params(&theme, 1200.0);
         let doc = DocLayout::build(
             &mut engine,
             &mut LineCache::new(),
@@ -928,13 +950,7 @@ mod tests {
             Some(&diff),
             None,
             usize::MAX,
-            1200.0,
-            1.0,
-            24.0,
-            24.0,
-            48.0,
-            18.0,
-            1.5,
+            &params,
             f32::INFINITY,
         );
         // Line 0's changed version has a deleted ghost stacked above it.
@@ -964,10 +980,11 @@ mod tests {
             .collect();
         let mut buffer: Buffer = text.parse().unwrap();
         let snapshot = buffer.render_snapshot();
+        let params = test_params(&theme, 1000.0);
         let build = |engine: &mut TextEngine, cache: &mut LineCache| {
             DocLayout::build(
-                engine, cache, &mut RenderCache::new(), 0, &snapshot, &theme, None, None, 0, 1000.0,
-                1.0, 24.0, 24.0, 48.0, 18.0, 1.5, f32::INFINITY,
+                engine, cache, &mut RenderCache::new(), 0, &snapshot, &theme, None, None, 0,
+                &params, f32::INFINITY,
             )
         };
         let t0 = Instant::now();
@@ -1002,11 +1019,12 @@ mod tests {
         // "# Title\n" then a body line. Heading content "Title" starts at buffer 2.
         let mut buffer: Buffer = "# Title\nbody line two\n".parse().unwrap();
         let snapshot = buffer.render_snapshot();
+        let params = test_params(&theme, 1200.0);
         let build =
             |engine: &mut TextEngine, lc: &mut LineCache, rc: &mut RenderCache, cursor: usize| {
                 DocLayout::build(
-                    engine, lc, rc, 7, &snapshot, &theme, None, None, cursor, 1200.0, 1.0, 24.0,
-                    24.0, 48.0, 18.0, 1.5, f32::INFINITY,
+                    engine, lc, rc, 7, &snapshot, &theme, None, None, cursor, &params,
+                    f32::INFINITY,
                 )
             };
 
@@ -1041,6 +1059,7 @@ mod tests {
         let mut buffer: Buffer = text.parse().unwrap();
         let snapshot = buffer.render_snapshot();
         let viewport_h = 600.0f32;
+        let params = test_params(&theme, 1000.0);
         let doc = DocLayout::build(
             &mut engine,
             &mut LineCache::new(),
@@ -1051,13 +1070,7 @@ mod tests {
             None,
             None,
             0,
-            1000.0,
-            1.0,
-            24.0,
-            24.0,
-            48.0,
-            18.0,
-            1.5,
+            &params,
             viewport_h, // measure_to_y = just the first viewport
         );
         let n = doc.line_count();
