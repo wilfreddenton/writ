@@ -1432,8 +1432,10 @@ impl EditorState {
             let text_start = content_start + leading_ws;
             let text_end = content_end - trailing_ws;
 
-            self.buffer.insert(text_end, "~~", cursor_pos);
-            self.buffer.insert(text_start, "~~", cursor_pos);
+            // Single replace wrapping the text in `~~` — one undo entry, byte-identical
+            // to inserting `~~` at both ends.
+            let wrapped = format!("~~{trimmed}~~");
+            self.buffer.replace(text_start..text_end, &wrapped, cursor_pos);
 
             let mut adjustment: isize = 0;
             if cursor_pos > text_start {
@@ -1451,8 +1453,10 @@ impl EditorState {
                 let trailing_ws = content.len() - content.trim_end().len();
                 let text_end = content_end - trailing_ws;
 
-                self.buffer.delete((text_end - 2)..text_end, cursor_pos);
-                self.buffer.delete(text_start..(text_start + 2), cursor_pos);
+                // Single replace stripping the wrapping `~~` — one undo entry, byte-identical
+                // to deleting the trailing and leading `~~` separately.
+                let inner = trimmed[2..trimmed.len() - 2].to_string();
+                self.buffer.replace(text_start..text_end, &inner, cursor_pos);
 
                 let mut adjustment: isize = 0;
                 if cursor_pos > text_start + 2 {
@@ -2454,6 +2458,53 @@ mod tests {
             assert!(text.contains("[ ] parent"), "parent should stay unchecked");
             assert!(text.contains("[x] ~~child1~~"), "child1 should be checked");
             assert!(text.contains("[ ] child2"), "child2 should stay unchecked");
+        }
+    }
+
+    mod strikethrough_tests {
+        use super::*;
+
+        #[test]
+        fn strikethrough_add_remove_round_trips() {
+            let mut state = EditorState::new("hello world\n");
+            state.toggle_line_strikethrough(0, true, 0);
+            assert_eq!(state.text(), "~~hello world~~\n");
+            state.toggle_line_strikethrough(0, false, 0);
+            assert_eq!(state.text(), "hello world\n", "round-trip is byte-identical");
+        }
+
+        #[test]
+        fn strikethrough_add_is_single_undo() {
+            let mut state = EditorState::new("hello world\n");
+            state.toggle_line_strikethrough(0, true, 0);
+            assert_eq!(state.text(), "~~hello world~~\n");
+            state.buffer.undo();
+            assert_eq!(
+                state.text(),
+                "hello world\n",
+                "one undo reverts the whole strikethrough toggle"
+            );
+            assert!(!state.buffer.can_undo(), "no further undo entries remain");
+        }
+
+        #[test]
+        fn strikethrough_remove_is_single_undo() {
+            let mut state = EditorState::new("~~hello world~~\n");
+            state.toggle_line_strikethrough(0, false, 0);
+            assert_eq!(state.text(), "hello world\n");
+            state.buffer.undo();
+            assert_eq!(state.text(), "~~hello world~~\n", "one undo restores `~~`");
+            assert!(!state.buffer.can_undo(), "no further undo entries remain");
+        }
+
+        #[test]
+        fn strikethrough_preserves_surrounding_whitespace() {
+            // Leading/trailing whitespace must be outside the `~~` wrap.
+            let mut state = EditorState::new("  hello  \n");
+            state.toggle_line_strikethrough(0, true, 0);
+            assert_eq!(state.text(), "  ~~hello~~  \n");
+            state.toggle_line_strikethrough(0, false, 0);
+            assert_eq!(state.text(), "  hello  \n");
         }
     }
 }
