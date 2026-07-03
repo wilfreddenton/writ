@@ -31,6 +31,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
 imara-diff = "0.2"
 gix = { version = "0.84", default-features = false, features = ["sha1"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # --- Linebender rendering stack (see MIGRATION-PLAN.md). `wgpu` is NOT a direct
 # dep — we use `vello::wgpu` so there is a single wgpu in the tree. ---
 parley = "0.11"

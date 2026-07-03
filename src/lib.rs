@@ -30,6 +30,7 @@ pub mod editor;
 pub mod git;
 pub mod github;
 pub mod highlight;
+pub mod image_cache;
 pub mod inline;
 pub mod marker;
 pub mod parser;
