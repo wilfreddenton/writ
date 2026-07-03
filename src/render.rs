@@ -253,6 +253,17 @@ pub fn build_line_render(
             }
         }
     } else {
+        // A completed task's content reads as "done": dimmed (its checkbox stays green).
+        // A base run under everything catches plain text between styled spans.
+        let dim = markers.checkbox() == Some(true);
+        let content_color = if dim {
+            peniko_color(theme.comment)
+        } else {
+            fg
+        };
+        if dim && !text.is_empty() {
+            runs.push(StyleRun::new(0..text.len(), content_color));
+        }
         if heading_level > 0 && !text.is_empty() {
             let mut h = StyleRun::new(0..text.len(), peniko_color(theme.purple));
             h.bold = true;
@@ -276,7 +287,7 @@ pub fn build_line_render(
                 Some(false) => peniko_color(theme.comment),
                 None if region.link_url.is_some() => peniko_color(theme.cyan),
                 None if style.code => peniko_color(theme.green),
-                None => fg,
+                None => content_color, // dimmed on a completed task, else fg
             };
             let mut run = StyleRun::new(r, color);
             run.bold = style.bold || heading_level > 0 || region.checkbox == Some(true);
@@ -353,6 +364,37 @@ mod tests {
         let theme = EditorTheme::dracula();
         let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &[], &[]);
         assert!(!lr.runs.iter().any(|r| r.underline));
+    }
+
+    /// A completed task dims its content (muted, spanning the line) while its checkbox
+    /// stays green; an active task's content is not dimmed.
+    #[test]
+    fn completed_task_dims_content() {
+        let theme = EditorTheme::dracula();
+        let comment = peniko_color(theme.comment);
+        let mut buf: Buffer = "- [x] done\n- [ ] todo\n".parse().unwrap();
+        let snap = buf.render_snapshot();
+
+        let done = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[]);
+        assert!(
+            done.runs
+                .iter()
+                .any(|r| r.color == comment && r.range.len() >= done.text.len()),
+            "completed task content is dimmed across the line"
+        );
+        assert!(
+            done.runs.iter().any(|r| r.color == peniko_color(theme.green)),
+            "the checkbox itself stays green"
+        );
+
+        let todo = build_line_render(&snap, 1, &theme, 18.0, usize::MAX, &[], &[]);
+        assert!(
+            !todo
+                .runs
+                .iter()
+                .any(|r| r.color == comment && r.range.len() >= todo.text.len()),
+            "active task content is not dimmed (only its empty box is muted)"
+        );
     }
 
     /// A thematic break hides its `---` and flags `is_hr` for the drawn rule — but
