@@ -14,18 +14,19 @@ use std::rc::Rc;
 
 use parley::{Affinity, Cluster, Cursor, Selection};
 use vello::Scene;
-use vello::kurbo::{Affine, Rect};
-use vello::peniko::{Brush, Color, Fill};
+use vello::kurbo::{Affine, Rect, Stroke};
+use vello::peniko::{Brush, Color, Fill, ImageBrush};
 
 use crate::buffer::RenderSnapshot;
 use crate::diff::{DiffState, InlineChange};
 use crate::editor::EditorTheme;
 use crate::github::GitHubValidationCache;
+use crate::image_cache::{ImageCache, ImageState};
 use crate::inline::{
     GitHubContext, NakedUrl, RawGitHubMatch, StyledRegion, github_refs_to_styled_regions,
     naked_urls_to_styled_regions,
 };
-use crate::render::{LineRender, build_line_render};
+use crate::render::{ImageRef, LineRender, build_line_render};
 use crate::segment_map::SegmentMap;
 use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
 
@@ -189,6 +190,35 @@ impl RenderCache {
     }
 }
 
+/// Cap on a displayed image's height in logical px; if it bites, width shrinks to
+/// preserve aspect. Images never upscale beyond their intrinsic size.
+const MAX_IMG_H: f32 = 400.0;
+/// Vertical padding (logical px) above and below an image block.
+const IMG_VPAD: f32 = 8.0;
+/// Block height (logical px) reserved for a loading/failed image placeholder.
+const IMG_PLACEHOLDER_H: f32 = 120.0;
+
+/// A standalone image to paint on a line: its load state plus the sizing the draw
+/// pass needs. `dest_*` are device px on screen; `nat_*` are the image's intrinsic
+/// pixel dimensions (draw_image paints at native size, so the transform scales
+/// `dest/nat`).
+struct ImageBlock {
+    alt: String,
+    kind: ImageBlockKind,
+}
+
+enum ImageBlockKind {
+    Loaded {
+        brush: ImageBrush,
+        nat_w: f32,
+        nat_h: f32,
+        dest_w: f32,
+        dest_h: f32,
+    },
+    Loading,
+    Failed,
+}
+
 /// Inline git-diff decorations for one real line (added-line bg + word ranges).
 #[derive(Default)]
 struct LineDiff {
@@ -301,6 +331,59 @@ fn map_changes_to_display(
         .collect()
 }
 
+/// Build the image block for a standalone image and its device-px block height (used
+/// as the line height). Fits to `content_w`, preserves aspect, never upscales beyond
+/// intrinsic, and caps height at `max_img_h` (shrinking width to keep aspect). Loading
+/// and failed states get a fixed placeholder height.
+fn build_image_block(
+    images: &ImageCache,
+    img: &ImageRef,
+    content_w: f32,
+    scale: f32,
+    max_img_h: f32,
+    vpad: f32,
+) -> (ImageBlock, f32) {
+    match images.get(&img.url) {
+        Some(ImageState::Loaded(loaded)) => {
+            // Intrinsic size in device px (treat intrinsic px as logical, so ×scale).
+            let iw = loaded.width as f32 * scale;
+            let ih = loaded.height as f32 * scale;
+            let mut dw = iw.min(content_w);
+            let mut dh = if iw > 0.0 { ih * dw / iw } else { 0.0 };
+            if dh > max_img_h && ih > 0.0 {
+                dh = max_img_h;
+                dw = iw * dh / ih;
+            }
+            let block = ImageBlock {
+                alt: img.alt.clone(),
+                kind: ImageBlockKind::Loaded {
+                    brush: loaded.brush.clone(),
+                    nat_w: loaded.width as f32,
+                    nat_h: loaded.height as f32,
+                    dest_w: dw,
+                    dest_h: dh,
+                },
+            };
+            (block, dh + 2.0 * vpad)
+        }
+        Some(ImageState::Failed) => (
+            ImageBlock {
+                alt: img.alt.clone(),
+                kind: ImageBlockKind::Failed,
+            },
+            IMG_PLACEHOLDER_H * scale,
+        ),
+        // Loading, or not yet spawned: a pending placeholder box.
+        Some(ImageState::Loading) | None => (
+            ImageBlock {
+                alt: img.alt.clone(),
+                kind: ImageBlockKind::Loading,
+            },
+            IMG_PLACEHOLDER_H * scale,
+        ),
+    }
+}
+
 /// Prefix-sum tops for `heights`: `out[0] = pad_top`, `out[i+1] = out[i] +
 /// heights[i]`. Length is `heights.len() + 1`.
 fn compute_tops(heights: &[f32], pad_top: f32) -> Vec<f32> {
@@ -332,6 +415,19 @@ pub struct DocLayout {
     line_diffs: Vec<LineDiff>,
     /// Ghost (deleted) lines rendered *above* each real line, parallel to `layouts`.
     ghosts: Vec<Vec<Ghost>>,
+    /// Per-line standalone-image block, parallel to `layouts`. `Some` overrides the
+    /// line's height with the image (or placeholder) block and is painted by
+    /// `draw_images`; `None` for ordinary lines.
+    image_blocks: Vec<Option<ImageBlock>>,
+    /// Distinct image URLs across the materialized lines, for the shell to kick off
+    /// loads (diffed against the shared cache).
+    image_urls: Vec<String>,
+    /// Vertical padding (device px) above/below an image block, and the placeholder
+    /// box colors — baked from `scale`/theme at build so the draw pass is self-contained.
+    img_vpad: f32,
+    img_label_size: f32,
+    image_border: Color,
+    image_bg: Color,
     /// Per-line x-offsets (from the line origin) of each blockquote gutter rule, parallel
     /// to `layouts`. Empty for non-quote lines. Painted as continuous vertical rects.
     quote_bars: Vec<Vec<f32>>,
@@ -368,6 +464,7 @@ impl DocLayout {
         theme: &EditorTheme,
         diff: Option<&DiffState>,
         github: Option<&GithubRenderData>,
+        images: &ImageCache,
         cursor_offset: usize,
         params: &LayoutParams,
         // Materialize (fully lay out) lines from the top until their cumulative height
@@ -428,6 +525,12 @@ impl DocLayout {
         let mut ghosts = Vec::with_capacity(n);
         let mut ghost_height = Vec::with_capacity(n);
         let mut quote_bars: Vec<Vec<f32>> = Vec::with_capacity(n);
+        let mut image_blocks: Vec<Option<ImageBlock>> = Vec::with_capacity(n);
+        let mut image_urls: Vec<String> = Vec::new();
+        // Content width available to an image (device px), same basis as `max_advance`.
+        let content_w = max_advance;
+        let max_img_h = MAX_IMG_H * scale;
+        let img_vpad = IMG_VPAD * scale;
         // Each line's total height = its ghost block above + the real line.
         let mut heights = Vec::with_capacity(n);
         // `i` indexes several parallel per-line inputs (styles, markers, diff).
@@ -455,6 +558,7 @@ impl DocLayout {
                 ghosts.push(Vec::new());
                 ghost_height.push(0.0);
                 quote_bars.push(Vec::new());
+                image_blocks.push(None);
                 continue;
             }
             // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
@@ -534,7 +638,20 @@ impl DocLayout {
                 .iter()
                 .filter_map(|&b| Cluster::from_byte_index(&layout, b).and_then(|c| c.visual_offset()))
                 .collect();
-            let total_h = gh + layout.height();
+            // Standalone image: the block (image or placeholder) sets the line height in
+            // place of the (empty) text layout, and the URL is collected for loading.
+            let (image_block, line_h) = match &lr.image {
+                Some(img) => {
+                    if !image_urls.iter().any(|u| u == &img.url) {
+                        image_urls.push(img.url.clone());
+                    }
+                    let (block, block_h) =
+                        build_image_block(images, img, content_w, scale, max_img_h, img_vpad);
+                    (Some(block), block_h)
+                }
+                None => (None, layout.height()),
+            };
+            let total_h = gh + line_h;
             measured_y += total_h;
             heights.push(total_h);
             layouts.push(layout);
@@ -544,6 +661,7 @@ impl DocLayout {
             line_diffs.push(line_diff);
             ghosts.push(line_ghosts);
             ghost_height.push(gh);
+            image_blocks.push(image_block);
         }
         cache.sweep();
         render_cache.sweep();
@@ -561,6 +679,12 @@ impl DocLayout {
             ghosts,
             ghost_height,
             quote_bars,
+            image_blocks,
+            image_urls,
+            img_vpad,
+            img_label_size: 14.0 * scale,
+            image_border: peniko_color(theme.comment),
+            image_bg: peniko_color_alpha(theme.comment, 0.08),
             diff_colors,
             // A thin rule (~1/6 of a mono cell), floored so it stays visible when small.
             quote_bar_width: (k * 0.16).max(1.5),
@@ -840,6 +964,77 @@ impl DocLayout {
         }
     }
 
+    /// Distinct standalone-image URLs across the materialized lines. The shell diffs
+    /// these against the shared cache to spawn loads.
+    pub fn image_urls(&self) -> Vec<String> {
+        self.image_urls.clone()
+    }
+
+    /// Paint standalone-image blocks: a loaded image at its fitted device rect, or a
+    /// bordered placeholder box with an alt/status label (pending/broken). Left-aligned
+    /// at `pad_x`, inset by `img_vpad`. Call BEFORE `draw` (glyphs, if any, sit on top).
+    pub fn draw_images(&self, engine: &mut TextEngine, scene: &mut Scene, viewport_h: f32) {
+        let (first, last) = self.visible_range(viewport_h);
+        for i in first..last {
+            let Some(block) = &self.image_blocks[i] else {
+                continue;
+            };
+            let x = self.pad_x as f64;
+            let top = (self.real_top(i) - self.scroll_y + self.img_vpad) as f64;
+            match &block.kind {
+                ImageBlockKind::Loaded {
+                    brush,
+                    nat_w,
+                    nat_h,
+                    dest_w,
+                    dest_h,
+                } => {
+                    // draw_image paints at native pixel size, so scale dest/intrinsic.
+                    let transform = Affine::translate((x, top))
+                        * Affine::scale_non_uniform(
+                            (*dest_w / *nat_w) as f64,
+                            (*dest_h / *nat_h) as f64,
+                        );
+                    scene.draw_image(brush, transform);
+                }
+                ImageBlockKind::Loading | ImageBlockKind::Failed => {
+                    let line_bottom = (self.tops[i + 1] - self.scroll_y) as f64;
+                    let x1 = (self.width - self.pad_x) as f64;
+                    let bottom = line_bottom - self.img_vpad as f64;
+                    let rect = Rect::new(x, top, x1, bottom.max(top)).to_rounded_rect(4.0);
+                    scene.fill(Fill::NonZero, Affine::IDENTITY, self.image_bg, None, &rect);
+                    scene.stroke(
+                        &Stroke::new(1.0),
+                        Affine::IDENTITY,
+                        self.image_border,
+                        None,
+                        &rect,
+                    );
+                    let failed = matches!(block.kind, ImageBlockKind::Failed);
+                    let label = if block.alt.is_empty() {
+                        if failed { "broken image" } else { "loading image…" }.to_string()
+                    } else if failed {
+                        format!("⚠ {}", block.alt)
+                    } else {
+                        block.alt.clone()
+                    };
+                    let pad = self.img_label_size * 0.5;
+                    let layout = engine.build_line(
+                        &label,
+                        1.0,
+                        self.img_label_size,
+                        1.3,
+                        self.image_border,
+                        Some(((x1 - x) as f32 - 2.0 * pad).max(1.0)),
+                        &[],
+                    );
+                    let ly = top as f32 + ((bottom - top) as f32 - layout.height()) * 0.5;
+                    engine.draw_line(scene, &layout, (x as f32 + pad, ly.max(top as f32)));
+                }
+            }
+        }
+    }
+
     /// Paint inline-diff backgrounds for added lines (faint full-row bg + stronger
     /// word-change bg). Call BEFORE `draw` so glyphs sit on top.
     pub fn draw_added_backgrounds(&self, scene: &mut Scene, viewport_h: f32) {
@@ -888,6 +1083,74 @@ mod tests {
         }
     }
 
+    /// Encode a solid RGBA image of the given size to PNG, decode it into the cache
+    /// under `url`, and return that URL's `ImageRef`.
+    fn cache_image(cache: &ImageCache, url: &str, w: u32, h: u32) -> ImageRef {
+        use image::{ImageFormat, RgbaImage};
+        use std::io::Cursor;
+        let img = RgbaImage::from_pixel(w, h, image::Rgba([1, 2, 3, 255]));
+        let mut buf = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        cache.set_loaded(url, crate::image_cache::decode(&buf).unwrap());
+        ImageRef {
+            url: url.to_string(),
+            alt: String::new(),
+        }
+    }
+
+    /// A wide image fits the content width (never overflows), and its height scales to
+    /// preserve aspect. A tall image's displayed height is capped at `max_img_h`, with
+    /// width re-derived so the aspect ratio is still preserved. A small image is not
+    /// upscaled beyond its intrinsic size.
+    #[test]
+    fn image_block_fits_width_and_caps_height() {
+        let cache = ImageCache::new();
+        let content_w = 800.0f32;
+        let max_h = MAX_IMG_H; // scale 1.0
+        let vpad = IMG_VPAD;
+
+        // Wide: 2000x100 → clamps to content width, height scaled to keep aspect.
+        let wide = cache_image(&cache, "wide", 2000, 100);
+        let (block, _) = build_image_block(&cache, &wide, content_w, 1.0, max_h, vpad);
+        let ImageBlockKind::Loaded { dest_w, dest_h, .. } = block.kind else {
+            panic!("expected loaded");
+        };
+        assert!((dest_w - content_w).abs() < 0.5, "wide image fills content width");
+        assert!((dest_h - content_w * 100.0 / 2000.0).abs() < 0.5, "aspect preserved");
+
+        // Tall: 100x2000 → height capped, width re-derived to keep aspect.
+        let tall = cache_image(&cache, "tall", 100, 2000);
+        let (block, _) = build_image_block(&cache, &tall, content_w, 1.0, max_h, vpad);
+        let ImageBlockKind::Loaded { dest_w, dest_h, .. } = block.kind else {
+            panic!("expected loaded");
+        };
+        assert!((dest_h - max_h).abs() < 0.5, "tall image height is capped");
+        assert!((dest_w - max_h * 100.0 / 2000.0).abs() < 0.5, "capped width keeps aspect");
+
+        // Small: 40x30, well under both limits → shown at intrinsic size (no upscale).
+        let small = cache_image(&cache, "small", 40, 30);
+        let (block, block_h) = build_image_block(&cache, &small, content_w, 1.0, max_h, vpad);
+        let ImageBlockKind::Loaded { dest_w, dest_h, .. } = block.kind else {
+            panic!("expected loaded");
+        };
+        assert_eq!((dest_w, dest_h), (40.0, 30.0), "small image is not upscaled");
+        assert!((block_h - (30.0 + 2.0 * vpad)).abs() < 0.5, "block adds vertical padding");
+    }
+
+    /// An uncached (still-loading) URL gets a fixed placeholder block height.
+    #[test]
+    fn image_block_placeholder_height_when_unloaded() {
+        let cache = ImageCache::new();
+        let img = ImageRef {
+            url: "pending.png".to_string(),
+            alt: "x".to_string(),
+        };
+        let (block, block_h) = build_image_block(&cache, &img, 800.0, 1.0, MAX_IMG_H, IMG_VPAD);
+        assert!(matches!(block.kind, ImageBlockKind::Loading));
+        assert_eq!(block_h, IMG_PLACEHOLDER_H);
+    }
+
     #[test]
     fn tops_prefix_sum_has_n_plus_one() {
         let heights = [10.0, 20.0, 5.0];
@@ -927,6 +1190,12 @@ mod tests {
             ghosts: heights.iter().map(|_| Vec::new()).collect(),
             ghost_height: heights.iter().map(|_| 0.0).collect(),
             quote_bars: heights.iter().map(|_| Vec::new()).collect(),
+            image_blocks: heights.iter().map(|_| None).collect(),
+            image_urls: Vec::new(),
+            img_vpad: 0.0,
+            img_label_size: 14.0,
+            image_border: Color::TRANSPARENT,
+            image_bg: Color::TRANSPARENT,
             quote_bar_width: 2.0,
             quote_bar_color: Color::TRANSPARENT,
             measured_count: heights.len(),
@@ -994,6 +1263,7 @@ mod tests {
             &theme,
             None,
             None,
+            &ImageCache::new(),
             0,
             &params,
             f32::INFINITY,
@@ -1035,6 +1305,7 @@ mod tests {
             &theme,
             Some(&diff),
             None,
+            &ImageCache::new(),
             usize::MAX,
             &params,
             f32::INFINITY,
@@ -1069,8 +1340,8 @@ mod tests {
         let params = test_params(&theme, 1000.0);
         let build = |engine: &mut TextEngine, cache: &mut LineCache| {
             DocLayout::build(
-                engine, cache, &mut RenderCache::new(), 0, &snapshot, &theme, None, None, 0,
-                &params, f32::INFINITY,
+                engine, cache, &mut RenderCache::new(), 0, &snapshot, &theme, None, None,
+                &ImageCache::new(), 0, &params, f32::INFINITY,
             )
         };
         let t0 = Instant::now();
@@ -1109,8 +1380,8 @@ mod tests {
         let build =
             |engine: &mut TextEngine, lc: &mut LineCache, rc: &mut RenderCache, cursor: usize| {
                 DocLayout::build(
-                    engine, lc, rc, 7, &snapshot, &theme, None, None, cursor, &params,
-                    f32::INFINITY,
+                    engine, lc, rc, 7, &snapshot, &theme, None, None, &ImageCache::new(),
+                    cursor, &params, f32::INFINITY,
                 )
             };
 
@@ -1155,6 +1426,7 @@ mod tests {
             &theme,
             None,
             None,
+            &ImageCache::new(),
             0,
             &params,
             viewport_h, // measure_to_y = just the first viewport

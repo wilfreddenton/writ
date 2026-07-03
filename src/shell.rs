@@ -14,6 +14,7 @@
 //! `WRIT_SHELL_SNAPSHOT=out.ppm` (+ optional `WRIT_SHELL_{W,H,SCROLL,CURSOR,SEL_A,SEL_B}`)
 //! to render one frame headlessly instead.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +46,7 @@ use crate::doc_layout::{
 };
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
+use crate::image_cache::{ImageCache, decode};
 use crate::github::{
     GitHubClient, IssueOrPr, IssueStatus, MentionableUser, ValidatedRefData, ValidationResult,
     ValidationState,
@@ -159,6 +161,9 @@ land in the next phases. For now this proves the render + scroll skeleton.
 #[derive(Debug, Clone)]
 enum WritEvent {
     GithubUpdated,
+    /// A standalone image finished loading (local or remote). A load changes a line's
+    /// height, so the loop rebuilds (not just redraws) to reflow around it.
+    ImageLoaded,
 }
 
 /// Autocomplete results a tokio task fetched, handed back to the main thread (via a
@@ -200,6 +205,8 @@ struct DocEngine {
     theme: EditorTheme,
     editor: Editor,
     doc: Option<DocLayout>,
+    /// Shared cache of decoded standalone images, threaded into `DocLayout::build`.
+    images: ImageCache,
 }
 
 struct App {
@@ -248,6 +255,7 @@ impl App {
                 theme: EditorTheme::dracula(),
                 editor,
                 doc: None,
+                images: ImageCache::new(),
             },
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
@@ -262,10 +270,108 @@ impl App {
         }
     }
 
-    /// Spawn async validation for every not-yet-cached GitHub ref currently detected.
-    /// Each finished task writes its result into the shared cache and wakes the loop.
+    /// Post-edit async side effects: validate freshly-detected GitHub refs and start
+    /// loading any newly-appeared standalone images. Both are idempotent (cache-guarded).
     fn spawn_validations(&self) {
         spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+        self.sync_images();
+    }
+
+    /// Kick off loads for every standalone image in the current layout that isn't cached
+    /// yet. Idempotent (already-cached URLs are skipped), so it's safe to call after any
+    /// rebuild/scroll.
+    fn sync_images(&self) {
+        sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+    }
+}
+
+/// Free-function form of `App::sync_images` that borrows only the doc-engine (+ runtime
+/// / proxy) — usable from `window_event` where `self.state` is already borrowed mutably.
+fn sync_image_loads(
+    doc_engine: &DocEngine,
+    runtime: &tokio::runtime::Handle,
+    proxy: &EventLoopProxy<WritEvent>,
+) {
+    let Some(doc) = doc_engine.doc.as_ref() else {
+        return;
+    };
+    let urls = doc.image_urls();
+    if urls.is_empty() {
+        return;
+    }
+    let dir = doc_engine
+        .editor
+        .file_path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    spawn_image_loads(dir, &urls, &doc_engine.images, runtime, proxy);
+}
+
+/// Resolve a standalone-image URL to a filesystem path: absolute paths as-is, relative
+/// paths against the document's directory. Returns None when relative but the doc has
+/// no directory (e.g. the in-memory sample).
+fn resolve_local_image(doc_dir: Option<&Path>, url: &str) -> Option<PathBuf> {
+    let path = Path::new(url.strip_prefix("file://").unwrap_or(url));
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        doc_dir.map(|d| d.join(path))
+    }
+}
+
+/// GET + decode a remote image. Mirrors the reqwest/rustls client pattern in github.rs.
+async fn load_remote_image(url: &str) -> Option<crate::image_cache::LoadedImage> {
+    let bytes = reqwest::Client::new()
+        .get(url)
+        .header("User-Agent", "writ")
+        .send()
+        .await
+        .ok()?
+        .bytes()
+        .await
+        .ok()?;
+    decode(&bytes)
+}
+
+/// For each standalone-image URL with no cache entry, mark it loading and spawn a
+/// worker: remote `http(s)` via reqwest on the async runtime, else a local file read +
+/// decode on a blocking task (so IO/decoding doesn't stall the runtime). Each finish
+/// wakes the loop with `ImageLoaded` so the doc rebuilds around the now-known height.
+fn spawn_image_loads(
+    doc_dir: Option<PathBuf>,
+    urls: &[String],
+    cache: &ImageCache,
+    runtime: &tokio::runtime::Handle,
+    proxy: &EventLoopProxy<WritEvent>,
+) {
+    for url in urls {
+        if cache.get(url).is_some() {
+            continue; // already loading/loaded/failed
+        }
+        cache.mark_loading(url);
+        let cache = cache.clone();
+        let proxy = proxy.clone();
+        let url = url.clone();
+        if url.starts_with("http://") || url.starts_with("https://") {
+            runtime.spawn(async move {
+                match load_remote_image(&url).await {
+                    Some(img) => cache.set_loaded(&url, img),
+                    None => cache.set_failed(&url),
+                }
+                let _ = proxy.send_event(WritEvent::ImageLoaded);
+            });
+        } else {
+            let path = resolve_local_image(doc_dir.as_deref(), &url);
+            runtime.spawn_blocking(move || {
+                let loaded = path
+                    .and_then(|p| std::fs::read(p).ok())
+                    .and_then(|bytes| decode(&bytes));
+                match loaded {
+                    Some(img) => cache.set_loaded(&url, img),
+                    None => cache.set_failed(&url),
+                }
+                let _ = proxy.send_event(WritEvent::ImageLoaded);
+            });
+        }
     }
 }
 
@@ -465,6 +571,7 @@ impl DocEngine {
             &self.theme,
             diff.as_ref(),
             Some(&github),
+            &self.images,
             cursor_offset,
             &params,
             measure_to_y,
@@ -857,24 +964,24 @@ impl ApplicationHandler<WritEvent> for App {
     /// A tokio task finished (validation/suggestion). Results are already in the
     /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WritEvent) {
-        match event {
-            WritEvent::GithubUpdated => {
-                // Install any fetched autocomplete suggestions (built on this thread).
-                let fetched = self.ac_slot.lock().unwrap().take();
-                if let Some(fetched) = fetched {
-                    apply_fetched(&mut self.doc_engine.editor, fetched);
-                }
-                if let Some(state) = self.state.as_ref() {
-                    let w = state.surface.config.width as f32;
-                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
-                    let scale = state.scale;
-                    let window = state.window.clone();
-                    // Rebuild so freshly-validated refs recolor; detection is unchanged,
-                    // so skip it and preserve the current scroll (no viewport jump).
-                    self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
-                    window.request_redraw();
-                }
+        // GithubUpdated may carry fetched autocomplete suggestions built on the worker;
+        // install them before rebuilding. ImageLoaded only changed the shared image
+        // cache. Both then rebuild-preserving-scroll (validated refs recolor / a loaded
+        // image reflows its line's height) and redraw.
+        if matches!(event, WritEvent::GithubUpdated) {
+            let fetched = self.ac_slot.lock().unwrap().take();
+            if let Some(fetched) = fetched {
+                apply_fetched(&mut self.doc_engine.editor, fetched);
             }
+        }
+        if let Some(state) = self.state.as_ref() {
+            let w = state.surface.config.width as f32;
+            let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+            let scale = state.scale;
+            let window = state.window.clone();
+            self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
+            self.sync_images();
+            window.request_redraw();
         }
     }
 
@@ -927,8 +1034,9 @@ impl ApplicationHandler<WritEvent> for App {
             window,
             scale,
         });
-        // Validate refs already present in the loaded file.
+        // Validate refs already present in the loaded file, and start loading images.
         self.spawn_validations();
+        self.sync_images();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -971,6 +1079,8 @@ impl ApplicationHandler<WritEvent> for App {
                     let w = state.surface.config.width as f32;
                     let scale = state.scale;
                     self.doc_engine.rebuild_preserving_scroll(w, scale, editor_h);
+                    // Image lines scrolled into the materialized range need loading.
+                    sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                 }
                 if self.doc_engine.doc.is_some() {
                     state.window.request_redraw();
@@ -989,6 +1099,7 @@ impl ApplicationHandler<WritEvent> for App {
                     let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     self.doc_engine.refresh(w, state.scale, vh);
                     spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+                    sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                     state.window.request_redraw();
                 }
             }
@@ -1050,6 +1161,7 @@ impl ApplicationHandler<WritEvent> for App {
                         self.hovered = None;
                         self.doc_engine.refresh(w, state.scale, vh);
                         spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+                        sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                         state.window.request_redraw();
                     }
                     return;
@@ -1135,6 +1247,7 @@ impl ApplicationHandler<WritEvent> for App {
                             self.hovered = None;
                             self.doc_engine.refresh(w, state.scale, vh);
                             spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+                            sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                             state.window.request_redraw();
                             return;
                         }
@@ -1146,6 +1259,7 @@ impl ApplicationHandler<WritEvent> for App {
                     self.hovered = None;
                     self.doc_engine.refresh(w, state.scale, vh);
                     spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+                    sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                     sync_autocomplete(
                         &mut self.doc_engine.editor,
                         &self.runtime,
@@ -1185,6 +1299,7 @@ impl ApplicationHandler<WritEvent> for App {
                     doc.draw_added_backgrounds(&mut self.scene, editor_h);
                     doc.draw_blockquote_gutters(&mut self.scene, editor_h);
                     doc.draw_horizontal_rules(&mut self.scene, editor_h);
+                    doc.draw_images(&mut self.doc_engine.text_engine, &mut self.scene, editor_h);
                     if let Some(sel) = self.doc_engine.editor.selection_range() {
                         let color = peniko_color(self.doc_engine.theme.selection);
                         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
@@ -1335,6 +1450,7 @@ impl ApplicationHandler<WritEvent> for App {
             let scale = state.scale;
             self.doc_engine.refresh(w, scale, editor_h);
             spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+            sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
             window.request_redraw();
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -1420,6 +1536,25 @@ fn load_editor_from_cli() -> Editor {
         eprintln!("[writ] file watch failed: {e}");
     }
     editor
+}
+
+/// Synchronously read + decode local standalone images into the cache (headless
+/// snapshot path). Remote `http(s)` images are marked loading and left as a placeholder
+/// (no network in the golden frame). Local reads are relative to the doc's directory.
+fn load_local_images_blocking(doc_dir: Option<&Path>, urls: &[String], cache: &ImageCache) {
+    for url in urls {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            cache.mark_loading(url);
+            continue;
+        }
+        let loaded = resolve_local_image(doc_dir, url)
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|bytes| decode(&bytes));
+        match loaded {
+            Some(img) => cache.set_loaded(url, img),
+            None => cache.set_failed(url),
+        }
+    }
 }
 
 /// Synchronously validate every detected GitHub ref (blocking on the current tokio
@@ -1541,8 +1676,17 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         theme: EditorTheme::dracula(),
         editor,
         doc: None,
+        images: ImageCache::new(),
     };
     let mut doc = de.rebuild(width as f32, 1.0, scroll_y + editor_h);
+    // Synchronously decode local standalone images so they appear in the single frame
+    // (remote images stay a placeholder headlessly). Then rebuild so their heights land.
+    let img_dir = de
+        .editor
+        .file_path()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+    load_local_images_blocking(img_dir.as_deref(), &doc.image_urls(), &de.images);
+    doc = de.rebuild(width as f32, 1.0, scroll_y + editor_h);
     doc.scroll_by(scroll_y, editor_h);
     let mut scene = Scene::new();
     let clip = Rect::new(
@@ -1555,6 +1699,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     doc.draw_added_backgrounds(&mut scene, editor_h);
     doc.draw_blockquote_gutters(&mut scene, editor_h);
     doc.draw_horizontal_rules(&mut scene, editor_h);
+    doc.draw_images(&mut de.text_engine, &mut scene, editor_h);
     if let Some(sel) = de.editor.selection_range() {
         let color = peniko_color(de.theme.selection);
         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
