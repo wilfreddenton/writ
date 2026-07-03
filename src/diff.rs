@@ -111,11 +111,11 @@ impl DiffState {
 /// Normalize text for diffing: ensure consistent trailing newline.
 /// This prevents spurious diffs on the last line when one text has a trailing
 /// newline and the other doesn't.
-fn normalize_for_diff(text: &str) -> String {
+fn normalize_for_diff(text: &str) -> std::borrow::Cow<'_, str> {
     if text.ends_with('\n') {
-        text.to_string()
+        std::borrow::Cow::Borrowed(text)
     } else {
-        format!("{}\n", text)
+        std::borrow::Cow::Owned(format!("{text}\n"))
     }
 }
 
@@ -130,7 +130,7 @@ fn compute_line_hunks(old_text: &str, new_text: &str) -> Vec<DiffHunk> {
     let old_lines: Vec<&str> = old_normalized.lines().collect();
     let new_lines: Vec<&str> = new_normalized.lines().collect();
 
-    let input = InternedInput::new(old_normalized.as_str(), new_normalized.as_str());
+    let input = InternedInput::new(&*old_normalized, &*new_normalized);
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
 

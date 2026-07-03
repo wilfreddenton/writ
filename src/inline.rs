@@ -347,6 +347,31 @@ pub fn detect_naked_urls(
     urls
 }
 
+/// Cheap byte pre-scan for whether a line could contain any GitHub reference. True when
+/// it has a hash, at-sign, or slash, a case-insensitive GH-dash, or a 7+ ascii-hex run.
+fn line_might_contain_ref(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut hex_run = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'#' || b == b'@' || b == b'/' {
+            return true;
+        }
+        // `GH-` (case-insensitive), the GH-123 issue form.
+        if b == b'-' && i >= 2 && (bytes[i - 1] | 0x20) == b'h' && (bytes[i - 2] | 0x20) == b'g' {
+            return true;
+        }
+        if b.is_ascii_hexdigit() {
+            hex_run += 1;
+            if hex_run >= 7 {
+                return true;
+            }
+        } else {
+            hex_run = 0;
+        }
+    }
+    false
+}
+
 /// Detect GitHub references in a single line of text.
 ///
 /// Returns raw matches that should be validated against the GitHub API
@@ -362,6 +387,11 @@ pub fn detect_github_references_in_line(
     github_context: Option<&GitHubContext>,
     code_ranges: &[Range<usize>],
 ) -> Vec<RawGitHubMatch> {
+    // Cheap pre-filter: a line with no `#`/`@`/`/` and no 7+ run of ascii-hex can't
+    // contain any reference, so skip all the regex passes (the common prose case).
+    if !line_might_contain_ref(line) {
+        return Vec::new();
+    }
     let mut matches = Vec::new();
     let mut matched_ranges: Vec<Range<usize>> = Vec::new();
 
@@ -640,34 +670,13 @@ pub struct StyledRegion {
 /// Returns a flat Vec sorted by start byte position.
 pub fn extract_all_inline_styles(tree: &MarkdownTree, rope: &Rope) -> Vec<StyledRegion> {
     let mut styles = Vec::new();
-
-    let block_root = tree.block_tree().root_node();
-    collect_from_block_tree(&block_root, tree, rope, &mut styles);
-
+    // The parser already stores every inline subtree; iterate them directly instead of
+    // re-walking the whole block tree to rediscover the nodes they hang off.
+    for inline_tree in tree.inline_trees() {
+        collect_from_inline_tree(inline_tree.root_node(), rope, &mut styles);
+    }
     styles.sort_by_key(|s| s.full_range.start);
-
     styles
-}
-
-/// Collect inline styles from the block tree by finding "inline" nodes.
-fn collect_from_block_tree(
-    node: &Node,
-    tree: &MarkdownTree,
-    rope: &Rope,
-    styles: &mut Vec<StyledRegion>,
-) {
-    // Check if this node has an associated inline tree
-    if (node.kind() == "inline" || node.kind() == "pipe_table_cell")
-        && let Some(inline_tree) = tree.inline_tree(node)
-    {
-        collect_from_inline_tree(inline_tree.root_node(), rope, styles);
-    }
-
-    // Recurse into children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_from_block_tree(&child, tree, rope, styles);
-    }
 }
 
 /// Collect styled regions from an inline tree.
