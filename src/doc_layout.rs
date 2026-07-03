@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
 
-use parley::{Affinity, Cursor, Selection};
+use parley::{Affinity, Cluster, Cursor, Selection};
 use vello::Scene;
 use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Brush, Color, Fill};
@@ -27,7 +27,7 @@ use crate::inline::{
 };
 use crate::render::{LineRender, build_line_render};
 use crate::segment_map::SegmentMap;
-use crate::text_engine::{StyleRun, TextEngine, peniko_color_alpha};
+use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
 
 /// A screen-space rectangle (device px), already offset by padding + scroll.
 pub type ScreenRect = (f64, f64, f64, f64);
@@ -332,6 +332,9 @@ pub struct DocLayout {
     line_diffs: Vec<LineDiff>,
     /// Ghost (deleted) lines rendered *above* each real line, parallel to `layouts`.
     ghosts: Vec<Vec<Ghost>>,
+    /// Per-line x-offsets (from the line origin) of each blockquote gutter rule, parallel
+    /// to `layouts`. Empty for non-quote lines. Painted as continuous vertical rects.
+    quote_bars: Vec<Vec<f32>>,
     /// Total ghost-block height above each real line, parallel to `layouts`.
     ghost_height: Vec<f32>,
     /// Top y of each line's *ghost block*; the real line begins at
@@ -341,6 +344,9 @@ pub struct DocLayout {
     /// height-estimated placeholders. Equals `line_count()` when nothing was estimated.
     measured_count: usize,
     diff_colors: DiffColors,
+    /// Width (device px) and color of the painted blockquote gutter rules.
+    quote_bar_width: f32,
+    quote_bar_color: Color,
     pub scroll_y: f32,
     /// Surface width in device px (for full-width diff row backgrounds).
     width: f32,
@@ -404,6 +410,7 @@ impl DocLayout {
             runs: Vec::new(),
             map: SegmentMap::identity("", 0).1,
             content_start: 0,
+            quote_bar_bytes: Vec::new(),
         });
         let mut measured_y = pad_top * scale; // tops-space y consumed by materialized lines
         let mut estimating = false;
@@ -418,6 +425,7 @@ impl DocLayout {
         let mut line_diffs = Vec::with_capacity(n);
         let mut ghosts = Vec::with_capacity(n);
         let mut ghost_height = Vec::with_capacity(n);
+        let mut quote_bars: Vec<Vec<f32>> = Vec::with_capacity(n);
         // Each line's total height = its ghost block above + the real line.
         let mut heights = Vec::with_capacity(n);
         // `i` indexes several parallel per-line inputs (styles, markers, diff).
@@ -444,6 +452,7 @@ impl DocLayout {
                 line_diffs.push(LineDiff::default());
                 ghosts.push(Vec::new());
                 ghost_height.push(0.0);
+                quote_bars.push(Vec::new());
                 continue;
             }
             // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
@@ -516,11 +525,19 @@ impl DocLayout {
                 }
                 _ => LineDiff::default(),
             };
+            // Measure each blockquote gutter's x (on the first, un-hung row) so the draw
+            // path can paint a continuous rule there. Only quote lines pay this.
+            let bars: Vec<f32> = lr
+                .quote_bar_bytes
+                .iter()
+                .filter_map(|&b| Cluster::from_byte_index(&layout, b).and_then(|c| c.visual_offset()))
+                .collect();
             let total_h = gh + layout.height();
             measured_y += total_h;
             heights.push(total_h);
             layouts.push(layout);
             renders.push(lr);
+            quote_bars.push(bars);
             line_ranges.push(range);
             line_diffs.push(line_diff);
             ghosts.push(line_ghosts);
@@ -541,7 +558,11 @@ impl DocLayout {
             line_diffs,
             ghosts,
             ghost_height,
+            quote_bars,
             diff_colors,
+            // A thin rule (~1/6 of a mono cell), floored so it stays visible when small.
+            quote_bar_width: (k * 0.16).max(1.5),
+            quote_bar_color: peniko_color(theme.comment),
             tops: compute_tops(&heights, pad_top * scale),
             measured_count,
             scroll_y: 0.0,
@@ -769,6 +790,32 @@ impl DocLayout {
         }
     }
 
+    /// Paint blockquote gutter rules: one continuous vertical rect per nesting level,
+    /// spanning each quote line's full height (so it covers wrapped rows) and tiling
+    /// with adjacent quote lines (so multi-line quotes read as one unbroken bar). Call
+    /// BEFORE `draw`. `quote_bars[i]` holds each level's x-offset from the line origin.
+    pub fn draw_blockquote_gutters(&self, scene: &mut Scene, viewport_h: f32) {
+        let (first, last) = self.visible_range(viewport_h);
+        for i in first..last {
+            let bars = &self.quote_bars[i];
+            if bars.is_empty() {
+                continue;
+            }
+            let top = (self.real_top(i) - self.scroll_y) as f64;
+            let bottom = (self.tops[i + 1] - self.scroll_y) as f64;
+            for &bx in bars {
+                let x = (self.pad_x + bx) as f64;
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    self.quote_bar_color,
+                    None,
+                    &Rect::new(x, top, x + self.quote_bar_width as f64, bottom),
+                );
+            }
+        }
+    }
+
     /// Paint inline-diff backgrounds for added lines (faint full-row bg + stronger
     /// word-change bg). Call BEFORE `draw` so glyphs sit on top.
     pub fn draw_added_backgrounds(&self, scene: &mut Scene, viewport_h: f32) {
@@ -845,6 +892,7 @@ mod tests {
                         runs: Vec::new(),
                         map: SegmentMap::identity("", 0).1,
                         content_start: 0,
+                        quote_bar_bytes: Vec::new(),
                     })
                 })
                 .collect(),
@@ -852,6 +900,9 @@ mod tests {
             line_diffs: heights.iter().map(|_| LineDiff::default()).collect(),
             ghosts: heights.iter().map(|_| Vec::new()).collect(),
             ghost_height: heights.iter().map(|_| 0.0).collect(),
+            quote_bars: heights.iter().map(|_| Vec::new()).collect(),
+            quote_bar_width: 2.0,
+            quote_bar_color: Color::TRANSPARENT,
             measured_count: heights.len(),
             diff_colors: DiffColors {
                 added_bg: Color::TRANSPARENT,

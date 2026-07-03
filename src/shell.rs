@@ -1172,8 +1172,10 @@ impl ApplicationHandler<WritEvent> for App {
                     );
                     self.scene
                         .push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
-                    // Draw order (all before glyphs): diff row/word bg, then selection.
+                    // Draw order (all before glyphs): diff row/word bg, quote gutters,
+                    // then selection.
                     doc.draw_added_backgrounds(&mut self.scene, editor_h);
+                    doc.draw_blockquote_gutters(&mut self.scene, editor_h);
                     if let Some(sel) = self.doc_engine.editor.selection_range() {
                         let color = peniko_color(self.doc_engine.theme.selection);
                         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
@@ -1542,6 +1544,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     );
     scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
     doc.draw_added_backgrounds(&mut scene, editor_h);
+    doc.draw_blockquote_gutters(&mut scene, editor_h);
     if let Some(sel) = de.editor.selection_range() {
         let color = peniko_color(de.theme.selection);
         for (x0, y0, x1, y1) in doc.selection_rects(sel) {

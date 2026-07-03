@@ -38,6 +38,10 @@ pub struct LineRender {
     /// Display byte offset where the line's content begins (after list/quote/heading
     /// markers). Wrapped rows hang-indent under this column; 0 means no marker prefix.
     pub content_start: usize,
+    /// Display byte offset of each blockquote marker on the line (outermost first), one
+    /// per nesting level. The draw path measures each to an x and paints a continuous
+    /// vertical rule there, so the quote bar spans wrapped rows and adjacent lines.
+    pub quote_bar_bytes: Vec<usize>,
 }
 
 /// Font-size multiplier for a heading level (1 = largest). 0 = body text.
@@ -145,8 +149,9 @@ pub fn build_line_render(
         {
             specials.push(Special::Hidden(mr));
         }
-        // Prefix markers render as bullets / blockquote bars (always on — they're
-        // structural), substituting `- `→`• `, `> `→`▎ `. Indent whitespace and
+        // Prefix markers render as bullets / blockquote gutters (always on — they're
+        // structural), substituting `- `→`• `, `> `→`  ` (the blockquote bar is painted
+        // as a continuous rule in the draw path, not a per-line glyph). Indent whitespace and
         // ordered-list numbers stay literal; checkbox stays as `[ ]`/`[x]`.
         // On a task item the checkbox is the marker, so suppress the list bullet.
         let has_checkbox = markers
@@ -162,7 +167,7 @@ pub fn build_line_render(
                     unordered_marker,
                     ..
                 } => Some(unordered_marker.as_ref().map_or("• ", |m| m.bullet())),
-                MarkerKind::BlockQuote => Some("▎ "),
+                MarkerKind::BlockQuote => Some("  "),
                 _ => None,
             };
             if let Some(display) = sub
@@ -201,6 +206,21 @@ pub fn build_line_render(
     }
 
     let (text, map) = SegmentMap::build(&line_text, line_start, &specials);
+
+    // Display offsets of each blockquote marker (outermost first), for the drawn gutter
+    // rules. Skipped inside code blocks, where `> ` isn't a quote marker.
+    let quote_bar_bytes: Vec<usize> = if in_code_block {
+        Vec::new()
+    } else {
+        let mut bars: Vec<usize> = markers
+            .markers
+            .iter()
+            .filter(|m| matches!(m.kind, MarkerKind::BlockQuote))
+            .map(|m| map.buffer_to_display(m.range.start))
+            .collect();
+        bars.sort_unstable(); // markers are innermost-first; want outermost (leftmost) first
+        bars
+    };
 
     let fg = peniko_color(theme.foreground);
     let mut runs = Vec::new();
@@ -268,6 +288,7 @@ pub fn build_line_render(
         runs,
         map,
         content_start,
+        quote_bar_bytes,
     }
 }
 
@@ -321,5 +342,28 @@ mod tests {
         let theme = EditorTheme::dracula();
         let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &[], &[]);
         assert!(!lr.runs.iter().any(|r| r.underline));
+    }
+
+    /// The blockquote bar is no longer a `▎` glyph in the text — the marker collapses
+    /// to spacing and one gutter offset per nesting level is exposed for the drawn rule.
+    #[test]
+    fn blockquote_exposes_gutter_offsets_not_glyph() {
+        let theme = EditorTheme::dracula();
+
+        let mut single: Buffer = "> quoted line\n".parse().unwrap();
+        let snap = single.render_snapshot();
+        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[]);
+        assert!(!lr.text.contains('▎'), "bar must not be a text glyph");
+        assert_eq!(lr.quote_bar_bytes, vec![0], "one gutter at the line start");
+
+        let mut nested: Buffer = "> > deeply quoted\n".parse().unwrap();
+        let snap = nested.render_snapshot();
+        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[]);
+        assert_eq!(lr.quote_bar_bytes.len(), 2, "one gutter per nesting level");
+        assert_eq!(lr.quote_bar_bytes[0], 0, "outer gutter at line start");
+        assert!(
+            lr.quote_bar_bytes[1] > lr.quote_bar_bytes[0],
+            "inner gutter sits to the right of the outer"
+        );
     }
 }
