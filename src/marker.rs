@@ -3,7 +3,10 @@
 //! This module provides types for representing markers (blockquotes, lists,
 //! headings, etc.) and functions for extracting them from the parse tree.
 
+use crate::parser::MarkdownParser;
 use ropey::Rope;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
 use tree_sitter::Node;
 
@@ -591,12 +594,44 @@ fn marker_from_node(
     (marker, indent_marker)
 }
 
+/// Shift every marker range by `to - from` (all ranges are ≥ `from`). Used to move
+/// cached markers between the canonical prefix-relative frame (base 0) and the live
+/// `start` offset.
+fn rebase_markers(markers: &[Marker], from: usize, to: usize) -> Vec<Marker> {
+    markers
+        .iter()
+        .map(|m| Marker {
+            kind: m.kind.clone(),
+            range: (m.range.start - from + to)..(m.range.end - from + to),
+        })
+        .collect()
+}
+
 /// Parse a continuation string into markers using tree-sitter.
 /// Returns markers innermost-to-outermost (reverse document order) for use by markers_at.
+///
+/// The marker set for a prefix depends only on its text, not on where it sits in the
+/// document, so results are memoized per prefix string (ranges stored relative to the
+/// prefix, then re-offset to `start`). Continuation prefixes are short and highly
+/// repetitive (`> `, `- `, `  `, …), so this turns almost every call into a lookup.
 pub fn parse_continuation(rope: &Rope, start: usize, end: usize) -> Vec<Marker> {
-    use crate::parser::MarkdownParser;
-    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Vec<Marker>>> = RefCell::new(HashMap::new());
+    }
 
+    let content = rope_slice_cow(rope, start, end);
+    if let Some(rel) = CACHE.with(|c| c.borrow().get(content.as_ref()).cloned()) {
+        return rebase_markers(&rel, 0, start);
+    }
+
+    let markers = parse_continuation_uncached(rope, start, end);
+    let rel = rebase_markers(&markers, start, 0);
+    CACHE.with(|c| c.borrow_mut().insert(content.into_owned(), rel));
+    markers
+}
+
+/// Uncached tree-sitter parse of the continuation prefix at `[start, end)`.
+fn parse_continuation_uncached(rope: &Rope, start: usize, end: usize) -> Vec<Marker> {
     thread_local! {
         static PARSER: RefCell<MarkdownParser> = RefCell::new(MarkdownParser::default());
     }

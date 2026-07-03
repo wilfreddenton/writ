@@ -116,6 +116,18 @@ impl RenderSnapshot {
         buckets
     }
 
+    /// Tree inline styles for one line (no synthetic checkbox regions), matching one
+    /// bucket of `inline_styles_by_line` but computed in isolation (O(log n)). For
+    /// callers that need only a handful of lines — e.g. the few visible ghost lines —
+    /// and shouldn't pay to bucket the whole document each rebuild.
+    pub fn tree_styles_for_line(&self, line_idx: usize) -> Vec<StyledRegion> {
+        let range = self.line_byte_range(line_idx);
+        styles_in_range(&self.inline_styles, &range)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     /// Get inline styles for a specific line. O(log n) binary search.
     /// Also injects a synthetic StyledRegion for any checkbox marker on the line.
     pub fn inline_styles_for_line(&self, line_idx: usize) -> Vec<StyledRegion> {

@@ -217,7 +217,6 @@ struct DiffColors {
 fn build_ghosts_before(
     engine: &mut TextEngine,
     diff: Option<&DiffState>,
-    old_line_styles: Option<&[Vec<StyledRegion>]>,
     new_line: usize,
     theme: &EditorTheme,
     scale: f32,
@@ -236,11 +235,10 @@ fn build_ghosts_before(
         if old_line >= old.line_count() {
             break;
         }
-        let styles = old_line_styles
-            .and_then(|s| s.get(old_line))
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        let lr = build_line_render(old, old_line, theme, base_font_size, usize::MAX, styles, &[]);
+        // Only the few visible ghost lines need styling, so compute per line instead
+        // of bucketing the entire HEAD snapshot on every rebuild.
+        let styles = old.tree_styles_for_line(old_line);
+        let lr = build_line_render(old, old_line, theme, base_font_size, usize::MAX, &styles, &[]);
         let layout = engine.build_line(
             &lr.text,
             scale,
@@ -379,9 +377,8 @@ impl DocLayout {
         let mut measured_count = n;
         // Bucket inline styles per line once (O(n + styles)) instead of the O(n²)
         // per-line `styles_in_range` scan — the dominant per-keystroke cost on large
-        // docs. Ghosts get the HEAD snapshot's buckets (only computed if a diff exists).
+        // docs. (Ghost lines style themselves lazily; see `build_ghosts_before`.)
         let line_styles = snapshot.inline_styles_by_line();
-        let old_line_styles = diff.map(|d| d.old_snapshot.inline_styles_by_line());
         let mut layouts = Vec::with_capacity(n);
         let mut renders = Vec::with_capacity(n);
         let mut line_ranges = Vec::with_capacity(n);
@@ -420,7 +417,6 @@ impl DocLayout {
             let line_ghosts = build_ghosts_before(
                 engine,
                 diff,
-                old_line_styles.as_deref(),
                 i,
                 theme,
                 scale,

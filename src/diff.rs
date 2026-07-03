@@ -59,52 +59,63 @@ impl DiffState {
         !self.hunks.is_empty()
     }
 
+    /// The hunk whose `new_lines` contains `new_line`, via binary search. Hunks are
+    /// ascending and non-overlapping in `new_lines`, so the first hunk ending past
+    /// `new_line` is the only possible container.
+    fn hunk_by_new_line(&self, new_line: usize) -> Option<&DiffHunk> {
+        let i = self.hunks.partition_point(|h| h.new_lines.end <= new_line);
+        self.hunks
+            .get(i)
+            .filter(|h| h.new_lines.contains(&new_line))
+    }
+
+    /// The hunk whose `old_lines` contains `old_line`, via binary search (same
+    /// ascending, non-overlapping invariant on `old_lines`).
+    fn hunk_by_old_line(&self, old_line: usize) -> Option<&DiffHunk> {
+        let i = self.hunks.partition_point(|h| h.old_lines.end <= old_line);
+        self.hunks
+            .get(i)
+            .filter(|h| h.old_lines.contains(&old_line))
+    }
+
     /// Get the old line range for a hunk if it should render ghost lines before this new line.
     /// Returns the range of old lines to render as ghosts.
     pub fn ghost_lines_before(&self, new_line: usize) -> Option<Range<usize>> {
-        for hunk in &self.hunks {
-            if hunk.new_lines.start == new_line && !hunk.old_lines.is_empty() {
-                return Some(hunk.old_lines.clone());
-            }
-        }
-        None
+        // A deletion hunk has an empty `new_lines`, so several hunks can share the
+        // same `new_lines.start`; scan just that tied run for one with deletions.
+        let start = self.hunks.partition_point(|h| h.new_lines.start < new_line);
+        self.hunks[start..]
+            .iter()
+            .take_while(|h| h.new_lines.start == new_line)
+            .find(|h| !h.old_lines.is_empty())
+            .map(|h| h.old_lines.clone())
     }
 
     /// Check if a line in the new buffer is an addition (part of a hunk's new_lines).
     pub fn is_addition(&self, new_line: usize) -> bool {
-        self.hunks.iter().any(|h| h.new_lines.contains(&new_line))
+        self.hunk_by_new_line(new_line).is_some()
     }
 
     /// Get inline changes for an old line (ghost line) if any.
     /// Returns byte ranges within the line that were deleted.
     pub fn old_inline_changes(&self, old_line: usize) -> Option<&[InlineChange]> {
-        for hunk in &self.hunks {
-            if hunk.old_lines.contains(&old_line) {
-                let line_offset = old_line - hunk.old_lines.start;
-                if let Some(changes) = hunk.old_inline_changes.get(line_offset)
-                    && !changes.is_empty()
-                {
-                    return Some(changes);
-                }
-            }
-        }
-        None
+        let hunk = self.hunk_by_old_line(old_line)?;
+        let line_offset = old_line - hunk.old_lines.start;
+        hunk.old_inline_changes
+            .get(line_offset)
+            .filter(|c| !c.is_empty())
+            .map(|c| c.as_slice())
     }
 
     /// Get inline changes for a new line (addition) if any.
     /// Returns byte ranges within the line that were added.
     pub fn new_inline_changes(&self, new_line: usize) -> Option<&[InlineChange]> {
-        for hunk in &self.hunks {
-            if hunk.new_lines.contains(&new_line) {
-                let line_offset = new_line - hunk.new_lines.start;
-                if let Some(changes) = hunk.new_inline_changes.get(line_offset)
-                    && !changes.is_empty()
-                {
-                    return Some(changes);
-                }
-            }
-        }
-        None
+        let hunk = self.hunk_by_new_line(new_line)?;
+        let line_offset = new_line - hunk.new_lines.start;
+        hunk.new_inline_changes
+            .get(line_offset)
+            .filter(|c| !c.is_empty())
+            .map(|c| c.as_slice())
     }
 }
 
