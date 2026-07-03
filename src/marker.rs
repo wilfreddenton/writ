@@ -474,6 +474,15 @@ fn find_node_info_index(nodes: &[NodeInfo], target_byte: usize) -> usize {
         .unwrap_or_else(|idx| idx)
 }
 
+/// Extend a marker's end byte to include a single trailing space, if present.
+fn extend_over_space(rope: &Rope, end: usize) -> usize {
+    if rope.get_byte(end) == Some(b' ') {
+        end + 1
+    } else {
+        end
+    }
+}
+
 /// Get a byte slice from a Rope, borrowing if possible.
 /// Returns a Cow that borrows if the slice fits in one chunk, allocates otherwise.
 fn rope_slice_cow(rope: &Rope, start: usize, end: usize) -> std::borrow::Cow<'_, str> {
@@ -915,23 +924,11 @@ pub fn markers_at_from_infos(
                     markers.push(m);
                 }
             }
-            "task_list_marker_unchecked" => {
+            "task_list_marker_unchecked" | "task_list_marker_checked" => {
+                let checked = kind == "task_list_marker_checked";
                 let checkbox_start = start;
-                let range_end = if rope.get_byte(end) == Some(b' ') {
-                    end + 1
-                } else {
-                    end
-                };
-                pending_task = Some((false, checkbox_start..range_end));
-            }
-            "task_list_marker_checked" => {
-                let checkbox_start = start;
-                let range_end = if rope.get_byte(end) == Some(b' ') {
-                    end + 1
-                } else {
-                    end
-                };
-                pending_task = Some((true, checkbox_start..range_end));
+                let range_end = extend_over_space(rope, end);
+                pending_task = Some((checked, checkbox_start..range_end));
             }
             "atx_h1_marker" | "atx_h2_marker" | "atx_h3_marker" | "atx_h4_marker"
             | "atx_h5_marker" | "atx_h6_marker" => {
@@ -943,11 +940,7 @@ pub fn markers_at_from_infos(
                     "atx_h5_marker" => 5,
                     _ => 6,
                 };
-                let range_end = if rope.get_byte(end) == Some(b' ') {
-                    end + 1
-                } else {
-                    end
-                };
+                let range_end = extend_over_space(rope, end);
                 markers.push(Marker {
                     kind: MarkerKind::Heading(level),
                     range: start..range_end,
