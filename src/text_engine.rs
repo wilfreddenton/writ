@@ -8,9 +8,9 @@
 use std::ops::Range;
 
 use parley::{
-    Alignment, AlignmentOptions, CHROMIUM_LINE_BREAK_OVERRIDE, FontContext, FontFamily,
-    FontFamilyName, FontStyle, FontWeight, GenericFamily, Layout, LayoutContext, LineHeight,
-    PositionedLayoutItem, StyleProperty,
+    Alignment, AlignmentOptions, CHROMIUM_LINE_BREAK_OVERRIDE, Cluster, FontContext, FontFamily,
+    FontFamilyName, FontStyle, FontWeight, GenericFamily, IndentOptions, Layout, LayoutContext,
+    LineHeight, PositionedLayoutItem, StyleProperty,
 };
 use vello::Scene;
 use vello::kurbo::{Affine, Line, Stroke};
@@ -78,13 +78,43 @@ impl TextEngine {
         max_advance: Option<f32>,
         runs: &[StyleRun],
     ) -> Layout<Brush> {
+        self.build_line_hanging(
+            text,
+            scale,
+            font_size,
+            line_height,
+            base_color,
+            max_advance,
+            runs,
+            0,
+        )
+    }
+
+    /// Like [`build_line`](Self::build_line), but wrapped continuation rows hang-indent
+    /// under display byte `content_start` (the column where content begins after
+    /// list/blockquote markers), so wrapped list/quote text aligns under its content
+    /// instead of returning to the margin. `content_start == 0` (or ≥ `text.len()`)
+    /// disables the hang. The prefix width is measured with a throwaway no-wrap break,
+    /// then applied via Parley's native `text-indent: hanging`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_line_hanging(
+        &mut self,
+        text: &str,
+        scale: f32,
+        font_size: f32,
+        line_height: f32,
+        base_color: Color,
+        max_advance: Option<f32>,
+        runs: &[StyleRun],
+        content_start: usize,
+    ) -> Layout<Brush> {
         let mut builder = self.lcx.ranged_builder(&mut self.fcx, text, scale, true);
         builder.push_default(StyleProperty::FontSize(font_size));
         builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(
             line_height,
         )));
         builder.push_default(StyleProperty::FontFamily(FontFamily::Single(
-            FontFamilyName::Generic(GenericFamily::SansSerif),
+            FontFamilyName::Generic(GenericFamily::Monospace),
         )));
         builder.push_default(StyleProperty::Brush(Brush::Solid(base_color)));
 
@@ -126,6 +156,26 @@ impl TextEngine {
         builder.set_line_break_override(Some(CHROMIUM_LINE_BREAK_OVERRIDE));
 
         let mut layout = builder.build(text);
+
+        // Hanging indent: measure the marker/quote prefix width on a throwaway no-wrap
+        // break (cluster x-offset at content start), then let Parley offset every
+        // continuation row by it. Must be set before the real break + align.
+        if content_start > 0 && content_start < text.len() {
+            layout.break_all_lines(None);
+            let hang = Cluster::from_byte_index(&layout, content_start)
+                .and_then(|c| c.visual_offset())
+                .unwrap_or(0.0);
+            if hang > 0.0 {
+                layout.set_text_indent(
+                    hang,
+                    IndentOptions {
+                        each_line: false,
+                        hanging: true,
+                    },
+                );
+            }
+        }
+
         layout.break_all_lines(max_advance);
         layout.align(Alignment::Start, AlignmentOptions::default());
         layout
@@ -324,5 +374,71 @@ mod tests {
             })
             .sum();
         assert!(glyphs > 0, "expected glyphs to be laid out");
+    }
+
+    /// With a `content_start`, wrapped continuation rows hang-indent under the content
+    /// column (offset > 0); without it they stay flush at the margin (offset ~0).
+    #[test]
+    fn hanging_indent_offsets_wrapped_rows() {
+        let mut engine = TextEngine::new();
+        let text = "- a fairly long list item that will certainly wrap onto several visual rows";
+        let content_start = 2; // just past "- "
+        let run = StyleRun {
+            range: 0..text.len(),
+            color: Color::WHITE,
+            bold: false,
+            italic: false,
+            mono: true,
+            underline: false,
+            strikethrough: false,
+        };
+        let runs = std::slice::from_ref(&run);
+        let wrap = engine
+            .build_line(text, 1.0, 16.0, 1.4, Color::WHITE, None, runs)
+            .width()
+            * 0.45;
+
+        // First glyph-run x of each visual row.
+        let row_x = |layout: &Layout<Brush>| -> Vec<f32> {
+            layout
+                .lines()
+                .map(|line| {
+                    line.items()
+                        .find_map(|it| match it {
+                            PositionedLayoutItem::GlyphRun(gr) => Some(gr.offset()),
+                            _ => None,
+                        })
+                        .unwrap_or(0.0)
+                })
+                .collect()
+        };
+
+        let hung = engine.build_line_hanging(
+            text,
+            1.0,
+            16.0,
+            1.4,
+            Color::WHITE,
+            Some(wrap),
+            runs,
+            content_start,
+        );
+        let flat = engine.build_line(text, 1.0, 16.0, 1.4, Color::WHITE, Some(wrap), runs);
+        let hung_x = row_x(&hung);
+        let flat_x = row_x(&flat);
+
+        assert!(hung_x.len() > 1, "expected the line to wrap");
+        assert_eq!(hung_x.len(), flat_x.len(), "same wrap points either way");
+        assert!(hung_x[0].abs() < 0.5, "first row flush at margin");
+        assert!(
+            hung_x[1] > 1.0,
+            "continuation row should hang, got {}",
+            hung_x[1]
+        );
+        assert!(
+            flat_x[1].abs() < 0.5,
+            "without content_start the continuation stays flush, got {}",
+            flat_x[1]
+        );
     }
 }

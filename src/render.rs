@@ -35,6 +35,9 @@ pub struct LineRender {
     pub runs: Vec<StyleRun>,
     /// Maps the display `text` back to buffer bytes (for cursor/click/diff).
     pub map: SegmentMap,
+    /// Display byte offset where the line's content begins (after list/quote/heading
+    /// markers). Wrapped rows hang-indent under this column; 0 means no marker prefix.
+    pub content_start: usize,
 }
 
 /// Font-size multiplier for a heading level (1 = largest). 0 = body text.
@@ -255,11 +258,16 @@ pub fn build_line_render(
         }
     }
 
+    // Display column where content begins (after markers) — drives the hanging indent
+    // so wrapped rows align under it. Hidden markers (e.g. heading `# `) collapse to 0.
+    let content_start = map.buffer_to_display(markers.content_start());
+
     LineRender {
         text,
         font_size,
         runs,
         map,
+        content_start,
     }
 }
 

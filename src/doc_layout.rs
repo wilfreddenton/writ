@@ -65,6 +65,7 @@ fn line_key(
     line_height: f32,
     max_advance: f32,
     runs: &[StyleRun],
+    content_start: usize,
 ) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
@@ -72,6 +73,9 @@ fn line_key(
     font_size.to_bits().hash(&mut h);
     line_height.to_bits().hash(&mut h);
     max_advance.to_bits().hash(&mut h);
+    // Same display text can have different content-start columns (real bullet vs a
+    // literally-typed "• "), which change the hanging indent — so key on it.
+    content_start.hash(&mut h);
     for r in runs {
         r.range.start.hash(&mut h);
         r.range.end.hash(&mut h);
@@ -257,7 +261,7 @@ fn build_ghosts_before(
         // of bucketing the entire HEAD snapshot on every rebuild.
         let styles = old.tree_styles_for_line(old_line);
         let lr = build_line_render(old, old_line, theme, base_font_size, usize::MAX, &styles, &[]);
-        let layout = engine.build_line(
+        let layout = engine.build_line_hanging(
             &lr.text,
             scale,
             lr.font_size,
@@ -265,6 +269,7 @@ fn build_ghosts_before(
             fg,
             Some(max_advance),
             &lr.runs,
+            lr.content_start,
         );
         let line_start = old.line_markers(old_line).range.start;
         let inline = d
@@ -398,6 +403,7 @@ impl DocLayout {
             font_size: base_font_size,
             runs: Vec::new(),
             map: SegmentMap::identity("", 0).1,
+            content_start: 0,
         });
         let mut measured_y = pad_top * scale; // tops-space y consumed by materialized lines
         let mut estimating = false;
@@ -480,9 +486,10 @@ impl DocLayout {
                 line_height,
                 max_advance,
                 &lr.runs,
+                lr.content_start,
             );
             let layout = cache.get_or_build(key, || {
-                engine.build_line(
+                engine.build_line_hanging(
                     &lr.text,
                     scale,
                     lr.font_size,
@@ -490,6 +497,7 @@ impl DocLayout {
                     fg,
                     Some(max_advance),
                     &lr.runs,
+                    lr.content_start,
                 )
             });
             let range = snapshot.line_markers(i).range;
@@ -836,6 +844,7 @@ mod tests {
                         font_size: 18.0,
                         runs: Vec::new(),
                         map: SegmentMap::identity("", 0).1,
+                        content_start: 0,
                     })
                 })
                 .collect(),
