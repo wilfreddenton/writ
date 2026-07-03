@@ -5,7 +5,7 @@ pub use action::Direction;
 pub use theme::EditorTheme;
 
 use crate::buffer::Buffer;
-use crate::cursor::{Cursor, Selection};
+use crate::cursor::{Cursor, Selection, prev_grapheme_boundary};
 use crate::marker::{LineMarkers, MarkerKind, OrderedMarker, UnorderedMarker};
 
 /// Context about the line at the cursor, used by smart editing actions.
@@ -1118,7 +1118,9 @@ impl EditorState {
             return;
         }
 
-        let new_pos = cursor_pos - 1;
+        // One grapheme cluster back, not one byte — so a codepoint or an emoji/combining
+        // cluster is deleted whole rather than split.
+        let new_pos = prev_grapheme_boundary(&self.buffer, cursor_pos);
         self.buffer.delete(new_pos..cursor_pos, cursor_pos);
         self.selection = Selection::new(new_pos, new_pos);
         self.propagate_checkbox_after_edit();
@@ -1886,6 +1888,22 @@ mod tests {
             let mut state = editor_with_cursor("line one\n|line two");
             state.delete_backward();
             assert_editor_eq(&state, "line one|line two");
+        }
+
+        #[test]
+        fn backspace_deletes_whole_zwj_emoji() {
+            // A family emoji is 7 codepoints but one grapheme — deleted whole, not split.
+            let mut state = editor_with_cursor("a👨‍👩‍👧‍👦|b");
+            state.delete_backward();
+            assert_editor_eq(&state, "a|b");
+        }
+
+        #[test]
+        fn backspace_deletes_whole_combining_accent() {
+            // "é" as base 'e' + combining acute (2 codepoints, 1 grapheme).
+            let mut state = editor_with_cursor("e\u{301}|");
+            state.delete_backward();
+            assert_editor_eq(&state, "|");
         }
 
         #[test]

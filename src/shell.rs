@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use parley::Layout;
+use unicode_segmentation::UnicodeSegmentation;
 use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Brush, Fill};
 use vello::util::{RenderContext, RenderSurface};
@@ -104,11 +105,10 @@ fn build_status_info(editor: &Editor, doc: &DocLayout, editor_h: f32) -> StatusI
     let cursor = editor.cursor_position();
     let line = buffer.byte_to_line(cursor);
     let line_start = buffer.line_to_byte(line);
-    let rope = buffer.rope();
-    let col = rope
-        .byte_to_char(cursor)
-        .saturating_sub(rope.byte_to_char(line_start))
-        + 1;
+    // Column counts grapheme clusters, not codepoints, so a multi-codepoint character
+    // (emoji ZWJ sequence, combining accent) advances the column by one, matching what
+    // the user sees on screen.
+    let col = buffer.slice_cow(line_start..cursor).graphemes(true).count() + 1;
     let (first, last) = doc.visible_range(editor_h);
     StatusInfo {
         context: editor.state.build_nested_context(cursor),

@@ -1,6 +1,53 @@
 use std::ops::Range;
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::buffer::Buffer;
+
+/// Byte offset one grapheme cluster before `offset` (or `offset` itself at position 0).
+/// Steps over a preceding newline (its own grapheme) so backspace at a line start joins
+/// lines. Graphemes never span `\n`, so a within-line chunk suffices otherwise. Correct
+/// for multi-codepoint clusters (emoji ZWJ sequences, combining marks) where a naive
+/// `offset - 1` would split a codepoint or a cluster.
+pub fn prev_grapheme_boundary(buffer: &Buffer, offset: usize) -> usize {
+    if offset == 0 {
+        return 0;
+    }
+    let rope = buffer.rope();
+    if rope.get_byte(offset - 1) == Some(b'\n') {
+        return offset - 1;
+    }
+    let line_start = buffer.line_to_byte(buffer.byte_to_line(offset));
+    let chunk = buffer.slice_cow(line_start..offset);
+    match chunk.graphemes(true).next_back() {
+        Some(g) => offset - g.len(),
+        None => offset - 1,
+    }
+}
+
+/// Byte offset one grapheme cluster after `offset` (or `offset` itself at the buffer
+/// end). Steps over a trailing newline into the next line.
+pub fn next_grapheme_boundary(buffer: &Buffer, offset: usize) -> usize {
+    let len = buffer.len_bytes();
+    if offset >= len {
+        return offset;
+    }
+    let rope = buffer.rope();
+    if rope.get_byte(offset) == Some(b'\n') {
+        return offset + 1;
+    }
+    let range = buffer.line_byte_range(buffer.byte_to_line(offset));
+    let content_end = if range.end > range.start && rope.get_byte(range.end - 1) == Some(b'\n') {
+        range.end - 1
+    } else {
+        range.end
+    };
+    let chunk = buffer.slice_cow(offset..content_end);
+    match chunk.graphemes(true).next() {
+        Some(g) => offset + g.len(),
+        None => offset + 1,
+    }
+}
 
 /// Compute the byte offset on `target_line` at the same character column as
 /// `offset` on `from_line`, clamped to the target line's length. Works in char
@@ -71,13 +118,8 @@ impl Cursor {
             return *self;
         }
 
-        let rope = buffer.rope();
-        let char_idx = rope.byte_to_char(self.offset);
-        if char_idx == 0 {
-            return *self;
-        }
         Self {
-            offset: rope.char_to_byte(char_idx - 1),
+            offset: prev_grapheme_boundary(buffer, self.offset),
         }
     }
 
@@ -100,14 +142,8 @@ impl Cursor {
             }
         }
 
-        let rope = buffer.rope();
-        let char_idx = rope.byte_to_char(self.offset);
-        let char_count = rope.len_chars();
-        if char_idx >= char_count {
-            return *self;
-        }
         Self {
-            offset: rope.char_to_byte(char_idx + 1),
+            offset: next_grapheme_boundary(buffer, self.offset),
         }
     }
 
@@ -283,6 +319,41 @@ mod tests {
         let extended = sel.extend_to(15);
         assert_eq!(extended.anchor, 5);
         assert_eq!(extended.head, 15);
+    }
+
+    #[test]
+    fn move_horizontal_steps_whole_grapheme_clusters() {
+        let family = "👨‍👩‍👧‍👦"; // 7 codepoints, one grapheme
+        let combining = "e\u{301}"; // 'e' + combining acute, one grapheme
+        let text = format!("{family}{combining}x\n"); // graphemes: family, é, x
+        let buf: Buffer = text.parse().unwrap();
+        let fam = family.len();
+        let comb = combining.len();
+
+        // Right crosses each grapheme whole.
+        let a = Cursor::new(0).move_right(&buf);
+        assert_eq!(a.offset, fam, "family emoji crossed in one step");
+        let b = a.move_right(&buf);
+        assert_eq!(b.offset, fam + comb, "combining accent crossed whole");
+        let c = b.move_right(&buf);
+        assert_eq!(c.offset, fam + comb + 1, "then the ascii char");
+
+        // Left mirrors it exactly.
+        assert_eq!(c.move_left(&buf).offset, fam + comb);
+        assert_eq!(b.move_left(&buf).offset, fam);
+        assert_eq!(a.move_left(&buf).offset, 0);
+    }
+
+    #[test]
+    fn grapheme_boundaries_cross_newlines_by_one() {
+        // `\n` is its own grapheme: stepping over a line boundary moves exactly one byte.
+        let buf: Buffer = "aé\nb".parse().unwrap();
+        let nl = "aé".len(); // byte offset of '\n'
+        assert_eq!(next_grapheme_boundary(&buf, nl), nl + 1, "step over newline");
+        assert_eq!(prev_grapheme_boundary(&buf, nl + 1), nl, "step back over newline");
+        // 'é' here is a single 2-byte codepoint; stepping still lands on its boundary.
+        assert_eq!(next_grapheme_boundary(&buf, 1), nl, "cross é to end of line");
+        assert_eq!(prev_grapheme_boundary(&buf, nl), 1, "back over é");
     }
 
     #[test]

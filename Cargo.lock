@@ -5168,6 +5168,7 @@ dependencies = [
  "tree-sitter-md",
  "tree-sitter-rust",
  "undo",
+ "unicode-segmentation",
  "vello",
  "winit",
 ]
