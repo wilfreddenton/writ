@@ -229,12 +229,7 @@ impl Editor {
     }
 
     pub fn move_in_direction(&mut self, direction: Direction, extend: bool) {
-        let new_cursor = match direction {
-            Direction::Left => self.state.cursor().move_left(&self.state.buffer),
-            Direction::Right => self.state.cursor().move_right(&self.state.buffer),
-            Direction::Up => self.state.cursor().move_up(&self.state.buffer),
-            Direction::Down => self.state.cursor().move_down(&self.state.buffer),
-        };
+        let new_cursor = self.state.cursor_in_direction(direction);
         if extend {
             self.state.selection = self.state.selection.extend_to(new_cursor.offset);
         } else {

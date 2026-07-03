@@ -66,40 +66,50 @@ impl EditorState {
         self.selection = Selection::new(offset, offset);
     }
 
+    /// Collapse the selection onto a single cursor.
+    fn set_cursor_to(&mut self, c: Cursor) {
+        self.selection = Selection::new(c.offset, c.offset);
+    }
+
+    /// Compute the cursor after moving one step in `direction`.
+    pub fn cursor_in_direction(&self, direction: Direction) -> Cursor {
+        let c = self.cursor();
+        match direction {
+            Direction::Left => c.move_left(&self.buffer),
+            Direction::Right => c.move_right(&self.buffer),
+            Direction::Up => c.move_up(&self.buffer),
+            Direction::Down => c.move_down(&self.buffer),
+        }
+    }
+
     /// Move cursor left by one character.
     pub fn move_left(&mut self) {
-        let new_cursor = self.cursor().move_left(&self.buffer);
-        self.selection = Selection::new(new_cursor.offset, new_cursor.offset);
+        self.set_cursor_to(self.cursor_in_direction(Direction::Left));
     }
 
     /// Move cursor right by one character.
     pub fn move_right(&mut self) {
-        let new_cursor = self.cursor().move_right(&self.buffer);
-        self.selection = Selection::new(new_cursor.offset, new_cursor.offset);
+        self.set_cursor_to(self.cursor_in_direction(Direction::Right));
     }
 
     /// Move cursor up by one line.
     pub fn move_up(&mut self) {
-        let new_cursor = self.cursor().move_up(&self.buffer);
-        self.selection = Selection::new(new_cursor.offset, new_cursor.offset);
+        self.set_cursor_to(self.cursor_in_direction(Direction::Up));
     }
 
     /// Move cursor down by one line.
     pub fn move_down(&mut self) {
-        let new_cursor = self.cursor().move_down(&self.buffer);
-        self.selection = Selection::new(new_cursor.offset, new_cursor.offset);
+        self.set_cursor_to(self.cursor_in_direction(Direction::Down));
     }
 
     /// Move cursor to start of current line.
     pub fn move_to_line_start(&mut self) {
-        let new_cursor = self.cursor().move_to_line_start(&self.buffer);
-        self.selection = Selection::new(new_cursor.offset, new_cursor.offset);
+        self.set_cursor_to(self.cursor().move_to_line_start(&self.buffer));
     }
 
     /// Move cursor to end of current line.
     pub fn move_to_line_end(&mut self) {
-        let new_cursor = self.cursor().move_to_line_end(&self.buffer);
-        self.selection = Selection::new(new_cursor.offset, new_cursor.offset);
+        self.set_cursor_to(self.cursor().move_to_line_end(&self.buffer));
     }
 
     /// Insert text at the current cursor position.
@@ -626,7 +636,7 @@ impl EditorState {
     }
 
     /// Find the list_item node containing the given byte offset.
-    fn find_list_item_node(&self, byte_offset: usize) -> Option<tree_sitter::Node<'_>> {
+    fn list_item_at(&self, byte_offset: usize) -> Option<tree_sitter::Node<'_>> {
         let tree = self.buffer.tree()?;
         let root = tree.block_tree().root_node();
         let node = root.descendant_for_byte_range(byte_offset, byte_offset)?;
@@ -637,6 +647,26 @@ impl EditorState {
                 return Some(n);
             }
             current = n.parent();
+        }
+        None
+    }
+
+    /// Find the checkbox marker among a list_item's direct children, if any.
+    /// Returns (checkbox_byte_offset, is_checked).
+    fn direct_checkbox(&self, list_item: tree_sitter::Node) -> Option<(usize, bool)> {
+        let mut cursor = list_item.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                match child.kind() {
+                    "task_list_marker_checked" => return Some((child.start_byte(), true)),
+                    "task_list_marker_unchecked" => return Some((child.start_byte(), false)),
+                    _ => {}
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
         }
         None
     }
@@ -834,46 +864,13 @@ impl EditorState {
     /// Find the parent list_item's checkbox, if any.
     /// Returns (checkbox_byte_offset, is_checked).
     fn find_parent_checkbox(&self, list_item_start: usize) -> Option<(usize, bool)> {
-        let tree = self.buffer.tree()?;
-        let root = tree.block_tree().root_node();
-        let node = root.descendant_for_byte_range(list_item_start, list_item_start)?;
+        let our_list_item = self.list_item_at(list_item_start)?;
 
-        // Find our list_item first
-        let mut current = Some(node);
-        let mut our_list_item = None;
-        while let Some(n) = current {
-            if n.kind() == "list_item" {
-                our_list_item = Some(n);
-                break;
-            }
-            current = n.parent();
-        }
-
-        // Walk up to find parent list_item
-        let our_list_item = our_list_item?;
+        // Walk up to find parent list_item, then read its direct checkbox
         let mut current = our_list_item.parent();
         while let Some(n) = current {
             if n.kind() == "list_item" {
-                // Found parent list_item, find its checkbox among direct children
-                let mut cursor = n.walk();
-                if cursor.goto_first_child() {
-                    loop {
-                        let child = cursor.node();
-                        match child.kind() {
-                            "task_list_marker_checked" => {
-                                return Some((child.start_byte(), true));
-                            }
-                            "task_list_marker_unchecked" => {
-                                return Some((child.start_byte(), false));
-                            }
-                            _ => {}
-                        }
-                        if !cursor.goto_next_sibling() {
-                            break;
-                        }
-                    }
-                }
-                return None;
+                return self.direct_checkbox(n);
             }
             current = n.parent();
         }
@@ -883,28 +880,7 @@ impl EditorState {
     /// Find all sibling checkboxes (same nesting level).
     /// Returns Vec of (checkbox_byte_offset, is_checked).
     fn find_sibling_checkboxes(&self, list_item_start: usize) -> Vec<(usize, bool)> {
-        let tree = match self.buffer.tree() {
-            Some(t) => t,
-            None => return Vec::new(),
-        };
-        let root = tree.block_tree().root_node();
-        let node = match root.descendant_for_byte_range(list_item_start, list_item_start) {
-            Some(n) => n,
-            None => return Vec::new(),
-        };
-
-        // Find our list_item
-        let mut current = Some(node);
-        let mut our_list_item = None;
-        while let Some(n) = current {
-            if n.kind() == "list_item" {
-                our_list_item = Some(n);
-                break;
-            }
-            current = n.parent();
-        }
-
-        let our_list_item = match our_list_item {
+        let our_list_item = match self.list_item_at(list_item_start) {
             Some(n) => n,
             None => return Vec::new(),
         };
@@ -915,34 +891,16 @@ impl EditorState {
             _ => return Vec::new(),
         };
 
-        // Iterate all list_item children and collect their checkboxes
+        // Iterate all list_item children and collect their (direct) checkboxes
         let mut siblings = Vec::new();
         let mut cursor = parent_list.walk();
         if cursor.goto_first_child() {
             loop {
                 let child = cursor.node();
-                if child.kind() == "list_item" {
-                    // Find checkbox in this list_item (direct child only)
-                    let mut inner_cursor = child.walk();
-                    if inner_cursor.goto_first_child() {
-                        loop {
-                            let inner_child = inner_cursor.node();
-                            match inner_child.kind() {
-                                "task_list_marker_checked" => {
-                                    siblings.push((inner_child.start_byte(), true));
-                                    break;
-                                }
-                                "task_list_marker_unchecked" => {
-                                    siblings.push((inner_child.start_byte(), false));
-                                    break;
-                                }
-                                _ => {}
-                            }
-                            if !inner_cursor.goto_next_sibling() {
-                                break;
-                            }
-                        }
-                    }
+                if child.kind() == "list_item"
+                    && let Some(cb) = self.direct_checkbox(child)
+                {
+                    siblings.push(cb);
                 }
                 if !cursor.goto_next_sibling() {
                     break;
@@ -1244,7 +1202,7 @@ impl EditorState {
         let mut cursor_pos = self.cursor().offset;
 
         // Find the list_item node for this checkbox - use checkbox_byte_start for accurate node finding
-        let list_item_node = self.find_list_item_node(checkbox_byte_start);
+        let list_item_node = self.list_item_at(checkbox_byte_start);
 
         // Collect all checkboxes to toggle (clicked + nested children)
         let mut checkboxes_to_toggle: Vec<(usize, bool)> = Vec::new();
