@@ -459,59 +459,38 @@ pub fn detect_github_references_in_line(
         });
     }
 
-    // Simple issues: #123 (only if we have GitHub context)
+    // Simple issues: #123 and GH-123 (only if we have GitHub context)
     if let Some(ctx) = github_context {
-        for cap in ISSUE_RE.captures_iter(line) {
-            let full_match = cap.get(0).unwrap();
-            let match_start = full_match.start();
-            let match_end = full_match.end();
-            let abs_start = line_byte_offset + match_start;
-            if is_in_code(abs_start) {
-                continue;
+        let mut push_issue_matches = |re: &Regex| {
+            for cap in re.captures_iter(line) {
+                let full_match = cap.get(0).unwrap();
+                let match_start = full_match.start();
+                let match_end = full_match.end();
+                let abs_start = line_byte_offset + match_start;
+                if is_in_code(abs_start) {
+                    continue;
+                }
+                // Check word boundaries
+                if match_start > 0 && !is_word_boundary(match_start - 1) {
+                    continue;
+                }
+                if match_end < line.len() && !is_word_boundary(match_end) {
+                    continue;
+                }
+                let abs_range = abs_start..(line_byte_offset + match_end);
+                if overlaps_matched(&abs_range, &matched_ranges) {
+                    continue;
+                }
+                matched_ranges.push(abs_range.clone());
+                matches.push(RawGitHubMatch {
+                    reference: GitHubRef::from_issue_capture(&cap, ctx),
+                    byte_range: abs_range,
+                });
             }
-            // Check word boundaries
-            if match_start > 0 && !is_word_boundary(match_start - 1) {
-                continue;
-            }
-            if match_end < line.len() && !is_word_boundary(match_end) {
-                continue;
-            }
-            let abs_range = abs_start..(line_byte_offset + match_end);
-            if overlaps_matched(&abs_range, &matched_ranges) {
-                continue;
-            }
-            matched_ranges.push(abs_range.clone());
-            matches.push(RawGitHubMatch {
-                reference: GitHubRef::from_issue_capture(&cap, ctx),
-                byte_range: abs_range,
-            });
-        }
+        };
 
-        // GH-123 format
-        for cap in GH_ISSUE_RE.captures_iter(line) {
-            let full_match = cap.get(0).unwrap();
-            let match_start = full_match.start();
-            let match_end = full_match.end();
-            let abs_start = line_byte_offset + match_start;
-            if is_in_code(abs_start) {
-                continue;
-            }
-            // Check word boundaries
-            if match_start > 0 && !is_word_boundary(match_start - 1) {
-                continue;
-            }
-            if match_end < line.len() && !is_word_boundary(match_end) {
-                continue;
-            }
-            let abs_range = abs_start..(line_byte_offset + match_end);
-            if overlaps_matched(&abs_range, &matched_ranges) {
-                continue;
-            }
-            matched_ranges.push(abs_range.clone());
-            matches.push(RawGitHubMatch {
-                reference: GitHubRef::from_issue_capture(&cap, ctx),
-                byte_range: abs_range,
-            });
+        for re in [&*ISSUE_RE, &*GH_ISSUE_RE] {
+            push_issue_matches(re);
         }
 
         // Simple SHA
