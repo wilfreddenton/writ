@@ -27,6 +27,14 @@ fn cursor_in(range: &Range<usize>, cursor: usize) -> bool {
     cursor >= range.start && cursor <= range.end
 }
 
+/// A standalone image on a line: a paragraph whose only content is `![alt](url)`.
+/// Drawn as an actual image block; `alt` is shown in the pending/broken placeholder.
+#[derive(Clone)]
+pub struct ImageRef {
+    pub url: String,
+    pub alt: String,
+}
+
 /// Fully-resolved styling for one line, ready to hand to `TextEngine::build_line`.
 #[derive(Clone)]
 pub struct LineRender {
@@ -45,6 +53,10 @@ pub struct LineRender {
     /// This line is a thematic break rendered as a horizontal rule (its `---` text is
     /// hidden). False while the cursor is on the line, so the `---` is editable.
     pub is_hr: bool,
+    /// This line is a standalone image (`![alt](url)` as the whole paragraph): its
+    /// markdown text is hidden and an image block is drawn instead. `None` while the
+    /// cursor is on the line, so the raw markdown is revealed for editing.
+    pub image: Option<ImageRef>,
 }
 
 /// Font-size multiplier for a heading level (1 = largest). 0 = body text.
@@ -140,6 +152,39 @@ pub fn build_line_render(
         .map(|r| cursor_in(&r.full_range, cursor_offset))
         .collect();
 
+    // Standalone image: the line's whole content (ignoring surrounding whitespace) is a
+    // single `![alt](url)` region. Rendered as a drawn image block, with the markdown
+    // text hidden — except while the cursor is on the line (revealed for editing). The
+    // "covers the trimmed content" test naturally excludes list/quote-prefixed images
+    // (their marker sits before the image, outside its range).
+    let trimmed_start = line_start + (line_text.len() - line_text.trim_start().len());
+    let trimmed_end = line_start + line_text.trim_end().len();
+    let image = if !in_code_block && !cursor_on_line && trimmed_start < trimmed_end {
+        let mut images = inline.iter().filter(|r| r.is_image);
+        match (images.next(), images.next()) {
+            (Some(r), None)
+                if r.full_range.start == trimmed_start
+                    && r.full_range.end == trimmed_end
+                    && r.content_range.start >= line_start
+                    && r.content_range.end <= line_end =>
+            {
+                r.link_url.as_ref().map(|url| {
+                    let alt = line_text
+                        [r.content_range.start - line_start..r.content_range.end - line_start]
+                        .to_string();
+                    ImageRef {
+                        url: url.clone(),
+                        alt,
+                    }
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let is_standalone_image = image.is_some();
+
     // Collect the buffer ranges hidden or collapsed on the way to the display.
     // Code blocks show their markers verbatim; thematic breaks hide their `---` and
     // render as a drawn rule (unless the cursor is on the line, for editing).
@@ -156,6 +201,11 @@ pub fn build_line_render(
         }
         // Thematic break: hide the `---` text; the draw path paints a horizontal rule.
         if is_hr && line_end > line_start {
+            specials.push(Special::Hidden(line_start..line_end));
+        }
+        // Standalone image: hide the whole `![alt](url)` line; the draw path paints the
+        // image block. Hiding the entire content leaves `text` empty (no double render).
+        if is_standalone_image && line_end > line_start {
             specials.push(Special::Hidden(line_start..line_end));
         }
         // Prefix markers render as bullets / blockquote gutters (always on — they're
@@ -190,6 +240,9 @@ pub fn build_line_render(
             }
         }
         for (i, region) in inline.iter().enumerate() {
+            if is_standalone_image {
+                break; // the whole line is hidden; the image block is drawn instead
+            }
             if cursor_inside[i] {
                 continue; // reveal the whole region (markers included) for editing
             }
@@ -311,6 +364,7 @@ pub fn build_line_render(
         content_start,
         quote_bar_bytes,
         is_hr,
+        image,
     }
 }
 
@@ -417,6 +471,40 @@ mod tests {
         let lr = build_line_render(&snap, 2, &theme, 18.0, on, &[], &[]);
         assert!(!lr.is_hr, "revealed for editing when cursor is on it");
         assert_eq!(lr.text, "---");
+    }
+
+    /// A paragraph that is only `![alt](url)` flags `image: Some` (with url + alt) and
+    /// hides its markdown text, so the draw path paints an image block instead. When the
+    /// cursor is on the line, `image` is `None` and the raw markdown is revealed.
+    #[test]
+    fn standalone_image_detected_off_line_revealed_on_line() {
+        let theme = EditorTheme::dracula();
+        let mut buffer: Buffer = "![a badge](img/badge.png)\n".parse().unwrap();
+        let snap = buffer.render_snapshot();
+        let styles = snap.inline_styles_by_line();
+
+        let off = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &styles[0], &[]);
+        let img = off.image.as_ref().expect("standalone image detected off-line");
+        assert_eq!(img.url, "img/badge.png");
+        assert_eq!(img.alt, "a badge");
+        assert!(off.text.is_empty(), "the `![alt](url)` markdown is hidden");
+
+        // Cursor on the line: reveal the raw markdown, no image block.
+        let on = build_line_render(&snap, 0, &theme, 18.0, 0, &styles[0], &[]);
+        assert!(on.image.is_none(), "cursor on the line reveals raw markdown");
+        assert_eq!(on.text, "![a badge](img/badge.png)");
+    }
+
+    /// An image that is only part of a paragraph (surrounding text) is not standalone:
+    /// it stays inline text/link, `image` is `None`.
+    #[test]
+    fn inline_image_is_not_standalone() {
+        let theme = EditorTheme::dracula();
+        let mut buffer: Buffer = "see ![a](x.png) here\n".parse().unwrap();
+        let snap = buffer.render_snapshot();
+        let styles = snap.inline_styles_by_line();
+        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &styles[0], &[]);
+        assert!(lr.image.is_none(), "image amid other text is not standalone");
     }
 
     /// The blockquote bar is no longer a `▎` glyph in the text — the marker collapses

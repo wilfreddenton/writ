@@ -412,6 +412,7 @@ impl DocLayout {
             content_start: 0,
             quote_bar_bytes: Vec::new(),
             is_hr: false,
+            image: None,
         });
         let mut measured_y = pad_top * scale; // tops-space y consumed by materialized lines
         let mut estimating = false;
@@ -917,6 +918,7 @@ mod tests {
                         content_start: 0,
                         quote_bar_bytes: Vec::new(),
                         is_hr: false,
+                        image: None,
                     })
                 })
                 .collect(),
