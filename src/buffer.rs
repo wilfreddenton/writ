@@ -1191,6 +1191,27 @@ mod tests {
         assert_eq!(buf.text(), "- First\n- Second\n- Third\n");
     }
 
+    /// Structural edits that MERGE two ordered lists still renumber, even though the
+    /// gate only runs `normalize_ordered_lists` for edits landing in an ordered list:
+    /// a merge leaves the edit offset at the seam, which is inside the resulting list,
+    /// so `edit_in_ordered_list` still fires. Guards the `normalize` gating (F2) against
+    /// a false-negative where merged lists would keep stale numbers.
+    #[test]
+    fn merging_ordered_lists_renumbers() {
+        // Blank-line-separated lists each restarting at 1.; delete the blank to merge.
+        let mut buf: Buffer = "1. a\n\n1. b\n".parse().unwrap();
+        let blank = buf.text().find("a\n\n").unwrap() + 2; // the second '\n'
+        buf.delete(blank..blank + 1, blank);
+        assert_eq!(buf.text(), "1. a\n2. b\n", "merged lists renumber");
+
+        // A malformed list (2., 5.) brought to byte 0 by a leading-paragraph delete:
+        // the offset-0 descendant must still resolve into the list.
+        let mut buf2: Buffer = "x\n\n2. a\n5. b\n".parse().unwrap();
+        let end = buf2.text().find("2. a").unwrap();
+        buf2.delete(0..end, 0);
+        assert_eq!(buf2.text(), "1. a\n2. b\n", "list at offset 0 renumbers");
+    }
+
     #[test]
     fn edit_in_ordered_list_renumbers() {
         // A non-sequential list gets renumbered when the edit lands inside it.
