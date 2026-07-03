@@ -55,8 +55,10 @@ pub fn head_blob_text(path: &Path) -> Option<String> {
 
     let tree = repo.head_commit().ok()?.tree().ok()?;
     let entry = tree.lookup_entry_by_path(rel).ok()??;
-    let blob = entry.object().ok()?;
-    String::from_utf8(blob.data.clone()).ok()
+    // `gix::Object` is `Drop`, so `data` can't be moved out; take it (leaving an empty
+    // Vec behind) to avoid deep-copying the whole file.
+    let mut blob = entry.object().ok()?;
+    String::from_utf8(std::mem::take(&mut blob.data)).ok()
 }
 
 /// Parse a "owner/repo" string into GitHubContext.

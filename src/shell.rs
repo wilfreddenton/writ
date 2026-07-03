@@ -454,7 +454,7 @@ fn rebuild_doc(
         cache: editor.github_validation_cache(),
         context: editor.github_context(),
     };
-    let mut doc = DocLayout::build(
+    DocLayout::build(
         engine,
         cache,
         render_cache,
@@ -472,10 +472,7 @@ fn rebuild_doc(
         FONT_SIZE,
         LINE_HEIGHT,
         measure_to_y,
-    );
-    // Editor content begins at the surface top (native title bar is outside the surface).
-    doc.set_content_top(0.0);
-    doc
+    )
 }
 
 /// Re-evaluate the autocomplete popup against the cursor and, if a fetch is needed,

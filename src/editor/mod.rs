@@ -366,21 +366,11 @@ impl EditorState {
         // Get current line's checkbox state to pass to state builder
         let current_checkbox = self.buffer.line_markers(line_idx).checkbox();
 
-        // Check if we have a valid cache for this line
-        let states = if let Some(ref cache) = self.tab_cycle_cache {
-            if cache.line_idx == line_idx {
-                cache.states.clone()
-            } else {
-                // Different line, recalculate and cache
-                let states = self.build_cycle_states_from_tree(cursor_offset, current_checkbox);
-                self.tab_cycle_cache = Some(TabCycleCache {
-                    line_idx,
-                    states: states.clone(),
-                });
-                states
-            }
+        // Reuse the cache only when it's for this line; otherwise (wrong line or no
+        // cache) rebuild and store.
+        let states = if self.tab_cycle_cache.as_ref().is_some_and(|c| c.line_idx == line_idx) {
+            self.tab_cycle_cache.as_ref().unwrap().states.clone()
         } else {
-            // No cache, calculate and cache
             let states = self.build_cycle_states_from_tree(cursor_offset, current_checkbox);
             self.tab_cycle_cache = Some(TabCycleCache {
                 line_idx,
