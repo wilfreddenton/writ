@@ -30,12 +30,12 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Theme, Window, WindowId};
 
 use winit::event_loop::ControlFlow;
 
 use crate::buffer::Buffer;
-use crate::chrome::{BarRect, StatusInfo, draw_panel, draw_status_bar, draw_title_bar};
+use crate::chrome::{BarRect, StatusInfo, draw_panel, draw_status_bar};
 use crate::config::Config;
 use crate::core::{AutocompleteState, AutocompleteSuggestion, AutocompleteTrigger, Editor};
 use crate::doc_layout::{DocLayout, GithubRenderData, LineCache, RenderCache, ScreenRect};
@@ -56,15 +56,31 @@ const LINE_HEIGHT: f32 = 1.5;
 const WHEEL_LINE_STEP: f32 = 48.0;
 /// Caret width in logical px (scaled per display).
 const CARET_WIDTH: f32 = 2.0;
-/// Title/status bar heights in logical px.
-const TITLE_BAR_H: f32 = 34.0;
+/// Status bar height in logical px (the title bar is the native decoration).
 const STATUS_BAR_H: f32 = 24.0;
 
 /// Chrome layout in device px: y where editor content begins, and its height.
 fn chrome_metrics(scale: f32, height_dev: f32) -> (f32, f32) {
-    let content_top = TITLE_BAR_H * scale;
-    let editor_h = (height_dev - (TITLE_BAR_H + STATUS_BAR_H) * scale).max(1.0);
+    // The title bar is the native window decoration now, so editor content starts at
+    // the surface top; only the bottom status bar is inset.
+    let content_top = 0.0;
+    let editor_h = (height_dev - STATUS_BAR_H * scale).max(1.0);
     (content_top, editor_h)
+}
+
+/// The native window title: the file name with a `●` dirty marker, shown in the OS
+/// decoration (we no longer draw our own title bar).
+fn window_title(editor: &Editor) -> String {
+    let name = editor
+        .file_path()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "untitled".to_string());
+    if editor.is_dirty() {
+        format!("● {name}")
+    } else {
+        name
+    }
 }
 
 /// Nearest heading level at or above `line`, if any.
@@ -183,6 +199,9 @@ struct App {
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
     mouse_down: bool,
+    /// Last title pushed to the native window (filename + dirty marker); re-set only
+    /// when it changes, so the OS decoration carries the document name.
+    title: String,
     /// GitHub ref under the pointer, if any (drives the hover popover).
     hovered: Option<HoverTarget>,
     /// Screen rects of the currently-drawn autocomplete rows (for click routing).
@@ -203,6 +222,7 @@ impl App {
         proxy: EventLoopProxy<WritEvent>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
+        let title = window_title(&editor);
         Self {
             context: RenderContext::new(),
             renderer: None,
@@ -217,6 +237,7 @@ impl App {
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             mouse_down: false,
+            title,
             hovered: None,
             ac_row_rects: Vec::new(),
             ac_gen: Arc::new(AtomicU64::new(0)),
@@ -429,7 +450,8 @@ fn rebuild_doc(
         LINE_HEIGHT,
         measure_to_y,
     );
-    doc.set_content_top(TITLE_BAR_H * scale);
+    // Editor content begins at the surface top (native title bar is outside the surface).
+    doc.set_content_top(0.0);
     doc
 }
 
@@ -837,7 +859,12 @@ impl ApplicationHandler<WritEvent> for App {
         if self.state.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("writ");
+        // Native decorations (shadow, rounded corners, resize, snap — all free), but
+        // request a dark title bar to match the editor instead of a bright one over
+        // dark content. On Wayland CSD this also honors WINIT_WAYLAND_CSD_THEME.
+        let attrs = Window::default_attributes()
+            .with_title(self.title.clone())
+            .with_theme(Some(Theme::Dark));
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
@@ -1170,6 +1197,13 @@ impl ApplicationHandler<WritEvent> for App {
             WindowEvent::RedrawRequested => {
                 self.scene.reset();
 
+                // Keep the native title bar's text current (filename + dirty marker).
+                let desired = window_title(&self.editor);
+                if desired != self.title {
+                    self.title = desired;
+                    state.window.set_title(&self.title);
+                }
+
                 let width = state.surface.config.width as f32;
                 let height = state.surface.config.height as f32;
                 let (content_top, editor_h) = chrome_metrics(state.scale, height);
@@ -1212,28 +1246,10 @@ impl ApplicationHandler<WritEvent> for App {
                     }
                     self.scene.pop_layer();
 
-                    // Chrome: title bar (top) + status bar (bottom).
+                    // Chrome: status bar (bottom). The title bar is the OS/compositor's
+                    // native one (filename goes there via `set_title`); we don't draw our
+                    // own — that would double up on the native decoration.
                     let info = build_status_info(&self.editor, doc, editor_h);
-                    let filename = self
-                        .editor
-                        .file_path()
-                        .and_then(|p| p.file_name())
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "untitled".to_string());
-                    draw_title_bar(
-                        &mut self.text_engine,
-                        &mut self.scene,
-                        &self.theme,
-                        &BarRect {
-                            x0: 0.0,
-                            y0: 0.0,
-                            x1: width as f64,
-                            y1: content_top as f64,
-                        },
-                        &filename,
-                        self.editor.is_dirty(),
-                        state.scale,
-                    );
                     draw_status_bar(
                         &mut self.text_engine,
                         &mut self.scene,
@@ -1372,6 +1388,12 @@ impl ApplicationHandler<WritEvent> for App {
 /// Boot the shell: install the TLS provider, stand up a tokio runtime for HTTP/
 /// GitHub work (kept alive for the process), and run the winit event loop.
 pub fn run() -> Result<()> {
+    // Default winit's Wayland client-side decoration (sctk-adwaita) to a dark title
+    // bar to match the editor. Set before any threads spawn; user can override.
+    if std::env::var_os("WINIT_WAYLAND_CSD_THEME").is_none() {
+        // SAFETY: called at process start, before the tokio runtime spawns any threads.
+        unsafe { std::env::set_var("WINIT_WAYLAND_CSD_THEME", "dark") };
+    }
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1609,25 +1631,6 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     }
     scene.pop_layer();
     let info = build_status_info(&editor, &doc, editor_h);
-    let filename = editor
-        .file_path()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "untitled.md".to_string());
-    draw_title_bar(
-        &mut engine,
-        &mut scene,
-        &theme,
-        &BarRect {
-            x0: 0.0,
-            y0: 0.0,
-            x1: width as f64,
-            y1: content_top as f64,
-        },
-        &filename,
-        editor.is_dirty(),
-        1.0,
-    );
     draw_status_bar(
         &mut engine,
         &mut scene,
