@@ -187,18 +187,28 @@ struct HoverTarget {
     anchor: ScreenRect,
 }
 
-struct App {
-    context: RenderContext,
-    // One renderer suffices; keyed to the surface's device.
-    renderer: Option<Renderer>,
-    state: Option<ActiveSurface>,
-    scene: Scene,
+/// The document engine: the editor/buffer plus the caches and Parley/Vello text
+/// engine that lay it out into `doc`. Held as one field kept SEPARATE from `state`
+/// (the GPU surface) so `&mut self.doc_engine` and `&self.state` are disjoint
+/// borrows — the split that lets a rebuild run while the surface stays borrowed at
+/// the call site. The per-line caches + `Rc`-wrapped layouts/renders avoid deep
+/// clones on the typing hot path.
+struct DocEngine {
     text_engine: TextEngine,
     line_cache: LineCache,
     render_cache: RenderCache,
     theme: EditorTheme,
     editor: Editor,
     doc: Option<DocLayout>,
+}
+
+struct App {
+    context: RenderContext,
+    // One renderer suffices; keyed to the surface's device.
+    renderer: Option<Renderer>,
+    state: Option<ActiveSurface>,
+    scene: Scene,
+    doc_engine: DocEngine,
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
     mouse_down: bool,
@@ -231,12 +241,14 @@ impl App {
             renderer: None,
             state: None,
             scene: Scene::new(),
-            text_engine: TextEngine::new(),
-            line_cache: LineCache::new(),
-            render_cache: RenderCache::new(),
-            theme: EditorTheme::dracula(),
-            editor,
-            doc: None,
+            doc_engine: DocEngine {
+                text_engine: TextEngine::new(),
+                line_cache: LineCache::new(),
+                render_cache: RenderCache::new(),
+                theme: EditorTheme::dracula(),
+                editor,
+                doc: None,
+            },
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             mouse_down: false,
@@ -253,7 +265,7 @@ impl App {
     /// Spawn async validation for every not-yet-cached GitHub ref currently detected.
     /// Each finished task writes its result into the shared cache and wakes the loop.
     fn spawn_validations(&self) {
-        spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
+        spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
     }
 }
 
@@ -387,89 +399,77 @@ fn apply_key(
     }
 }
 
-/// Rebuild the document layout after an edit or cursor move (marker reveal is
-/// cursor-dependent), preserving scroll then revealing the cursor. Free function
-/// so it borrows only these fields, not all of `self` (the surface stays borrowed).
-fn refresh_doc(
-    engine: &mut TextEngine,
-    cache: &mut LineCache,
-    render_cache: &mut RenderCache,
-    editor: &mut Editor,
-    theme: &EditorTheme,
-    doc: &mut Option<DocLayout>,
-    device_width: f32,
-    scale: f32,
-    editor_h: f32,
-) {
-    // Re-detect GitHub refs / naked URLs after the edit so coloring + validation
-    // spawning see the current buffer. Whole-buffer scan; cheap enough for now.
-    editor.refresh_detection();
-    let prev_scroll = doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
-    let mut new_doc = rebuild_doc(
-        engine,
-        cache,
-        render_cache,
-        editor,
-        theme,
-        device_width,
-        scale,
-        prev_scroll + editor_h,
-    );
-    new_doc.scroll_y = prev_scroll;
-    new_doc.scroll_to(editor.cursor_position(), editor_h);
-    *doc = Some(new_doc);
-}
+impl DocEngine {
+    /// Rebuild after an edit or cursor move (marker reveal is cursor-dependent),
+    /// preserving scroll then revealing the cursor. Re-detects GitHub refs / naked
+    /// URLs first so coloring + validation spawning see the current buffer.
+    ///
+    /// A method on `DocEngine` (not `App`) so it borrows only the doc-engine fields,
+    /// leaving the caller's `&self.state` (GPU surface) borrow disjoint and intact.
+    fn refresh(&mut self, device_width: f32, scale: f32, editor_h: f32) {
+        // Whole-buffer scan; cheap enough for now.
+        self.editor.refresh_detection();
+        let prev_scroll = self.doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
+        let mut new_doc = self.rebuild(device_width, scale, prev_scroll + editor_h);
+        new_doc.scroll_y = prev_scroll;
+        new_doc.scroll_to(self.editor.cursor_position(), editor_h);
+        self.doc = Some(new_doc);
+    }
 
-/// Lay out the whole document at `device_width`. Free function so it borrows only
-/// the fields it needs, leaving the caller's `&mut self.state` borrow intact.
-fn rebuild_doc(
-    engine: &mut TextEngine,
-    cache: &mut LineCache,
-    render_cache: &mut RenderCache,
-    editor: &mut Editor,
-    theme: &EditorTheme,
-    device_width: f32,
-    scale: f32,
-    // Device-px depth (scroll_y + viewport_h) that must be fully laid out; deeper
-    // lines are height-estimated. `f32::INFINITY` lays out the whole document.
-    measure_to_y: f32,
-) -> DocLayout {
-    let cursor_offset = editor.cursor_position();
-    let version = editor.state.buffer.version();
-    // Clone the diff before borrowing the buffer mutably for the snapshot.
-    let diff = editor.diff_state().cloned();
-    let snapshot = editor.state.buffer.render_snapshot();
-    // The snapshot is owned, so the mutable borrow above is released — now gather the
-    // GitHub autolink data (immutable borrows) to color validated refs.
-    let github = GithubRenderData {
-        refs_by_line: editor.github_refs_by_line(),
-        urls_by_line: editor.naked_urls_by_line(),
-        cache: editor.github_validation_cache(),
-        context: editor.github_context(),
-    };
-    let params = LayoutParams {
-        device_width,
-        scale,
-        pad_x: PADDING,
-        pad_top: PADDING,
-        pad_bottom: PADDING * 2.0,
-        base_font_size: FONT_SIZE,
-        line_height: LINE_HEIGHT,
-        fg: peniko_color(theme.foreground),
-    };
-    DocLayout::build(
-        engine,
-        cache,
-        render_cache,
-        version,
-        &snapshot,
-        theme,
-        diff.as_ref(),
-        Some(&github),
-        cursor_offset,
-        &params,
-        measure_to_y,
-    )
+    /// Rebuild preserving the current scroll (no cursor reveal, no re-detection): the
+    /// freshly-validated-refs recolor and wheel-remeasure paths, where the viewport
+    /// must not jump.
+    fn rebuild_preserving_scroll(&mut self, device_width: f32, scale: f32, editor_h: f32) {
+        let prev_scroll = self.doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
+        let mut new_doc = self.rebuild(device_width, scale, prev_scroll + editor_h);
+        new_doc.scroll_y = prev_scroll;
+        new_doc.clamp_scroll(editor_h);
+        self.doc = Some(new_doc);
+    }
+
+    /// Lay out the whole document at `device_width`, returning the layout for the
+    /// caller to store. `measure_to_y` is the device-px depth (scroll_y + viewport_h)
+    /// that must be fully laid out; deeper lines are height-estimated. `f32::INFINITY`
+    /// lays out the whole document. Borrows disjoint doc-engine fields so the caller's
+    /// surface borrow stays intact.
+    fn rebuild(&mut self, device_width: f32, scale: f32, measure_to_y: f32) -> DocLayout {
+        let cursor_offset = self.editor.cursor_position();
+        let version = self.editor.state.buffer.version();
+        // Clone the diff before borrowing the buffer mutably for the snapshot.
+        let diff = self.editor.diff_state().cloned();
+        let snapshot = self.editor.state.buffer.render_snapshot();
+        // The snapshot is owned, so the mutable borrow above is released — now gather
+        // the GitHub autolink data (immutable borrows) to color validated refs.
+        let github = GithubRenderData {
+            refs_by_line: self.editor.github_refs_by_line(),
+            urls_by_line: self.editor.naked_urls_by_line(),
+            cache: self.editor.github_validation_cache(),
+            context: self.editor.github_context(),
+        };
+        let params = LayoutParams {
+            device_width,
+            scale,
+            pad_x: PADDING,
+            pad_top: PADDING,
+            pad_bottom: PADDING * 2.0,
+            base_font_size: FONT_SIZE,
+            line_height: LINE_HEIGHT,
+            fg: peniko_color(self.theme.foreground),
+        };
+        DocLayout::build(
+            &mut self.text_engine,
+            &mut self.line_cache,
+            &mut self.render_cache,
+            version,
+            &snapshot,
+            &self.theme,
+            diff.as_ref(),
+            Some(&github),
+            cursor_offset,
+            &params,
+            measure_to_y,
+        )
+    }
 }
 
 /// Re-evaluate the autocomplete popup against the cursor and, if a fetch is needed,
@@ -862,7 +862,7 @@ impl ApplicationHandler<WritEvent> for App {
                 // Install any fetched autocomplete suggestions (built on this thread).
                 let fetched = self.ac_slot.lock().unwrap().take();
                 if let Some(fetched) = fetched {
-                    apply_fetched(&mut self.editor, fetched);
+                    apply_fetched(&mut self.doc_engine.editor, fetched);
                 }
                 if let Some(state) = self.state.as_ref() {
                     let w = state.surface.config.width as f32;
@@ -871,20 +871,7 @@ impl ApplicationHandler<WritEvent> for App {
                     let window = state.window.clone();
                     // Rebuild so freshly-validated refs recolor; detection is unchanged,
                     // so skip it and preserve the current scroll (no viewport jump).
-                    let prev_scroll = self.doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
-                    let mut new_doc = rebuild_doc(
-                        &mut self.text_engine,
-                        &mut self.line_cache,
-                        &mut self.render_cache,
-                        &mut self.editor,
-                        &self.theme,
-                        w,
-                        scale,
-                        prev_scroll + vh,
-                    );
-                    new_doc.scroll_y = prev_scroll;
-                    new_doc.clamp_scroll(vh);
-                    self.doc = Some(new_doc);
+                    self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
                     window.request_redraw();
                 }
             }
@@ -933,17 +920,8 @@ impl ApplicationHandler<WritEvent> for App {
 
         let scale = window.scale_factor() as f32;
         let (_, editor_h) = chrome_metrics(scale, size.height as f32);
-        let doc = rebuild_doc(
-            &mut self.text_engine,
-            &mut self.line_cache,
-            &mut self.render_cache,
-            &mut self.editor,
-            &self.theme,
-            size.width as f32,
-            scale,
-            editor_h,
-        );
-        self.doc = Some(doc);
+        let doc = self.doc_engine.rebuild(size.width as f32, scale, editor_h);
+        self.doc_engine.doc = Some(doc);
         self.state = Some(ActiveSurface {
             surface,
             window,
@@ -966,17 +944,9 @@ impl ApplicationHandler<WritEvent> for App {
                     size.height.max(1),
                 );
                 let (_, editor_h) = chrome_metrics(state.scale, size.height as f32);
-                let doc = rebuild_doc(
-                    &mut self.text_engine,
-                    &mut self.line_cache,
-                    &mut self.render_cache,
-                    &mut self.editor,
-                    &self.theme,
-                    size.width as f32,
-                    state.scale,
-                    editor_h,
-                );
-                self.doc = Some(doc);
+                let scale = state.scale;
+                let doc = self.doc_engine.rebuild(size.width as f32, scale, editor_h);
+                self.doc_engine.doc = Some(doc);
                 state.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -989,7 +959,7 @@ impl ApplicationHandler<WritEvent> for App {
                     MouseScrollDelta::PixelDelta(p) => -p.y as f32,
                 };
                 let (_, editor_h) = chrome_metrics(state.scale, state.surface.config.height as f32);
-                let remeasure = if let Some(doc) = self.doc.as_mut() {
+                let remeasure = if let Some(doc) = self.doc_engine.doc.as_mut() {
                     doc.scroll_by(dy, editor_h);
                     doc.needs_remeasure(editor_h)
                 } else {
@@ -1000,22 +970,9 @@ impl ApplicationHandler<WritEvent> for App {
                 if remeasure {
                     let w = state.surface.config.width as f32;
                     let scale = state.scale;
-                    let new_scroll = self.doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
-                    let mut nd = rebuild_doc(
-                        &mut self.text_engine,
-                        &mut self.line_cache,
-                        &mut self.render_cache,
-                        &mut self.editor,
-                        &self.theme,
-                        w,
-                        scale,
-                        new_scroll + editor_h,
-                    );
-                    nd.scroll_y = new_scroll;
-                    nd.clamp_scroll(editor_h);
-                    self.doc = Some(nd);
+                    self.doc_engine.rebuild_preserving_scroll(w, scale, editor_h);
                 }
-                if self.doc.is_some() {
+                if self.doc_engine.doc.is_some() {
                     state.window.request_redraw();
                 }
             }
@@ -1026,22 +983,12 @@ impl ApplicationHandler<WritEvent> for App {
             // is a follow-up; committing already covers most Latin input methods.
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 if !text.is_empty() {
-                    self.editor.insert_str(&text);
+                    self.doc_engine.editor.insert_str(&text);
                     self.hovered = None;
                     let w = state.surface.config.width as f32;
                     let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
-                    refresh_doc(
-                        &mut self.text_engine,
-                        &mut self.line_cache,
-                        &mut self.render_cache,
-                        &mut self.editor,
-                        &self.theme,
-                        &mut self.doc,
-                        w,
-                        state.scale,
-                        vh,
-                    );
-                    spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
+                    self.doc_engine.refresh(w, state.scale, vh);
+                    spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
                     state.window.request_redraw();
                 }
             }
@@ -1049,31 +996,27 @@ impl ApplicationHandler<WritEvent> for App {
                 self.mouse_pos = (position.x as f32, position.y as f32);
                 if self.mouse_down {
                     if let Some(off) = self
+                        .doc_engine
                         .doc
                         .as_ref()
                         .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
                     {
-                        self.editor.drag(off);
+                        self.doc_engine.editor.drag(off);
                         let w = state.surface.config.width as f32;
                         let (_, vh) =
                             chrome_metrics(state.scale, state.surface.config.height as f32);
-                        refresh_doc(
-                            &mut self.text_engine,
-                            &mut self.line_cache,
-                            &mut self.render_cache,
-                            &mut self.editor,
-                            &self.theme,
-                            &mut self.doc,
-                            w,
-                            state.scale,
-                            vh,
-                        );
+                        self.doc_engine.refresh(w, state.scale, vh);
                         state.window.request_redraw();
                     }
                 } else {
                     // Not dragging: update the hovered GitHub ref (popover source).
-                    let new = self.doc.as_ref().and_then(|d| {
-                        find_hover_target(&self.editor, d, self.mouse_pos.0, self.mouse_pos.1)
+                    let new = self.doc_engine.doc.as_ref().and_then(|d| {
+                        find_hover_target(
+                            &self.doc_engine.editor,
+                            d,
+                            self.mouse_pos.0,
+                            self.mouse_pos.1,
+                        )
                     });
                     let changed = self.hovered.as_ref().map(|h| &h.reference)
                         != new.as_ref().map(|h| &h.reference);
@@ -1093,7 +1036,7 @@ impl ApplicationHandler<WritEvent> for App {
                 let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
 
                 // Autocomplete row click: accept that suggestion, don't move the caret.
-                if self.editor.autocomplete().is_some()
+                if self.doc_engine.editor.autocomplete().is_some()
                     && let Some(row) = self.ac_row_rects.iter().position(|r| {
                         let (x0, y0, x1, y1) = *r;
                         (self.mouse_pos.0 as f64) >= x0
@@ -1102,46 +1045,29 @@ impl ApplicationHandler<WritEvent> for App {
                             && (self.mouse_pos.1 as f64) <= y1
                     })
                 {
-                    self.editor.autocomplete_select(row);
-                    if self.editor.accept_autocomplete_suggestion() {
+                    self.doc_engine.editor.autocomplete_select(row);
+                    if self.doc_engine.editor.accept_autocomplete_suggestion() {
                         self.hovered = None;
-                        refresh_doc(
-                            &mut self.text_engine,
-                            &mut self.line_cache,
-                            &mut self.render_cache,
-                            &mut self.editor,
-                            &self.theme,
-                            &mut self.doc,
-                            w,
-                            state.scale,
-                            vh,
-                        );
-                        spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
+                        self.doc_engine.refresh(w, state.scale, vh);
+                        spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
                         state.window.request_redraw();
                     }
                     return;
                 }
 
                 if let Some(off) = self
+                    .doc_engine
                     .doc
                     .as_ref()
                     .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
                 {
-                    self.editor.click(off, self.modifiers.shift_key(), 1);
-                    refresh_doc(
-                        &mut self.text_engine,
-                        &mut self.line_cache,
-                        &mut self.render_cache,
-                        &mut self.editor,
-                        &self.theme,
-                        &mut self.doc,
-                        w,
-                        state.scale,
-                        vh,
-                    );
+                    self.doc_engine
+                        .editor
+                        .click(off, self.modifiers.shift_key(), 1);
+                    self.doc_engine.refresh(w, state.scale, vh);
                     // Clicking into/out of a ref opens/closes the popup.
                     sync_autocomplete(
-                        &mut self.editor,
+                        &mut self.doc_engine.editor,
                         &self.runtime,
                         &self.proxy,
                         &self.ac_gen,
@@ -1171,42 +1097,36 @@ impl ApplicationHandler<WritEvent> for App {
 
                 // When the autocomplete popup is open, route navigation keys to it.
                 // `ac_has` is Some(has_suggestions) iff the popup is open.
-                let ac_has = self.editor.autocomplete().map(|ac| !ac.suggestions.is_empty());
+                let ac_has = self
+                    .doc_engine
+                    .editor
+                    .autocomplete()
+                    .map(|ac| !ac.suggestions.is_empty());
                 if let Some(has) = ac_has {
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
-                            self.editor.close_autocomplete();
+                            self.doc_engine.editor.close_autocomplete();
                             state.window.request_redraw();
                             return;
                         }
                         Key::Named(NamedKey::ArrowUp) if has => {
-                            self.editor.autocomplete_move(false);
+                            self.doc_engine.editor.autocomplete_move(false);
                             state.window.request_redraw();
                             return;
                         }
                         Key::Named(NamedKey::ArrowDown) if has => {
-                            self.editor.autocomplete_move(true);
+                            self.doc_engine.editor.autocomplete_move(true);
                             state.window.request_redraw();
                             return;
                         }
                         // `has` guarantees suggestions exist, so accept() always
                         // succeeds here (it mutates as part of the guard).
                         Key::Named(NamedKey::Enter | NamedKey::Tab)
-                            if has && self.editor.accept_autocomplete_suggestion() =>
+                            if has && self.doc_engine.editor.accept_autocomplete_suggestion() =>
                         {
                             self.hovered = None;
-                            refresh_doc(
-                                &mut self.text_engine,
-                                &mut self.line_cache,
-                                &mut self.render_cache,
-                                &mut self.editor,
-                                &self.theme,
-                                &mut self.doc,
-                                w,
-                                state.scale,
-                                vh,
-                            );
-                            spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
+                            self.doc_engine.refresh(w, state.scale, vh);
+                            spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
                             state.window.request_redraw();
                             return;
                         }
@@ -1214,22 +1134,12 @@ impl ApplicationHandler<WritEvent> for App {
                     }
                 }
 
-                if apply_key(&mut self.editor, self.modifiers, &event) {
+                if apply_key(&mut self.doc_engine.editor, self.modifiers, &event) {
                     self.hovered = None;
-                    refresh_doc(
-                        &mut self.text_engine,
-                        &mut self.line_cache,
-                        &mut self.render_cache,
-                        &mut self.editor,
-                        &self.theme,
-                        &mut self.doc,
-                        w,
-                        state.scale,
-                        vh,
-                    );
-                    spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
+                    self.doc_engine.refresh(w, state.scale, vh);
+                    spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
                     sync_autocomplete(
-                        &mut self.editor,
+                        &mut self.doc_engine.editor,
                         &self.runtime,
                         &self.proxy,
                         &self.ac_gen,
@@ -1242,7 +1152,7 @@ impl ApplicationHandler<WritEvent> for App {
                 self.scene.reset();
 
                 // Keep the native title bar's text current (filename + dirty marker).
-                let desired = window_title(&self.editor);
+                let desired = window_title(&self.doc_engine.editor);
                 if desired != self.title {
                     self.title = desired;
                     state.window.set_title(&self.title);
@@ -1252,7 +1162,7 @@ impl ApplicationHandler<WritEvent> for App {
                 let height = state.surface.config.height as f32;
                 let (content_top, editor_h) = chrome_metrics(state.scale, height);
 
-                if let Some(doc) = self.doc.as_ref() {
+                if let Some(doc) = self.doc_engine.doc.as_ref() {
                     // Editor content, clipped to the region between the chrome bars.
                     let clip = Rect::new(
                         0.0,
@@ -1264,8 +1174,8 @@ impl ApplicationHandler<WritEvent> for App {
                         .push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
                     // Draw order (all before glyphs): diff row/word bg, then selection.
                     doc.draw_added_backgrounds(&mut self.scene, editor_h);
-                    if let Some(sel) = self.editor.selection_range() {
-                        let color = peniko_color(self.theme.selection);
+                    if let Some(sel) = self.doc_engine.editor.selection_range() {
+                        let color = peniko_color(self.doc_engine.theme.selection);
                         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
                             self.scene.fill(
                                 Fill::NonZero,
@@ -1276,14 +1186,15 @@ impl ApplicationHandler<WritEvent> for App {
                             );
                         }
                     }
-                    doc.draw(&self.text_engine, &mut self.scene, editor_h);
-                    if let Some((x0, y0, x1, y1)) =
-                        doc.caret_rect(self.editor.cursor_position(), CARET_WIDTH * state.scale)
-                    {
+                    doc.draw(&self.doc_engine.text_engine, &mut self.scene, editor_h);
+                    if let Some((x0, y0, x1, y1)) = doc.caret_rect(
+                        self.doc_engine.editor.cursor_position(),
+                        CARET_WIDTH * state.scale,
+                    ) {
                         self.scene.fill(
                             Fill::NonZero,
                             Affine::IDENTITY,
-                            peniko_color(self.theme.foreground),
+                            peniko_color(self.doc_engine.theme.foreground),
                             None,
                             &Rect::new(x0, y0, x1.max(x0 + 1.0), y1),
                         );
@@ -1293,11 +1204,11 @@ impl ApplicationHandler<WritEvent> for App {
                     // Chrome: status bar (bottom). The title bar is the OS/compositor's
                     // native one (filename goes there via `set_title`); we don't draw our
                     // own — that would double up on the native decoration.
-                    let info = build_status_info(&self.editor, doc, editor_h);
+                    let info = build_status_info(&self.doc_engine.editor, doc, editor_h);
                     draw_status_bar(
-                        &mut self.text_engine,
+                        &mut self.doc_engine.text_engine,
                         &mut self.scene,
-                        &self.theme,
+                        &self.doc_engine.theme,
                         &BarRect {
                             x0: 0.0,
                             y0: (content_top + editor_h) as f64,
@@ -1311,18 +1222,20 @@ impl ApplicationHandler<WritEvent> for App {
                     // Overlays on top of everything (unclipped): the autocomplete
                     // dropdown takes priority over the hover popover.
                     let ac_open = self
+                        .doc_engine
                         .editor
                         .autocomplete()
                         .is_some_and(|ac| !ac.suggestions.is_empty());
                     if ac_open {
-                        if let Some(caret) =
-                            doc.caret_rect(self.editor.cursor_position(), CARET_WIDTH * state.scale)
-                        {
-                            let ac = self.editor.autocomplete().expect("open");
+                        if let Some(caret) = doc.caret_rect(
+                            self.doc_engine.editor.cursor_position(),
+                            CARET_WIDTH * state.scale,
+                        ) {
+                            let ac = self.doc_engine.editor.autocomplete().expect("open");
                             self.ac_row_rects = draw_autocomplete(
-                                &mut self.text_engine,
+                                &mut self.doc_engine.text_engine,
                                 &mut self.scene,
-                                &self.theme,
+                                &self.doc_engine.theme,
                                 ac,
                                 caret,
                                 width,
@@ -1334,10 +1247,10 @@ impl ApplicationHandler<WritEvent> for App {
                         self.ac_row_rects.clear();
                         if let Some(target) = self.hovered.as_ref() {
                             draw_hover_popover(
-                                &mut self.text_engine,
+                                &mut self.doc_engine.text_engine,
                                 &mut self.scene,
-                                &self.theme,
-                                &self.editor,
+                                &self.doc_engine.theme,
+                                &self.doc_engine.editor,
                                 target,
                                 width,
                                 height,
@@ -1349,7 +1262,7 @@ impl ApplicationHandler<WritEvent> for App {
 
                 let dev = &self.context.devices[state.surface.dev_id];
                 let params = RenderParams {
-                    base_color: peniko_color(self.theme.background),
+                    base_color: peniko_color(self.doc_engine.theme.background),
                     width: state.surface.config.width,
                     height: state.surface.config.height,
                     antialiasing_method: AaConfig::Area,
@@ -1402,25 +1315,15 @@ impl ApplicationHandler<WritEvent> for App {
     /// Poll for external file edits (e.g. an agent writing the file) between events,
     /// reloading + recomputing the diff live, and keep a slow poll timer running.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.editor.poll_file_changes()
+        if self.doc_engine.editor.poll_file_changes()
             && let Some(state) = self.state.as_ref()
         {
             let w = state.surface.config.width as f32;
             let (_, editor_h) = chrome_metrics(state.scale, state.surface.config.height as f32);
             let window = state.window.clone();
             let scale = state.scale;
-            refresh_doc(
-                &mut self.text_engine,
-                &mut self.line_cache,
-                &mut self.render_cache,
-                &mut self.editor,
-                &self.theme,
-                &mut self.doc,
-                w,
-                scale,
-                editor_h,
-            );
-            spawn_ref_validations(&self.editor, &self.runtime, &self.proxy);
+            self.doc_engine.refresh(w, scale, editor_h);
+            spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
             window.request_redraw();
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -1574,8 +1477,6 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     let device = &context.devices[dev_id].device;
     let queue = &context.devices[dev_id].queue;
 
-    let mut engine = TextEngine::new();
-    let theme = EditorTheme::dracula();
     // WRIT_SHELL_FILE opens a real file (with live HEAD diff); else the sample doc.
     let mut editor = match std::env::var("WRIT_SHELL_FILE") {
         Ok(p) => Editor::open(std::path::Path::new(&p)),
@@ -1621,18 +1522,16 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         }
     }
     let (content_top, editor_h) = chrome_metrics(1.0, height as f32);
-    let mut cache = LineCache::new();
-    let mut render_cache = RenderCache::new();
-    let mut doc = rebuild_doc(
-        &mut engine,
-        &mut cache,
-        &mut render_cache,
-        &mut editor,
-        &theme,
-        width as f32,
-        1.0,
-        scroll_y + editor_h,
-    );
+    // Reuse the shared rebuild path (caches + Parley/Vello engine) headlessly.
+    let mut de = DocEngine {
+        text_engine: TextEngine::new(),
+        line_cache: LineCache::new(),
+        render_cache: RenderCache::new(),
+        theme: EditorTheme::dracula(),
+        editor,
+        doc: None,
+    };
+    let mut doc = de.rebuild(width as f32, 1.0, scroll_y + editor_h);
     doc.scroll_by(scroll_y, editor_h);
     let mut scene = Scene::new();
     let clip = Rect::new(
@@ -1643,8 +1542,8 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     );
     scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
     doc.draw_added_backgrounds(&mut scene, editor_h);
-    if let Some(sel) = editor.selection_range() {
-        let color = peniko_color(theme.selection);
+    if let Some(sel) = de.editor.selection_range() {
+        let color = peniko_color(de.theme.selection);
         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
             scene.fill(
                 Fill::NonZero,
@@ -1655,22 +1554,22 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
             );
         }
     }
-    doc.draw(&engine, &mut scene, editor_h);
-    if let Some((x0, y0, x1, y1)) = doc.caret_rect(editor.cursor_position(), 2.0) {
+    doc.draw(&de.text_engine, &mut scene, editor_h);
+    if let Some((x0, y0, x1, y1)) = doc.caret_rect(de.editor.cursor_position(), 2.0) {
         scene.fill(
             Fill::NonZero,
             Affine::IDENTITY,
-            peniko_color(theme.foreground),
+            peniko_color(de.theme.foreground),
             None,
             &Rect::new(x0, y0, x1.max(x0 + 1.0), y1),
         );
     }
     scene.pop_layer();
-    let info = build_status_info(&editor, &doc, editor_h);
+    let info = build_status_info(&de.editor, &doc, editor_h);
     draw_status_bar(
-        &mut engine,
+        &mut de.text_engine,
         &mut scene,
-        &theme,
+        &de.theme,
         &BarRect {
             x0: 0.0,
             y0: (content_top + editor_h) as f64,
@@ -1686,13 +1585,13 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     if let Some(off) = std::env::var("WRIT_SHELL_HOVER")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        && let Some(t) = hover_target_at_offset(&editor, &doc, off)
+        && let Some(t) = hover_target_at_offset(&de.editor, &doc, off)
     {
         draw_hover_popover(
-            &mut engine,
+            &mut de.text_engine,
             &mut scene,
-            &theme,
-            &editor,
+            &de.theme,
+            &de.editor,
             &t,
             width as f32,
             height as f32,
@@ -1701,13 +1600,13 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     }
 
     // Optional autocomplete golden image (see WRIT_SHELL_AUTOCOMPLETE above).
-    if let Some(ac) = editor.autocomplete().filter(|ac| !ac.suggestions.is_empty())
-        && let Some(caret) = doc.caret_rect(editor.cursor_position(), 2.0)
+    if let Some(ac) = de.editor.autocomplete().filter(|ac| !ac.suggestions.is_empty())
+        && let Some(caret) = doc.caret_rect(de.editor.cursor_position(), 2.0)
     {
         draw_autocomplete(
-            &mut engine,
+            &mut de.text_engine,
             &mut scene,
-            &theme,
+            &de.theme,
             ac,
             caret,
             width as f32,
@@ -1749,7 +1648,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
             &scene,
             &target_view,
             &RenderParams {
-                base_color: peniko_color(theme.background),
+                base_color: peniko_color(de.theme.background),
                 width,
                 height,
                 antialiasing_method: AaConfig::Area,
