@@ -49,25 +49,30 @@ pub fn next_grapheme_boundary(buffer: &Buffer, offset: usize) -> usize {
     }
 }
 
-/// Compute the byte offset on `target_line` at the same character column as
-/// `offset` on `from_line`, clamped to the target line's length. Works in char
-/// units so the result always lands on a codepoint boundary — measuring the
-/// column in bytes would land mid-codepoint on lines containing multibyte text.
+/// Compute the byte offset on `target_line` at the same **grapheme** column as
+/// `offset` on `from_line`, clamped to the target line's content length. Grapheme
+/// units keep vertical movement consistent with horizontal (which steps whole
+/// clusters) and always land on a cluster boundary. `line_byte_range` excludes the
+/// trailing newline, so the clamp lands at end-of-content, not on the `\n`.
 fn same_column_offset(
     buffer: &Buffer,
     from_line: usize,
     offset: usize,
     target_line: usize,
 ) -> usize {
-    let rope = buffer.rope();
     let from_start = buffer.line_to_byte(from_line);
-    let column = rope.byte_to_char(offset) - rope.byte_to_char(from_start);
+    let column = buffer.slice_cow(from_start..offset).graphemes(true).count();
 
     let target = buffer.line_byte_range(target_line);
-    let target_start_char = rope.byte_to_char(target.start);
-    let target_len_chars = rope.byte_to_char(target.end) - target_start_char;
-
-    rope.char_to_byte(target_start_char + column.min(target_len_chars))
+    let chunk = buffer.slice_cow(target.start..target.end);
+    let mut byte = target.start;
+    for (i, g) in chunk.graphemes(true).enumerate() {
+        if i == column {
+            return byte;
+        }
+        byte += g.len();
+    }
+    byte // fewer graphemes than the column → clamp to end of content
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -342,6 +347,23 @@ mod tests {
         assert_eq!(c.move_left(&buf).offset, fam + comb);
         assert_eq!(b.move_left(&buf).offset, fam);
         assert_eq!(a.move_left(&buf).offset, 0);
+    }
+
+    #[test]
+    fn vertical_movement_preserves_grapheme_column() {
+        // Line 0: a wide ZWJ family emoji then 'a' → the cursor after 'a' is at grapheme
+        // column 2. Char-column math would say column 8 (7 codepoints + 'a') and clamp to
+        // the end of "xyz"; grapheme columns correctly land after "xy".
+        let family = "👨‍👩‍👧‍👦";
+        let text = format!("{family}a\nxyz\n");
+        let buf: Buffer = text.parse().unwrap();
+        let after_a = family.len() + 1;
+        let line1 = text.find("xyz").unwrap();
+
+        let down = Cursor::new(after_a).move_down(&buf);
+        assert_eq!(down.offset, line1 + 2, "down lands at grapheme column 2");
+        // And back up returns to just after the emoji cluster (column 2 on line 0).
+        assert_eq!(down.move_up(&buf).offset, after_a);
     }
 
     #[test]
