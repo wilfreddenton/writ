@@ -760,6 +760,42 @@ impl Buffer {
         self.history.edit(&mut self.content, edit)
     }
 
+    /// Current head index into the undo history. Pair with `coalesce_since` to
+    /// collapse a batch of edits into a single undo entry.
+    pub fn undo_head(&self) -> usize {
+        self.history.head()
+    }
+
+    /// Collapse every edit made since `head` (a prior `undo_head` value) into one
+    /// undo entry mapping the state at `head` (`text_before`) directly to
+    /// `text_after`. Reverts the intervening edits, then splices a single minimal
+    /// replace, so undo/redo treat the whole batch as one step. `cursor_before`/
+    /// `cursor_after` are recorded on the entry so undo/redo restore the cursor.
+    pub fn coalesce_since(
+        &mut self,
+        head: usize,
+        text_before: &str,
+        text_after: &str,
+        cursor_before: usize,
+        cursor_after: usize,
+    ) {
+        let (start, old_end, replacement) = minimal_diff(text_before, text_after);
+        // Discard the reverted batch either way; only push a new entry if the
+        // batch produced a net visible change.
+        self.history.go_to(&mut self.content, head);
+        if start == old_end && replacement.is_empty() {
+            return;
+        }
+        let edit = TextEdit::new(
+            start,
+            text_before[start..old_end].to_string(),
+            replacement,
+            cursor_before,
+            cursor_after,
+        );
+        self.history.edit(&mut self.content, edit);
+    }
+
     pub fn undo(&mut self) -> Option<usize> {
         self.history.undo(&mut self.content)
     }
@@ -798,6 +834,37 @@ impl Default for Buffer {
     }
 }
 
+/// Minimal replace transforming `old` into `new`: strip the common prefix and
+/// suffix, returning `(start, old_end, replacement)` where replacing
+/// `old[start..old_end]` with `replacement` yields `new`. Boundaries are snapped
+/// to UTF-8 char boundaries so the result is safe to apply to a rope.
+fn minimal_diff(old: &str, new: &str) -> (usize, usize, String) {
+    let old_b = old.as_bytes();
+    let new_b = new.as_bytes();
+
+    let max_pre = old_b.len().min(new_b.len());
+    let mut start = 0;
+    while start < max_pre && old_b[start] == new_b[start] {
+        start += 1;
+    }
+    while start > 0 && !old.is_char_boundary(start) {
+        start -= 1;
+    }
+
+    let max_suf = old_b.len().min(new_b.len()) - start;
+    let mut suf = 0;
+    while suf < max_suf && old_b[old_b.len() - 1 - suf] == new_b[new_b.len() - 1 - suf] {
+        suf += 1;
+    }
+    let mut old_end = old_b.len() - suf;
+    while old_end < old_b.len() && !old.is_char_boundary(old_end) {
+        old_end += 1;
+    }
+
+    let new_end = new_b.len() - (old_b.len() - old_end);
+    (start, old_end, new[start..new_end].to_string())
+}
+
 impl FromStr for Buffer {
     type Err = std::convert::Infallible;
 
@@ -829,6 +896,47 @@ impl FromStr for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn apply_diff(old: &str, new: &str) -> String {
+        let (start, old_end, replacement) = minimal_diff(old, new);
+        let mut result = String::new();
+        result.push_str(&old[..start]);
+        result.push_str(&replacement);
+        result.push_str(&old[old_end..]);
+        result
+    }
+
+    #[test]
+    fn minimal_diff_reconstructs_and_is_minimal() {
+        // Single-char change in the middle: tight span, empty ends.
+        let (start, old_end, repl) = minimal_diff("- [ ] task", "- [x] task");
+        assert_eq!((start, old_end, repl.as_str()), (3, 4, "x"));
+
+        // Pure insertion and reconstruction across several shapes.
+        for (old, new) in [
+            ("- [ ] task", "- [x] ~~task~~"),
+            ("~~hello~~", "hello"),
+            ("abc", "abc"),
+            ("", "xyz"),
+            ("xyz", ""),
+        ] {
+            assert_eq!(apply_diff(old, new), new, "reconstruct {old:?} -> {new:?}");
+        }
+    }
+
+    #[test]
+    fn minimal_diff_respects_utf8_boundaries() {
+        // Edits adjacent to multibyte chars must land on char boundaries.
+        let old = "café ☕ done";
+        let new = "café ☕ DONE";
+        let (start, old_end, _) = minimal_diff(old, new);
+        assert!(old.is_char_boundary(start) && old.is_char_boundary(old_end));
+        assert_eq!(apply_diff(old, new), new);
+
+        let old2 = "α β γ";
+        let new2 = "α X γ";
+        assert_eq!(apply_diff(old2, new2), new2);
+    }
 
     /// The linear `inline_styles_by_line` bucketing must match the original
     /// per-line `styles_in_range` (tree styles only), including multi-line emphasis

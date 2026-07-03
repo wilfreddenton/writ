@@ -1182,6 +1182,12 @@ impl EditorState {
     }
 
     pub fn toggle_checkbox_for_test(&mut self, line_number: usize) {
+        // Capture pre-toggle state so the whole cascade (child + parent + all
+        // strikethrough edits) collapses to a single undo entry at the end.
+        let head_before = self.buffer.undo_head();
+        let cursor_before = self.cursor().offset;
+        let text_before = self.buffer.text();
+
         let (is_checked, checkbox_byte_start) = {
             if line_number >= self.buffer.line_count() {
                 return;
@@ -1244,6 +1250,10 @@ impl EditorState {
         // Propagate upward: if checking and all siblings are now checked, check parent
         // If unchecking, uncheck parent if it was checked
         self.propagate_checkbox_up(checkbox_byte_start, new_checked, &mut cursor_pos);
+
+        let text_after = self.buffer.text();
+        self.buffer
+            .coalesce_since(head_before, &text_before, &text_after, cursor_before, cursor_pos);
 
         self.selection = Selection::new(cursor_pos, cursor_pos);
     }
@@ -2458,6 +2468,68 @@ mod tests {
             assert!(text.contains("[ ] parent"), "parent should stay unchecked");
             assert!(text.contains("[x] ~~child1~~"), "child1 should be checked");
             assert!(text.contains("[ ] child2"), "child2 should stay unchecked");
+        }
+    }
+
+    mod checkbox_undo_tests {
+        use super::*;
+
+        #[test]
+        fn single_undo_reverts_cascade_to_children_and_parent() {
+            // Checking child2 checks child2 AND auto-checks the parent — a cascade
+            // spanning multiple lines. One undo must revert the entire toggle.
+            let before = trim_raw("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] child2\n");
+            let mut state = editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
+            state.toggle_checkbox_for_test(2);
+            assert!(state.text().contains("[x] ~~parent~~"), "parent auto-checked");
+            assert!(state.text().contains("[x] ~~child2~~"), "child2 checked");
+
+            state.buffer.undo();
+            assert_eq!(state.text(), before, "one undo reverts the whole cascade");
+            assert!(!state.buffer.can_undo(), "toggle was a single undo entry");
+        }
+
+        #[test]
+        fn redo_reapplies_full_cascade() {
+            let mut state = editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
+            state.toggle_checkbox_for_test(2);
+            let after = state.text();
+
+            state.buffer.undo();
+            state.buffer.redo();
+            assert_eq!(state.text(), after, "one redo re-applies the whole cascade");
+        }
+
+        #[test]
+        fn toggle_leaf_box_text_and_single_entry() {
+            let mut state = editor_with_cursor("- [ ] |task\n");
+            state.toggle_checkbox_for_test(0);
+            assert_eq!(state.text(), "- [x] ~~task~~\n");
+            state.buffer.undo();
+            assert_eq!(state.text(), "- [ ] task\n");
+            assert!(!state.buffer.can_undo(), "leaf toggle is one undo entry");
+        }
+
+        #[test]
+        fn toggle_parent_all_children_text() {
+            let mut state = editor_with_cursor("- [ ] |parent\n  - [ ] child1\n  - [ ] child2\n");
+            state.toggle_checkbox_for_test(0);
+            assert_eq!(
+                state.text(),
+                "- [x] ~~parent~~\n  - [x] ~~child1~~\n  - [x] ~~child2~~\n"
+            );
+        }
+
+        #[test]
+        fn uncheck_cascades_to_parent_text() {
+            let mut state = editor_with_cursor(
+                "- [x] ~~parent~~\n  - [x] ~~|child1~~\n  - [x] ~~child2~~\n",
+            );
+            state.toggle_checkbox_for_test(1);
+            assert_eq!(
+                state.text(),
+                "- [ ] parent\n  - [ ] child1\n  - [x] ~~child2~~\n"
+            );
         }
     }
 
