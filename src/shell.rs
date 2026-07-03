@@ -1061,6 +1061,14 @@ impl ApplicationHandler<WritEvent> for App {
                     .as_ref()
                     .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
                 {
+                    // Clicking a checkbox toggles it (leaving the caret where it was)
+                    // rather than placing the caret in the box.
+                    if let Some(line) = self.doc_engine.editor.checkbox_at(off) {
+                        self.doc_engine.editor.toggle_checkbox(line);
+                        self.doc_engine.refresh(w, state.scale, vh);
+                        state.window.request_redraw();
+                        return;
+                    }
                     self.doc_engine
                         .editor
                         .click(off, self.modifiers.shift_key(), 1);
@@ -1176,6 +1184,7 @@ impl ApplicationHandler<WritEvent> for App {
                     // then selection.
                     doc.draw_added_backgrounds(&mut self.scene, editor_h);
                     doc.draw_blockquote_gutters(&mut self.scene, editor_h);
+                    doc.draw_horizontal_rules(&mut self.scene, editor_h);
                     if let Some(sel) = self.doc_engine.editor.selection_range() {
                         let color = peniko_color(self.doc_engine.theme.selection);
                         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
@@ -1545,6 +1554,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
     doc.draw_added_backgrounds(&mut scene, editor_h);
     doc.draw_blockquote_gutters(&mut scene, editor_h);
+    doc.draw_horizontal_rules(&mut scene, editor_h);
     if let Some(sel) = de.editor.selection_range() {
         let color = peniko_color(de.theme.selection);
         for (x0, y0, x1, y1) in doc.selection_rects(sel) {

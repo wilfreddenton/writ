@@ -411,6 +411,7 @@ impl DocLayout {
             map: SegmentMap::identity("", 0).1,
             content_start: 0,
             quote_bar_bytes: Vec::new(),
+            is_hr: false,
         });
         let mut measured_y = pad_top * scale; // tops-space y consumed by materialized lines
         let mut estimating = false;
@@ -816,6 +817,28 @@ impl DocLayout {
         }
     }
 
+    /// Paint thematic breaks (`---`) as a horizontal rule across the content width,
+    /// centered in the line (whose `---` text is hidden). Call BEFORE `draw`.
+    pub fn draw_horizontal_rules(&self, scene: &mut Scene, viewport_h: f32) {
+        let (first, last) = self.visible_range(viewport_h);
+        for i in first..last {
+            if !self.renders[i].is_hr {
+                continue;
+            }
+            let mid = (self.real_top(i) + self.tops[i + 1]) / 2.0 - self.scroll_y;
+            let h = self.quote_bar_width as f64;
+            let x0 = self.pad_x as f64;
+            let x1 = (self.width - self.pad_x) as f64;
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                self.quote_bar_color,
+                None,
+                &Rect::new(x0, mid as f64 - h / 2.0, x1, mid as f64 + h / 2.0),
+            );
+        }
+    }
+
     /// Paint inline-diff backgrounds for added lines (faint full-row bg + stronger
     /// word-change bg). Call BEFORE `draw` so glyphs sit on top.
     pub fn draw_added_backgrounds(&self, scene: &mut Scene, viewport_h: f32) {
@@ -893,6 +916,7 @@ mod tests {
                         map: SegmentMap::identity("", 0).1,
                         content_start: 0,
                         quote_bar_bytes: Vec::new(),
+                        is_hr: false,
                     })
                 })
                 .collect(),

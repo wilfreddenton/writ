@@ -26,6 +26,7 @@ use crate::inline::{
     GitHubContext, GitHubRef, NakedUrl, RawGitHubMatch, detect_github_references_in_line,
     detect_naked_urls,
 };
+use crate::marker::MarkerKind;
 
 /// The kind of autocomplete triggered at the cursor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -249,6 +250,18 @@ impl Editor {
     pub fn toggle_checkbox(&mut self, line_number: usize) {
         self.state.toggle_checkbox_for_test(line_number);
         self.recompute_diff();
+    }
+
+    /// If buffer `offset` lands on a checkbox marker (`[ ]`/`[x]`), the line to toggle.
+    /// Lets a click on the box flip it instead of just placing the caret.
+    pub fn checkbox_at(&self, offset: usize) -> Option<usize> {
+        let line = self.state.buffer.byte_to_line(offset);
+        let markers = self.state.buffer.line_markers(line);
+        markers
+            .markers
+            .iter()
+            .any(|m| matches!(m.kind, MarkerKind::Checkbox { .. }) && m.range.contains(&offset))
+            .then_some(line)
     }
 
     pub fn undo(&mut self) {
@@ -811,6 +824,21 @@ mod tests {
             status: IssueStatus::Open,
             title: title.into(),
         }
+    }
+
+    #[test]
+    fn checkbox_at_detects_box_not_content() {
+        let editor = Editor::new("- [ ] task\n");
+        let text = editor.text();
+        // A hit anywhere on `[ ]` toggles line 0.
+        let box_off = text.find('[').unwrap();
+        assert_eq!(editor.checkbox_at(box_off), Some(0));
+        assert_eq!(editor.checkbox_at(box_off + 1), Some(0));
+        // A hit on the content is not a checkbox click.
+        assert_eq!(editor.checkbox_at(text.find("task").unwrap()), None);
+        // A non-checkbox line has no box.
+        let plain = Editor::new("just a paragraph\n");
+        assert_eq!(plain.checkbox_at(3), None);
     }
 
     #[test]

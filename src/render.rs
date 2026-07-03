@@ -42,6 +42,9 @@ pub struct LineRender {
     /// per nesting level. The draw path measures each to an x and paints a continuous
     /// vertical rule there, so the quote bar spans wrapped rows and adjacent lines.
     pub quote_bar_bytes: Vec<usize>,
+    /// This line is a thematic break rendered as a horizontal rule (its `---` text is
+    /// hidden). False while the cursor is on the line, so the `---` is editable.
+    pub is_hr: bool,
 }
 
 /// Font-size multiplier for a heading level (1 = largest). 0 = body text.
@@ -138,7 +141,9 @@ pub fn build_line_render(
         .collect();
 
     // Collect the buffer ranges hidden or collapsed on the way to the display.
-    // Code blocks and thematic breaks show their markers verbatim.
+    // Code blocks show their markers verbatim; thematic breaks hide their `---` and
+    // render as a drawn rule (unless the cursor is on the line, for editing).
+    let is_hr = markers.is_thematic_break() && !cursor_on_line && !in_code_block;
     let mut specials: Vec<Special> = Vec::new();
     if !in_code_block {
         // Heading `# ` prefix hides when the cursor is elsewhere.
@@ -148,6 +153,10 @@ pub fn build_line_render(
             && mr.end <= line_end
         {
             specials.push(Special::Hidden(mr));
+        }
+        // Thematic break: hide the `---` text; the draw path paints a horizontal rule.
+        if is_hr && line_end > line_start {
+            specials.push(Special::Hidden(line_start..line_end));
         }
         // Prefix markers render as bullets / blockquote gutters (always on — they're
         // structural), substituting `- `→`• `, `> `→`  ` (the blockquote bar is painted
@@ -289,6 +298,7 @@ pub fn build_line_render(
         map,
         content_start,
         quote_bar_bytes,
+        is_hr,
     }
 }
 
@@ -342,6 +352,28 @@ mod tests {
         let theme = EditorTheme::dracula();
         let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &[], &[]);
         assert!(!lr.runs.iter().any(|r| r.underline));
+    }
+
+    /// A thematic break hides its `---` and flags `is_hr` for the drawn rule — but
+    /// reveals the text (no rule) while the cursor is on the line, for editing.
+    #[test]
+    fn thematic_break_hides_text_and_flags_rule() {
+        let theme = EditorTheme::dracula();
+        // Blank lines around `---` so it parses as a thematic break, not a setext
+        // heading underline (`a\n---` would make "a" an H2). The break is line 2.
+        let mut buffer: Buffer = "a\n\n---\n\nb\n".parse().unwrap();
+        let snap = buffer.render_snapshot();
+
+        // Cursor off the `---` line: text hidden, rule flagged.
+        let lr = build_line_render(&snap, 2, &theme, 18.0, 0, &[], &[]);
+        assert!(lr.is_hr, "off-line thematic break renders as a rule");
+        assert!(lr.text.is_empty(), "the `---` text is hidden");
+
+        // Cursor on the `---` line: text revealed, no rule.
+        let on = snap.line_markers(2).range.start;
+        let lr = build_line_render(&snap, 2, &theme, 18.0, on, &[], &[]);
+        assert!(!lr.is_hr, "revealed for editing when cursor is on it");
+        assert_eq!(lr.text, "---");
     }
 
     /// The blockquote bar is no longer a `▎` glyph in the text — the marker collapses
