@@ -250,6 +250,34 @@ impl Editor {
         }
     }
 
+    pub fn select_all(&mut self) {
+        self.state.selection = Selection::select_all(&self.state.buffer);
+    }
+
+    pub fn cursor_in_code_block(&self) -> bool {
+        self.state.cursor_in_code_block()
+    }
+
+    /// Smart space (suppressed at line/blockquote-content start; literal in code blocks).
+    /// Returns false if the space was suppressed so the caller can decide the fallback.
+    pub fn try_insert_space(&mut self) -> bool {
+        let handled = self.state.try_insert_space();
+        self.recompute_diff();
+        handled
+    }
+
+    /// After typing `>`, auto-insert the trailing space of a blockquote marker.
+    pub fn maybe_complete_blockquote_marker(&mut self) {
+        self.state.maybe_complete_blockquote_marker();
+        self.recompute_diff();
+    }
+
+    /// After typing the third ``` `/`~`, auto-insert the closing fence.
+    pub fn maybe_complete_code_fence(&mut self) {
+        self.state.maybe_complete_code_fence();
+        self.recompute_diff();
+    }
+
     pub fn click(&mut self, buffer_offset: usize, shift_held: bool, click_count: usize) {
         self.state
             .handle_click(buffer_offset, shift_held, click_count);
@@ -796,6 +824,51 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The input behaviors restored from the gpui `on_key_down` (Home/End/doc-boundary
+    /// movement, select-all, smart space, blockquote/fence auto-completion) — wired
+    /// through `Editor`, so a future shell refactor can't silently drop them again.
+    #[test]
+    fn restored_editor_input_behaviors() {
+        // Home/End = line boundary; Ctrl variants = doc boundary; Shift extends.
+        let mut e = Editor::new("hello\nworld two\n");
+        e.set_cursor(3);
+        e.move_in_direction(Direction::LineEnd, false);
+        assert_eq!(e.cursor_position(), 5, "End → end of line");
+        e.move_in_direction(Direction::LineStart, false);
+        assert_eq!(e.cursor_position(), 0, "Home → line start");
+        e.move_in_direction(Direction::DocEnd, false);
+        assert_eq!(e.cursor_position(), e.len(), "Ctrl+End → doc end");
+        e.move_in_direction(Direction::DocStart, true);
+        assert_eq!(e.selection_range(), Some(0..e.len()), "Shift+Ctrl+Home extends");
+
+        e.select_all();
+        assert_eq!(e.selection_range(), Some(0..e.len()), "Ctrl+A selects all");
+
+        // Smart space: suppressed at line start, inserted mid-line.
+        let mut e = Editor::new("hello\n");
+        e.set_cursor(0);
+        assert!(!e.try_insert_space(), "space suppressed at line start");
+        assert_eq!(e.text(), "hello\n");
+        e.set_cursor(3);
+        assert!(e.try_insert_space(), "space inserted mid-line");
+        assert_eq!(e.text(), "hel lo\n");
+
+        // Blockquote marker auto-spaces after `>`.
+        let mut e = Editor::new("");
+        e.insert_str(">");
+        e.maybe_complete_blockquote_marker();
+        assert_eq!(e.text(), "> ", "`>` completes to `> `");
+
+        // Code fence auto-closes after the third backtick.
+        let mut e = Editor::new("");
+        for _ in 0..3 {
+            e.insert_str("`");
+            e.maybe_complete_code_fence();
+        }
+        assert_eq!(e.text(), "```\n```", "triple backtick auto-closes the fence");
+        assert!(e.cursor_in_code_block(), "cursor sits inside the new code block");
+    }
 
     /// Phase 2 DoD: a headless editor opens a doc, applies edits, toggles a
     /// checkbox, detects a GitHub ref, and computes diff state — no gpui.

@@ -79,6 +79,10 @@ impl EditorState {
             Direction::Right => c.move_right(&self.buffer),
             Direction::Up => c.move_up(&self.buffer),
             Direction::Down => c.move_down(&self.buffer),
+            Direction::LineStart => c.move_to_line_start(&self.buffer),
+            Direction::LineEnd => c.move_to_line_end(&self.buffer),
+            Direction::DocStart => Cursor::start(),
+            Direction::DocEnd => Cursor::end(&self.buffer),
         }
     }
 
@@ -145,7 +149,7 @@ impl EditorState {
 
     /// Check if the cursor is inside a code block (between opening and closing fences,
     /// or after an opening fence with no closing fence yet).
-    fn cursor_in_code_block(&self) -> bool {
+    pub fn cursor_in_code_block(&self) -> bool {
         let Some(tree) = self.buffer.tree() else {
             return false;
         };

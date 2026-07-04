@@ -7,4 +7,10 @@ pub enum Direction {
     Right,
     Up,
     Down,
+    /// Start / end of the current line (Home / End).
+    LineStart,
+    LineEnd,
+    /// Start / end of the document (Ctrl+Home / Ctrl+End).
+    DocStart,
+    DocEnd,
 }

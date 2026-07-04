@@ -447,6 +447,9 @@ fn spawn_ref_validations(
 
 /// Translate a key press into an editor edit/move. Returns true if the editor
 /// changed (so the caller rebuilds + reveals the cursor).
+/// Lines the cursor jumps per PageUp/PageDown (fixed; viewport-aware is a refinement).
+const PAGE_LINES: usize = 20;
+
 fn apply_key(
     editor: &mut Editor,
     modifiers: ModifiersState,
@@ -475,7 +478,10 @@ fn apply_key(
             true
         }
         Key::Named(NamedKey::Tab) => {
-            if shift {
+            // In a code block Tab indents (4 spaces) instead of cycling list nesting.
+            if !shift && editor.cursor_in_code_block() {
+                editor.insert_str("    ");
+            } else if shift {
                 editor.shift_tab();
             } else {
                 editor.tab();
@@ -483,7 +489,10 @@ fn apply_key(
             true
         }
         Key::Named(NamedKey::Space) => {
-            editor.insert_str(" ");
+            // Smart space: suppressed at line/blockquote-content start.
+            if !editor.try_insert_space() {
+                editor.insert_str(" ");
+            }
             true
         }
         Key::Named(NamedKey::ArrowLeft) => {
@@ -500,6 +509,30 @@ fn apply_key(
         }
         Key::Named(NamedKey::ArrowDown) => {
             editor.move_in_direction(Direction::Down, shift);
+            true
+        }
+        // Home/End: line boundary, or document boundary with Ctrl/Super; Shift extends.
+        Key::Named(NamedKey::Home) => {
+            let dir = if ctrl { Direction::DocStart } else { Direction::LineStart };
+            editor.move_in_direction(dir, shift);
+            true
+        }
+        Key::Named(NamedKey::End) => {
+            let dir = if ctrl { Direction::DocEnd } else { Direction::LineEnd };
+            editor.move_in_direction(dir, shift);
+            true
+        }
+        // Page up/down: a fixed page of lines (viewport-aware sizing is a later refinement).
+        Key::Named(NamedKey::PageUp) => {
+            for _ in 0..PAGE_LINES {
+                editor.move_in_direction(Direction::Up, shift);
+            }
+            true
+        }
+        Key::Named(NamedKey::PageDown) => {
+            for _ in 0..PAGE_LINES {
+                editor.move_in_direction(Direction::Down, shift);
+            }
             true
         }
         _ => {
@@ -527,6 +560,10 @@ fn apply_key(
                         editor.redo();
                         return true;
                     }
+                    if c.eq_ignore_ascii_case("a") {
+                        editor.select_all();
+                        return true;
+                    }
                 }
                 return false;
             }
@@ -536,6 +573,13 @@ fn apply_key(
                 && !text.chars().any(|c| c.is_control())
             {
                 editor.insert_str(text);
+                // Auto-complete markdown structure just typed: `> `→blockquote space,
+                // ` ``` `/`~~~`→closing fence.
+                match text.as_str() {
+                    ">" => editor.maybe_complete_blockquote_marker(),
+                    "`" | "~" => editor.maybe_complete_code_fence(),
+                    _ => {}
+                }
                 return true;
             }
             false
