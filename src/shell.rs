@@ -450,6 +450,11 @@ fn spawn_ref_validations(
 /// Lines the cursor jumps per PageUp/PageDown (fixed; viewport-aware is a refinement).
 const PAGE_LINES: usize = 20;
 
+/// Extra lines above/below the viewport that ref/URL detection covers — generous so it
+/// spans every line the layout materializes and draws (viewport + measure overscan),
+/// keeping scrolled-in refs colored while bounding the per-keystroke scan.
+const DETECT_OVERSCAN_LINES: usize = 200;
+
 fn apply_key(
     editor: &mut Editor,
     modifiers: ModifiersState,
@@ -594,9 +599,26 @@ impl DocEngine {
     ///
     /// A method on `DocEngine` (not `App`) so it borrows only the doc-engine fields,
     /// leaving the caller's `&self.state` (GPU surface) borrow disjoint and intact.
+    /// Line window to run GitHub-ref / URL detection over: the visible range widened by
+    /// overscan (covering the lines the rebuild materializes + draws) and always
+    /// including the cursor line. Whole buffer until the first layout exists. Scoping it
+    /// keeps per-keystroke detection bounded instead of O(total lines) on large docs.
+    fn detection_range(&self, editor_h: f32) -> Range<usize> {
+        let n = self.editor.state.buffer.line_count();
+        let cursor_line = self.editor.line_of(self.editor.cursor_position());
+        match &self.doc {
+            Some(d) => {
+                let (first, last) = d.visible_range(editor_h);
+                let lo = first.saturating_sub(DETECT_OVERSCAN_LINES).min(cursor_line);
+                let hi = (last + DETECT_OVERSCAN_LINES).max(cursor_line + 1).min(n);
+                lo..hi
+            }
+            None => 0..n,
+        }
+    }
+
     fn refresh(&mut self, device_width: f32, scale: f32, editor_h: f32) {
-        // Whole-buffer scan; cheap enough for now.
-        self.editor.refresh_detection();
+        self.editor.refresh_detection(self.detection_range(editor_h));
         let prev_scroll = self.doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
         let mut new_doc = self.rebuild(device_width, scale, prev_scroll + editor_h);
         new_doc.scroll_y = prev_scroll;
@@ -604,10 +626,12 @@ impl DocEngine {
         self.doc = Some(new_doc);
     }
 
-    /// Rebuild preserving the current scroll (no cursor reveal, no re-detection): the
-    /// freshly-validated-refs recolor and wheel-remeasure paths, where the viewport
-    /// must not jump.
+    /// Rebuild preserving the current scroll (no cursor reveal): the freshly-validated-
+    /// refs recolor and wheel-remeasure paths, where the viewport must not jump. Re-runs
+    /// detection over the (possibly scrolled) viewport — gated, so a same-window recolor
+    /// wakeup doesn't rescan, but scrolling into new lines detects their refs.
     fn rebuild_preserving_scroll(&mut self, device_width: f32, scale: f32, editor_h: f32) {
+        self.editor.refresh_detection(self.detection_range(editor_h));
         let prev_scroll = self.doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
         let mut new_doc = self.rebuild(device_width, scale, prev_scroll + editor_h);
         new_doc.scroll_y = prev_scroll;
@@ -1935,7 +1959,7 @@ fn load_editor_from_cli() -> Editor {
     }
     // Populate github_refs_by_line / naked_urls_by_line so the first frame can color
     // (and the shell can spawn validation for) any refs already in the file.
-    editor.refresh_detection();
+    editor.refresh_detection(0..usize::MAX);
 
     if let Err(e) = editor.watch_file() {
         eprintln!("[writ] file watch failed: {e}");
@@ -2062,7 +2086,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
             editor.set_github_context(ctx);
         }
         editor.set_github_client(GitHubClient::new(token));
-        editor.refresh_detection();
+        editor.refresh_detection(0..usize::MAX);
         validate_all_blocking(&mut editor);
         // WRIT_SHELL_AUTOCOMPLETE opens the popup at the caret (WRIT_SHELL_CURSOR).
         if std::env::var("WRIT_SHELL_AUTOCOMPLETE").is_ok() {

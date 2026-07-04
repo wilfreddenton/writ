@@ -82,10 +82,10 @@ pub struct Editor {
     github_validation_cache: GitHubValidationCache,
     naked_urls_by_line: HashMap<usize, Vec<NakedUrl>>,
     github_refs_by_line: HashMap<usize, Vec<RawGitHubMatch>>,
-    /// Buffer version the cached detection reflects; lets `refresh_detection` skip
-    /// the whole-buffer rescan on cursor-only rebuilds (drag/click), where the text
-    /// is unchanged. Reset when the GitHub context changes so a rescan is forced.
-    detection_version: Option<u64>,
+    /// (buffer version, scanned line range) the cached detection reflects; lets
+    /// `refresh_detection` skip the rescan when neither the text nor the scanned window
+    /// changed (cursor-only rebuilds). Reset when the GitHub context changes.
+    detection_key: Option<(u64, Range<usize>)>,
     /// Active `#`/`@` autocomplete popup, if the cursor is inside a trigger token.
     autocomplete: Option<AutocompleteState>,
 
@@ -112,7 +112,7 @@ impl Editor {
             github_validation_cache: GitHubValidationCache::new(),
             naked_urls_by_line: HashMap::new(),
             github_refs_by_line: HashMap::new(),
-            detection_version: None,
+            detection_key: None,
             autocomplete: None,
             head_base: None,
             diff_state: None,
@@ -336,7 +336,7 @@ impl Editor {
 
     pub fn set_github_context(&mut self, context: GitHubContext) {
         self.github_context = Some(context);
-        self.detection_version = None; // force the next refresh_detection to rescan
+        self.detection_key = None; // force the next refresh_detection to rescan
     }
 
     pub fn set_github_client(&mut self, client: GitHubClient) {
@@ -456,19 +456,23 @@ impl Editor {
         (github_matches_by_line, urls_by_line)
     }
 
-    /// Re-run detection across the whole buffer and cache the results. Skips the
-    /// rescan when the buffer is unchanged since the last detection (cursor-only
-    /// rebuilds), which is the common case on the click/drag/arrow-key hot path.
-    pub fn refresh_detection(&mut self) {
+    /// Re-run GitHub-ref / naked-URL detection over `lines` (clamped to the buffer) and
+    /// cache the results. The caller passes the viewport (plus overscan + cursor line);
+    /// every consumer — visible-line coloring, cursor-line autocomplete, and
+    /// `detected_refs_in_lines` validation — is viewport/cursor-scoped, so a whole-buffer
+    /// scan is unnecessary and would be O(total lines) per keystroke on large docs.
+    /// Skips the rescan when neither the buffer version nor the window changed.
+    pub fn refresh_detection(&mut self, lines: Range<usize>) {
         let version = self.state.buffer.version();
-        if self.detection_version == Some(version) {
+        let n = self.state.buffer.line_count();
+        let lines = lines.start.min(n)..lines.end.min(n);
+        if self.detection_key.as_ref() == Some(&(version, lines.clone())) {
             return;
         }
-        let line_count = self.state.buffer.line_count();
-        let (refs, urls) = self.detect_links(0, line_count);
+        let (refs, urls) = self.detect_links(lines.start, lines.end);
         self.github_refs_by_line = refs;
         self.naked_urls_by_line = urls;
-        self.detection_version = Some(version);
+        self.detection_key = Some((version, lines));
     }
 
     // --- GitHub autocomplete (#/@) ------------------------------------------
@@ -897,7 +901,7 @@ mod tests {
             owner: "wilfreddenton".into(),
             repo: "writ".into(),
         });
-        editor.refresh_detection();
+        editor.refresh_detection(0..usize::MAX);
         assert!(
             editor.github_refs_by_line().contains_key(&0),
             "should detect #123 on line 0"
@@ -952,7 +956,7 @@ mod tests {
         let mut editor = Editor::new("Working on #12\n");
         editor.set_github_context(ctx());
         editor.set_github_client(GitHubClient::new("dummy".into()));
-        editor.refresh_detection();
+        editor.refresh_detection(0..usize::MAX);
         editor.set_cursor(14); // end of "#12"
 
         // Cursor inside the detected issue ref opens Issue autocomplete for "12".
@@ -978,7 +982,7 @@ mod tests {
         let mut editor = Editor::new("See #1 here\n\n\nAnd #2 there\n");
         editor.set_github_context(ctx());
         editor.set_github_client(GitHubClient::new("dummy".into()));
-        editor.refresh_detection();
+        editor.refresh_detection(0..usize::MAX);
 
         let numbers = |refs: Vec<GitHubRef>| {
             refs.iter()
@@ -1007,7 +1011,7 @@ mod tests {
         let mut editor = Editor::new("cc @tor\n");
         editor.set_github_context(ctx());
         editor.set_github_client(GitHubClient::new("dummy".into()));
-        editor.refresh_detection();
+        editor.refresh_detection(0..usize::MAX);
         editor.set_cursor(7); // end of "@tor"
 
         assert!(editor.update_autocomplete_from_cursor());
