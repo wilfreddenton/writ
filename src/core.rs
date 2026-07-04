@@ -74,6 +74,9 @@ pub struct Editor {
     pub state: EditorState,
     file_path: Option<PathBuf>,
     input_blocked: bool,
+    /// When set (via `--autosave`, used by the GhostText daemon), every buffer edit
+    /// writes back to `file_path` so an external watcher sees the change immediately.
+    autosave: bool,
 
     // --- GitHub autolink detection ---
     github_context: Option<GitHubContext>,
@@ -108,6 +111,7 @@ impl Editor {
             state: EditorState::new(content),
             file_path: None,
             input_blocked: false,
+            autosave: false,
             github_context: None,
             github_client: None,
             github_validation_cache: GitHubValidationCache::new(),
@@ -191,6 +195,21 @@ impl Editor {
         self.input_blocked = blocked;
     }
 
+    pub fn set_autosave(&mut self, autosave: bool) {
+        self.autosave = autosave;
+    }
+
+    /// Write the buffer back to disk after an edit when autosave is on (GhostText).
+    /// Guarded by `is_dirty` so a no-op "edit" doesn't churn the file.
+    fn maybe_autosave(&mut self) {
+        if self.autosave
+            && self.state.buffer.is_dirty()
+            && let Err(e) = self.save()
+        {
+            eprintln!("[writ] autosave failed: {e}");
+        }
+    }
+
     pub fn input_blocked(&self) -> bool {
         self.input_blocked
     }
@@ -203,6 +222,7 @@ impl Editor {
     fn edit<R>(&mut self, f: impl FnOnce(&mut EditorState) -> R) -> R {
         let result = f(&mut self.state);
         self.recompute_diff();
+        self.maybe_autosave();
         result
     }
 
@@ -313,6 +333,7 @@ impl Editor {
         if let Some(cursor_pos) = self.state.buffer.undo() {
             self.state.selection = Selection::new(cursor_pos, cursor_pos);
             self.recompute_diff();
+            self.maybe_autosave();
         }
     }
 
@@ -320,6 +341,7 @@ impl Editor {
         if let Some(cursor_pos) = self.state.buffer.redo() {
             self.state.selection = Selection::new(cursor_pos, cursor_pos);
             self.recompute_diff();
+            self.maybe_autosave();
         }
     }
 
@@ -836,6 +858,31 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Autosave (used by the GhostText daemon via `--autosave`) writes every edit back to
+    /// the file with no explicit save — the daemon relays that to the browser.
+    #[test]
+    fn autosave_writes_on_every_edit() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("writ_autosave_test_{}.md", std::process::id()));
+        std::fs::write(&path, "start\n").unwrap();
+
+        let mut e = Editor::open(&path);
+        e.set_autosave(true);
+        e.set_cursor(e.len());
+        e.insert_str("X");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "start\nX");
+
+        e.backspace();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "start\n");
+
+        // Without autosave, edits stay in memory only.
+        e.set_autosave(false);
+        e.insert_str("Y");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "start\n");
+
+        std::fs::remove_file(&path).ok();
+    }
 
     /// The input behaviors restored from the gpui `on_key_down` (Home/End/doc-boundary
     /// movement, select-all, smart space, blockquote/fence auto-completion) — wired

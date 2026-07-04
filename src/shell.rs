@@ -1593,6 +1593,7 @@ fn load_editor_from_cli() -> Editor {
     };
 
     let mut editor = Editor::open(&path);
+    editor.set_autosave(config.autosave);
 
     // GitHub context for ref detection: explicit --github-repo, else auto-detect.
     let context = config
