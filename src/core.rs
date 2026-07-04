@@ -197,9 +197,17 @@ impl Editor {
 
     // --- edit operations (delegate to the pure engine, then sync diff) ------
 
-    pub fn insert_str(&mut self, text: &str) {
-        self.state.insert_text(text);
+    /// Single choke point for buffer-mutating engine ops: run `f`, then resync the inline
+    /// diff so a new mutator can't silently skip the refresh. Cursor-only ops that don't
+    /// touch the buffer (click/drag/move/select_all) deliberately bypass this.
+    fn edit<R>(&mut self, f: impl FnOnce(&mut EditorState) -> R) -> R {
+        let result = f(&mut self.state);
         self.recompute_diff();
+        result
+    }
+
+    pub fn insert_str(&mut self, text: &str) {
+        self.edit(|s| s.insert_text(text));
     }
 
     /// Insert clipboard text with context-aware paste normalization (CRLF→LF,
@@ -207,8 +215,7 @@ impl Editor {
     pub fn paste(&mut self, text: &str) {
         let ctx = PasteContext::from_buffer(&self.state.buffer, self.cursor_position());
         let transformed = transform_paste(text, &ctx);
-        self.state.insert_text(&transformed);
-        self.recompute_diff();
+        self.edit(|s| s.insert_text(&transformed));
     }
 
     pub fn type_char(&mut self, c: char) {
@@ -217,38 +224,31 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) {
-        self.state.delete_backward();
-        self.recompute_diff();
+        self.edit(|s| s.delete_backward());
     }
 
     pub fn delete_forward(&mut self) {
-        self.state.delete_forward();
-        self.recompute_diff();
+        self.edit(|s| s.delete_forward());
     }
 
     pub fn enter(&mut self) {
-        self.state.enter();
-        self.recompute_diff();
+        self.edit(|s| s.enter());
     }
 
     pub fn shift_enter(&mut self) {
-        self.state.shift_enter();
-        self.recompute_diff();
+        self.edit(|s| s.shift_enter());
     }
 
     pub fn shift_alt_enter(&mut self) {
-        self.state.shift_alt_enter();
-        self.recompute_diff();
+        self.edit(|s| s.shift_alt_enter());
     }
 
     pub fn tab(&mut self) {
-        self.state.tab();
-        self.recompute_diff();
+        self.edit(|s| s.tab());
     }
 
     pub fn shift_tab(&mut self) {
-        self.state.shift_tab();
-        self.recompute_diff();
+        self.edit(|s| s.shift_tab());
     }
 
     pub fn move_in_direction(&mut self, direction: Direction, extend: bool) {
@@ -271,21 +271,17 @@ impl Editor {
     /// Smart space (suppressed at line/blockquote-content start; literal in code blocks).
     /// Returns false if the space was suppressed so the caller can decide the fallback.
     pub fn try_insert_space(&mut self) -> bool {
-        let handled = self.state.try_insert_space();
-        self.recompute_diff();
-        handled
+        self.edit(|s| s.try_insert_space())
     }
 
     /// After typing `>`, auto-insert the trailing space of a blockquote marker.
     pub fn maybe_complete_blockquote_marker(&mut self) {
-        self.state.maybe_complete_blockquote_marker();
-        self.recompute_diff();
+        self.edit(|s| s.maybe_complete_blockquote_marker());
     }
 
     /// After typing the third ``` `/`~`, auto-insert the closing fence.
     pub fn maybe_complete_code_fence(&mut self) {
-        self.state.maybe_complete_code_fence();
-        self.recompute_diff();
+        self.edit(|s| s.maybe_complete_code_fence());
     }
 
     pub fn click(&mut self, buffer_offset: usize, shift_held: bool, click_count: usize) {
@@ -298,8 +294,7 @@ impl Editor {
     }
 
     pub fn toggle_checkbox(&mut self, line_number: usize) {
-        self.state.toggle_checkbox_for_test(line_number);
-        self.recompute_diff();
+        self.edit(|s| s.toggle_checkbox_for_test(line_number));
     }
 
     /// If buffer `offset` lands on a checkbox marker (`[ ]`/`[x]`), the line to toggle.
