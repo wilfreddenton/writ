@@ -53,6 +53,9 @@ pub struct LineRender {
     /// This line is a thematic break rendered as a horizontal rule (its `---` text is
     /// hidden). False while the cursor is on the line, so the `---` is editable.
     pub is_hr: bool,
+    /// Display byte ranges of inline `code` spans, for painting a subtle background
+    /// chip behind them (they'd otherwise be indistinguishable in a monospace body).
+    pub code_ranges: Vec<Range<usize>>,
     /// This line is a standalone image (`![alt](url)` as the whole paragraph): its
     /// markdown text is hidden and an image block is drawn instead. `None` while the
     /// cursor is on the line, so the raw markdown is revealed for editing.
@@ -286,6 +289,7 @@ pub fn build_line_render(
 
     let fg = peniko_color(theme.foreground);
     let mut runs = Vec::new();
+    let mut code_ranges: Vec<Range<usize>> = Vec::new();
 
     if in_code_block {
         // Monospace everywhere, tree-sitter capture colors on top.
@@ -342,6 +346,10 @@ pub fn build_line_render(
                 None if style.code => peniko_color(theme.green),
                 None => content_color, // dimmed on a completed task, else fg
             };
+            // Inline code (not a link/checkbox) gets a background chip behind its span.
+            if style.code && region.checkbox.is_none() && region.link_url.is_none() {
+                code_ranges.push(r.clone());
+            }
             let mut run = StyleRun::new(r, color);
             run.bold = style.bold || heading_level > 0 || region.checkbox == Some(true);
             run.italic = style.italic;
@@ -365,6 +373,7 @@ pub fn build_line_render(
         quote_bar_bytes,
         is_hr,
         image,
+        code_ranges,
     }
 }
 

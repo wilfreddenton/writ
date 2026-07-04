@@ -422,6 +422,8 @@ pub struct DocLayout {
     img_label_size: f32,
     image_border: Color,
     image_bg: Color,
+    /// Background chip painted behind inline `code` spans.
+    code_bg: Color,
     /// Per-line x-offsets (from the line origin) of each blockquote gutter rule, parallel
     /// to `layouts`. Empty for non-quote lines. Painted as continuous vertical rects.
     quote_bars: Vec<Vec<f32>>,
@@ -508,6 +510,7 @@ impl DocLayout {
             quote_bar_bytes: Vec::new(),
             is_hr: false,
             image: None,
+            code_ranges: Vec::new(),
         });
         let mut measured_y = pad_top * scale; // tops-space y consumed by materialized lines
         let mut estimating = false;
@@ -682,6 +685,7 @@ impl DocLayout {
             img_label_size: 14.0 * scale,
             image_border: peniko_color(theme.comment),
             image_bg: peniko_color_alpha(theme.comment, 0.08),
+            code_bg: peniko_color_alpha(theme.comment, 0.22),
             diff_colors,
             // A thin rule (~1/6 of a mono cell), floored so it stays visible when small.
             quote_bar_width: (k * 0.16).max(1.5),
@@ -926,6 +930,11 @@ impl DocLayout {
                 );
                 engine.draw_line(scene, &ghost.layout, (self.pad_x, gy));
                 gy += ghost.height;
+            }
+            // Background chips behind inline code, under the real line's glyphs.
+            let code = &self.renders[i].code_ranges;
+            if !code.is_empty() {
+                self.fill_word_ranges(scene, &self.layouts[i], code, gy as f64, self.code_bg);
             }
             // The real line, below its ghost block.
             engine.draw_line(scene, &self.layouts[i], (self.pad_x, gy));
@@ -1202,6 +1211,7 @@ mod tests {
                         quote_bar_bytes: Vec::new(),
                         is_hr: false,
                         image: None,
+                        code_ranges: Vec::new(),
                     })
                 })
                 .collect(),
@@ -1216,6 +1226,7 @@ mod tests {
             img_label_size: 14.0,
             image_border: Color::TRANSPARENT,
             image_bg: Color::TRANSPARENT,
+            code_bg: Color::TRANSPARENT,
             quote_bar_width: 2.0,
             quote_bar_color: Color::TRANSPARENT,
             measured_count: heights.len(),
