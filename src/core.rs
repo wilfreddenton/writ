@@ -388,24 +388,42 @@ impl Editor {
     /// a naked URL, or a markdown link target — whichever covers the offset.
     pub fn link_at(&mut self, offset: usize) -> Option<String> {
         let line = self.line_of(offset);
-        if let Some(refs) = self.github_refs_by_line.get(&line)
-            && let Some(m) = refs.iter().find(|m| m.byte_range.contains(&offset))
+        let raw = if let Some(m) = self
+            .github_refs_by_line
+            .get(&line)
+            .and_then(|refs| refs.iter().find(|m| m.byte_range.contains(&offset)))
         {
-            return Some(m.reference.url());
-        }
-        if let Some(urls) = self.naked_urls_by_line.get(&line)
-            && let Some(u) = urls.iter().find(|u| u.byte_range.contains(&offset))
+            m.reference.url()
+        } else if let Some(u) = self
+            .naked_urls_by_line
+            .get(&line)
+            .and_then(|urls| urls.iter().find(|u| u.byte_range.contains(&offset)))
         {
-            return Some(u.url.clone());
+            u.url.clone()
+        } else {
+            // Markdown link [text](url) / image: the region spans the whole link source.
+            self.state
+                .buffer
+                .render_snapshot()
+                .inline_styles_for_line(line)
+                .into_iter()
+                .find(|r| r.link_url.is_some() && r.full_range.contains(&offset))
+                .and_then(|r| r.link_url)?
+        };
+        Some(self.resolve_link_target(raw))
+    }
+
+    /// A web URL / absolute path opens as-is; a relative target (a markdown link or image
+    /// path) resolves against the document's directory — matching how images are loaded,
+    /// so Ctrl-clicking a relative link/image opens the right file, not one relative to cwd.
+    fn resolve_link_target(&self, url: String) -> String {
+        if url.contains("://") || url.starts_with("mailto:") || Path::new(&url).is_absolute() {
+            return url;
         }
-        // Markdown link [text](url): the styled region spans the whole link source.
-        self.state
-            .buffer
-            .render_snapshot()
-            .inline_styles_for_line(line)
-            .into_iter()
-            .find(|r| r.link_url.is_some() && r.full_range.contains(&offset))
-            .and_then(|r| r.link_url)
+        match self.file_path.as_ref().and_then(|p| p.parent()) {
+            Some(dir) => dir.join(&url).to_string_lossy().into_owned(),
+            None => url,
+        }
     }
 
     pub fn github_validation_cache(&self) -> &GitHubValidationCache {
@@ -962,6 +980,22 @@ mod tests {
         );
         // Plain text position → no link.
         assert_eq!(e.link_at(0), None);
+    }
+
+    /// Ctrl-click resolution: a relative link/image target resolves against the doc's
+    /// directory; web/absolute targets pass through unchanged.
+    #[test]
+    fn link_at_resolves_relative_against_doc_dir() {
+        let mut e = Editor::new("![img](assets/p.png) and [w](https://x.com)\n");
+        e.set_file_path(std::path::PathBuf::from("/home/u/notes/doc.md"));
+        let rel = e.text().find("assets").unwrap();
+        assert_eq!(
+            e.link_at(rel).as_deref(),
+            Some("/home/u/notes/assets/p.png"),
+            "relative image path resolves against the doc dir"
+        );
+        let web = e.text().find("x.com").unwrap();
+        assert_eq!(e.link_at(web).as_deref(), Some("https://x.com"), "web URL as-is");
     }
 
     /// The input behaviors restored from the gpui `on_key_down` (Home/End/doc-boundary
