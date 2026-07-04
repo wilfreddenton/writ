@@ -350,6 +350,23 @@ pub fn build_line_render(
             base.mono = true;
             runs.push(base);
         }
+        if markers.is_fence() {
+            // Fence line: the ```/~~~ delimiter reads as comment, the language/info
+            // string as green (matching the old gpui rendering). Overlays the base run.
+            let bytes = text.as_bytes();
+            if let Some(start) = bytes.iter().position(|&b| b == b'`' || b == b'~') {
+                let fc = bytes[start];
+                let end = start + bytes[start..].iter().take_while(|&&b| b == fc).count();
+                let mut delim = StyleRun::new(start..end, peniko_color(theme.comment));
+                delim.mono = true;
+                runs.push(delim);
+                if end < text.len() {
+                    let mut lang = StyleRun::new(end..text.len(), peniko_color(theme.green));
+                    lang.mono = true;
+                    runs.push(lang);
+                }
+            }
+        }
         for span in snapshot.code_highlights_for_line(line_idx) {
             let r = map.buffer_range_to_display(span.range.clone());
             if !r.is_empty() {
