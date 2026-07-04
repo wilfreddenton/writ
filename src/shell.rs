@@ -515,10 +515,9 @@ fn apply_key(
             true
         }
         Key::Named(NamedKey::Space) => {
-            // Smart space: suppressed at line/blockquote-content start.
-            if !editor.try_insert_space() {
-                editor.insert_str(" ");
-            }
+            // Smart space: try_insert_space suppresses the space at a line's
+            // start / blockquote-content start (returns false) — no fallback insert.
+            editor.try_insert_space();
             true
         }
         Key::Named(NamedKey::ArrowLeft) => {

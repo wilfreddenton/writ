@@ -832,6 +832,7 @@ mod tests {
     /// The input behaviors restored from the gpui `on_key_down` (Home/End/doc-boundary
     /// movement, select-all, smart space, blockquote/fence auto-completion) — wired
     /// through `Editor`, so a future shell refactor can't silently drop them again.
+
     #[test]
     fn restored_editor_input_behaviors() {
         // Home/End = line boundary; Ctrl variants = doc boundary; Shift extends.
@@ -872,6 +873,12 @@ mod tests {
         }
         assert_eq!(e.text(), "```\n```", "triple backtick auto-closes the fence");
         assert!(e.cursor_in_code_block(), "cursor sits inside the new code block");
+        // Tab inside a code block indents with spaces (mirrors the shell's Tab arm),
+        // never a stray fence character.
+        if e.cursor_in_code_block() {
+            e.insert_str("    ");
+        }
+        assert_eq!(e.text(), "```    \n```", "Tab in code block inserts 4 spaces");
     }
 
     /// Phase 2 DoD: a headless editor opens a doc, applies edits, toggles a
