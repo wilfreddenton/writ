@@ -120,36 +120,67 @@ fn build_status_info(editor: &Editor, doc: &DocLayout, editor_h: f32) -> StatusI
 }
 
 /// Sample document shown until the shell loads real files (Phase 4+ wires input).
-const SAMPLE_DOC: &str = "\
-# writ on Vello
+/// The `--demo` (and no-args) showcase document — exercises headings, emphasis,
+/// inline code, task lists, a colored code fence, a blockquote, and links.
+const DEMO_DOC: &str = r##"# writ — a live Markdown diff viewer
 
-The editor now renders a **whole document** through Parley and Vello, laid out
-line by line with browser-grade wrapping so a closing paren never gets orphaned
-onto the next line (see: writ). Headings are larger, giving *variable* line
-heights that the prefix-sum viewport stacks correctly.
+**writ** renders Markdown as you type, and shows a live *inline diff* against
+git `HEAD`: added lines glow green, deletions appear as ghost rows, and
+word-level changes highlight in place. Point it at a file an agent is editing and
+watch the changes land in real time.
 
-## Scrolling
+## Features
 
-This paragraph exists to push content past the bottom of the window so the
-mouse wheel has something to do. Resize the window and the prose re-wraps to the
-new width, exactly like a browser would reflow it.
+- [x] GPU-rendered Markdown (winit + Vello + Parley)
+- [x] Live inline `git HEAD` diff with word-level changes
+- [x] GitHub `#123` / `@user` refs — validated, with hover cards + autocomplete
+- [ ] GFM tables
+- [ ] Multi-cursor
+
+## A code block
 
 ```rust
 fn main() {
-    let editor = Editor::new(\"# hello\");
-    println!(\"{}\", editor.text());
+    let editor = Editor::new("# hello");
+    println!("{}", editor.text());
 }
 ```
 
-- a bulleted list item
-- another item with `inline code`
-- a third, slightly longer item so it wraps around when the window is narrow
+> Ctrl-click any link or `#ref` to open it in your browser.
 
-### Still to come
+Try editing this file — every keystroke re-renders and re-diffs against HEAD.
+"##;
 
-Marker hiding (the real segment map), the cursor, selection, and inline git diff
-land in the next phases. For now this proves the render + scroll skeleton.
-";
+/// A synthetic "git HEAD" version of `DEMO_DOC` so `--demo` shows the live inline
+/// diff (added/deleted/changed lines) without needing a real git repo.
+const DEMO_BASE: &str = r##"# writ — a Markdown viewer
+
+**writ** renders Markdown as you type. Point it at a file and read it nicely.
+
+## Features
+
+- GPU-rendered Markdown
+- This line is removed in the working copy, so it renders as a deleted ghost row.
+
+## A code block
+
+```rust
+fn main() {
+    let editor = Editor::new("# hello");
+    println!("{}", editor.text());
+}
+```
+
+Try editing this file.
+"##;
+
+/// The demo editor: the showcase doc with a synthetic HEAD base so the inline diff
+/// (the headline feature) is visible on first open.
+fn demo_editor() -> Editor {
+    let mut editor = Editor::new(DEMO_DOC);
+    editor.set_head_base(DEMO_BASE);
+    editor
+}
 
 /// Wakeups sent from tokio worker tasks back into the winit loop. The work's
 /// results are already written to the shared `Arc<Mutex>` caches; the event just
@@ -1693,14 +1724,18 @@ pub fn run() -> Result<()> {
 fn load_editor_from_cli() -> Editor {
     use clap::Parser;
 
-    // No args → sample document (dev/demo).
+    // No args → the demo showcase.
     if std::env::args().len() <= 1 {
-        return Editor::new(SAMPLE_DOC);
+        return demo_editor();
     }
 
     let config = Config::parse();
+    // `--demo`: showcase doc with a synthetic HEAD diff (no file needed).
+    if config.demo {
+        return demo_editor();
+    }
     let Some(path) = config.file.clone() else {
-        return Editor::new(SAMPLE_DOC);
+        return demo_editor();
     };
 
     let mut editor = Editor::open(&path);
@@ -1776,10 +1811,10 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     let device = &context.devices[dev_id].device;
     let queue = &context.devices[dev_id].queue;
 
-    // WRIT_SHELL_FILE opens a real file (with live HEAD diff); else the sample doc.
+    // WRIT_SHELL_FILE opens a real file (with live HEAD diff); else the demo doc.
     let mut editor = match std::env::var("WRIT_SHELL_FILE") {
         Ok(p) => Editor::open(std::path::Path::new(&p)),
-        Err(_) => Editor::new(SAMPLE_DOC),
+        Err(_) => Editor::new(DEMO_DOC),
     };
     // Place the caret mid-document so the snapshot exercises caret geometry.
     let env_usize = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
@@ -1792,10 +1827,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     // Optional diff: set a HEAD base that differs from the current doc so additions
     // (green) + a word-level change render. Exercises the inline-diff path.
     if std::env::var("WRIT_SHELL_DIFF").is_ok() {
-        let base = SAMPLE_DOC
-            .replace("## Scrolling\n\n", "")
-            .replace("**whole document**", "**the document**");
-        editor.set_head_base(&base);
+        editor.set_head_base(DEMO_BASE);
     }
     // Optional GitHub golden-image check: wire a client from GITHUB_TOKEN +
     // WRIT_SHELL_GITHUB_REPO, then *synchronously* validate every ref so the single
