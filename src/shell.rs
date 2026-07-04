@@ -786,10 +786,20 @@ impl DocEngine {
 
     fn refresh(&mut self, device_width: f32, scale: f32, editor_h: f32) {
         self.editor.refresh_detection(self.detection_range(editor_h));
-        let prev_scroll = self.doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
-        let mut new_doc = self.rebuild(device_width, scale, prev_scroll + editor_h);
-        new_doc.scroll_y = prev_scroll;
+        let (anchor_line, anchor_off) =
+            self.doc.as_ref().map(|d| d.scroll_anchor()).unwrap_or((0, 0.0));
+        let mut new_doc = self.rebuild(device_width, scale, anchor_line, editor_h);
+        new_doc.scroll_y = new_doc.anchor_scroll_y(anchor_line, anchor_off);
+        new_doc.clamp_scroll(editor_h);
         new_doc.scroll_to(self.editor.cursor_position(), editor_h);
+        // A cursor jump (Ctrl+End / PageDown) can reveal lines outside the band built
+        // around the old anchor; rebuild once around the new position so it's laid out.
+        if new_doc.needs_remeasure(editor_h) {
+            let (line, off) = new_doc.scroll_anchor();
+            new_doc = self.rebuild(device_width, scale, line, editor_h);
+            new_doc.scroll_y = new_doc.anchor_scroll_y(line, off);
+            new_doc.clamp_scroll(editor_h);
+        }
         self.doc = Some(new_doc);
     }
 
@@ -799,19 +809,26 @@ impl DocEngine {
     /// wakeup doesn't rescan, but scrolling into new lines detects their refs.
     fn rebuild_preserving_scroll(&mut self, device_width: f32, scale: f32, editor_h: f32) {
         self.editor.refresh_detection(self.detection_range(editor_h));
-        let prev_scroll = self.doc.as_ref().map(|d| d.scroll_y).unwrap_or(0.0);
-        let mut new_doc = self.rebuild(device_width, scale, prev_scroll + editor_h);
-        new_doc.scroll_y = prev_scroll;
+        let (anchor_line, anchor_off) =
+            self.doc.as_ref().map(|d| d.scroll_anchor()).unwrap_or((0, 0.0));
+        let mut new_doc = self.rebuild(device_width, scale, anchor_line, editor_h);
+        new_doc.scroll_y = new_doc.anchor_scroll_y(anchor_line, anchor_off);
         new_doc.clamp_scroll(editor_h);
         self.doc = Some(new_doc);
     }
 
-    /// Lay out the whole document at `device_width`, returning the layout for the
-    /// caller to store. `measure_to_y` is the device-px depth (scroll_y + viewport_h)
-    /// that must be fully laid out; deeper lines are height-estimated. `f32::INFINITY`
-    /// lays out the whole document. Borrows disjoint doc-engine fields so the caller's
-    /// surface borrow stays intact.
-    fn rebuild(&mut self, device_width: f32, scale: f32, measure_to_y: f32) -> DocLayout {
+    /// Lay out the document at `device_width`, materializing a band around `anchor_line`
+    /// (the top visible line) that covers `viewport_h` + overscan; the head and tail are
+    /// height-estimated. `anchor_line = 0` + `viewport_h = f32::INFINITY` lays out
+    /// everything. Borrows disjoint doc-engine fields so the caller's surface borrow stays
+    /// intact.
+    fn rebuild(
+        &mut self,
+        device_width: f32,
+        scale: f32,
+        anchor_line: usize,
+        viewport_h: f32,
+    ) -> DocLayout {
         let cursor_offset = self.editor.cursor_position();
         let version = self.editor.state.buffer.version();
         // Clone the diff before borrowing the buffer mutably for the snapshot.
@@ -853,7 +870,8 @@ impl DocEngine {
             cursor_offset,
             &params,
             preedit.as_ref(),
-            measure_to_y,
+            anchor_line,
+            viewport_h,
         )
     }
 }
@@ -1486,7 +1504,7 @@ impl ApplicationHandler<WritEvent> for App {
 
         let scale = window.scale_factor() as f32;
         let (_, editor_h) = chrome_metrics(scale, size.height as f32);
-        let doc = self.doc_engine.rebuild(size.width as f32, scale, editor_h);
+        let doc = self.doc_engine.rebuild(size.width as f32, scale, 0, editor_h);
         self.doc_engine.doc = Some(doc);
         self.state = Some(ActiveSurface {
             surface,
@@ -1512,7 +1530,17 @@ impl ApplicationHandler<WritEvent> for App {
                 );
                 let (_, editor_h) = chrome_metrics(state.scale, size.height as f32);
                 let scale = state.scale;
-                let doc = self.doc_engine.rebuild(size.width as f32, scale, editor_h);
+                let (anchor_line, anchor_off) = self
+                    .doc_engine
+                    .doc
+                    .as_ref()
+                    .map(|d| d.scroll_anchor())
+                    .unwrap_or((0, 0.0));
+                let mut doc = self
+                    .doc_engine
+                    .rebuild(size.width as f32, scale, anchor_line, editor_h);
+                doc.scroll_y = doc.anchor_scroll_y(anchor_line, anchor_off);
+                doc.clamp_scroll(editor_h);
                 self.doc_engine.doc = Some(doc);
                 state.window.request_redraw();
             }
@@ -2253,7 +2281,9 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         images: ImageCache::new(),
         preedit: None,
     };
-    let mut doc = de.rebuild(width as f32, 1.0, scroll_y + editor_h);
+    // Headless: lay out the whole document (anchor 0, infinite viewport) so any scroll
+    // position renders correctly for the golden frame.
+    let mut doc = de.rebuild(width as f32, 1.0, 0, f32::INFINITY);
     // Synchronously decode local standalone images so they appear in the single frame
     // (remote images stay a placeholder headlessly). Then rebuild so their heights land.
     let img_dir = de
@@ -2261,7 +2291,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         .file_path()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()));
     load_local_images_blocking(img_dir.as_deref(), &doc.image_urls(), &de.images);
-    doc = de.rebuild(width as f32, 1.0, scroll_y + editor_h);
+    doc = de.rebuild(width as f32, 1.0, 0, f32::INFINITY);
     doc.scroll_by(scroll_y, editor_h);
     let mut scene = Scene::new();
     let clip = Rect::new(

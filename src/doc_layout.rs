@@ -532,8 +532,10 @@ pub struct DocLayout {
     /// Top y of each line's *ghost block*; the real line begins at
     /// `tops[i] + ghost_height[i]`. Length `layouts.len() + 1`. Device px.
     tops: Vec<f32>,
-    /// Number of lines from the top that are fully laid out; `[measured_count..]` are
-    /// height-estimated placeholders. Equals `line_count()` when nothing was estimated.
+    /// The materialized (fully laid-out) band is `[measured_start, measured_count)`.
+    /// Lines outside it are height-estimated placeholders. `measured_start` is 0 and
+    /// `measured_count` is `line_count()` when the whole document was laid out.
+    measured_start: usize,
     measured_count: usize,
     /// `(line, display byte offset)` of the IME composition caret within the spliced
     /// caret line, when a preedit is active. Drives the drawn caret + candidate popup.
@@ -570,11 +572,14 @@ impl DocLayout {
         // In-progress IME composition to splice into the caret line (render-only; no
         // buffer mutation). `None` outside composition and on the headless snapshot path.
         preedit: Option<&PreeditView>,
-        // Materialize (fully lay out) lines from the top until their cumulative height
-        // reaches `measure_to_y` (device px, = scroll_y + viewport_h) + overscan; the
-        // rest of the document is cheaply height-*estimated* and left un-laid-out.
-        // Pass `f32::INFINITY` to force laying out every line (the old behavior).
-        measure_to_y: f32,
+        // Materialize (fully lay out) a band of lines around the scroll anchor: from
+        // `anchor_line - overscan` downward until the materialized height covers
+        // `viewport_h` + overscan on both sides. Lines above and below the band are
+        // cheaply height-*estimated* (head/tail virtualization) — O(visible) regardless
+        // of scroll depth. `anchor_line = 0` + `viewport_h = f32::INFINITY` lays out the
+        // whole document (the headless/first-open path).
+        anchor_line: usize,
+        viewport_h: f32,
     ) -> Self {
         let LayoutParams {
             device_width,
@@ -621,9 +626,18 @@ impl DocLayout {
             code_ranges: Vec::new(),
             inline_images: Vec::new(),
         });
-        let mut measured_y = pad_top * scale; // tops-space y consumed by materialized lines
-        let mut estimating = false;
-        let mut measured_count = n;
+        // The materialized band: [measure_from_line, measured_count). Lines before
+        // `measure_from_line` (head) and from `measured_count` on (tail) are estimated.
+        // A fixed line count of overscan is always laid out above the anchor (for smooth
+        // up-scroll); coverage below is measured in pixels from the anchor.
+        let measure_from_line = anchor_line.saturating_sub(MEASURE_OVERSCAN_LINES);
+        // Materialize downward from the anchor until this much height is covered — the
+        // viewport plus one overscan band — so the viewport can never reach a placeholder.
+        let band_span = viewport_h + MEASURE_OVERSCAN_PX;
+        let mut band_y = 0.0f32; // height materialized from `anchor_line` down
+        let mut past_band = false; // true once the band is tall enough; tail is estimated
+        let mut measured_start = n; // first materialized line (n = none materialized yet)
+        let mut measured_count = n; // first estimated tail line (n = materialized to end)
         let mut preedit_caret: Option<(usize, usize)> = None;
         // Bucket inline styles per line once (O(n + styles)) instead of the O(n²)
         // per-line `styles_in_range` scan — the dominant per-keystroke cost on large
@@ -647,17 +661,13 @@ impl DocLayout {
         // `i` indexes several parallel per-line inputs (styles, markers, diff).
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
-            // Once we've materialized enough height to cover the viewport (+overscan)
-            // and passed the cursor's line, estimate the remaining lines instead of
-            // laying them out — the O(visible) win on large documents.
-            if !estimating
-                && measured_y >= measure_to_y + MEASURE_OVERSCAN_PX
-                && i > cursor_line + MEASURE_OVERSCAN_LINES
-            {
-                estimating = true;
-                measured_count = i;
+            // Estimate the head (above the band) and the tail (once the band has covered
+            // the viewport + overscan); materialize only the band in between.
+            if i >= measure_from_line && !past_band && measured_start == n {
+                measured_start = i;
             }
-            if estimating {
+            let estimate = i < measure_from_line || past_band;
+            if estimate {
                 let range = snapshot.line_byte_range(i);
                 // Prefer an exact height measured on a recent frame; fall back to the
                 // char-count soft-wrap estimate for never-seen lines.
@@ -855,7 +865,15 @@ impl DocLayout {
             );
             height_cache.set(hkey, line_h);
             let total_h = gh + line_h;
-            measured_y += total_h;
+            // Count coverage only from the anchor down (lines above are fixed-count
+            // overscan); stop once the viewport + overscan below is covered.
+            if i >= anchor_line {
+                band_y += total_h;
+                if band_y >= band_span {
+                    past_band = true;
+                    measured_count = i + 1;
+                }
+            }
             heights.push(total_h);
             layouts.push(layout);
             renders.push(lr);
@@ -897,6 +915,7 @@ impl DocLayout {
             quote_bar_width: (k * 0.16).max(1.5),
             quote_bar_color: peniko_color(theme.comment),
             tops: compute_tops(&heights, pad_top * scale),
+            measured_start: measured_start.min(measured_count),
             measured_count,
             preedit_caret,
             scroll_y: 0.0,
@@ -1056,11 +1075,33 @@ impl DocLayout {
         self.layouts.len()
     }
 
-    /// True if the viewport now reaches into height-estimated (un-laid-out) lines —
-    /// i.e. a wheel-scroll outran the materialized range and the shell should rebuild
-    /// with a larger `measure_to_y` before this frame draws blanks.
+    /// True if the viewport now reaches into height-estimated (un-laid-out) lines above
+    /// or below the materialized band — i.e. a scroll outran the band and the shell
+    /// should rebuild around the new anchor before this frame draws blanks.
     pub fn needs_remeasure(&self, viewport_h: f32) -> bool {
-        self.measured_count < self.layouts.len() && self.visible_range(viewport_h).1 > self.measured_count
+        let (first, last) = self.visible_range(viewport_h);
+        (self.measured_start > 0 && first < self.measured_start)
+            || (self.measured_count < self.layouts.len() && last > self.measured_count)
+    }
+
+    /// The scroll anchor: the topmost line touching the viewport, and how far its top is
+    /// scrolled above the viewport top (device px). Re-pinning to this across a rebuild
+    /// keeps visible content from shifting when off-screen height estimates change — the
+    /// heart of the anchor-forward virtualization.
+    pub fn scroll_anchor(&self) -> (usize, f32) {
+        let n = self.layouts.len();
+        if n == 0 {
+            return (0, 0.0);
+        }
+        let line = self.tops[1..].partition_point(|&b| b <= self.scroll_y).min(n - 1);
+        (line, self.scroll_y - self.tops[line])
+    }
+
+    /// The `scroll_y` that pins `line`'s top `offset` px above the viewport top — the
+    /// inverse of `scroll_anchor`, used to re-pin after a rebuild.
+    pub fn anchor_scroll_y(&self, line: usize, offset: f32) -> f32 {
+        let line = line.min(self.tops.len().saturating_sub(1));
+        self.tops[line] + offset
     }
 
     /// Total document height in device px (last line bottom + bottom padding).
@@ -1523,6 +1564,7 @@ mod tests {
             code_bg: Color::TRANSPARENT,
             quote_bar_width: 2.0,
             quote_bar_color: Color::TRANSPARENT,
+            measured_start: 0,
             measured_count: heights.len(),
             preedit_caret: None,
             diff_colors: DiffColors {
@@ -1594,6 +1636,7 @@ mod tests {
             0,
             &params,
             None,
+            0,
             f32::INFINITY,
         );
         // Several buffer offsets (incl. second line) should map to a caret rect
@@ -1638,6 +1681,7 @@ mod tests {
             usize::MAX,
             &params,
             None,
+            0,
             f32::INFINITY,
         );
         // Line 0's changed version has a deleted ghost stacked above it.
@@ -1671,7 +1715,7 @@ mod tests {
         let build = |engine: &mut TextEngine, cache: &mut LineCache| {
             DocLayout::build(
                 engine, cache, &mut RenderCache::new(), &mut HeightCache::new(), 0, &snapshot,
-                &theme, None, None, &ImageCache::new(), 0, &params, None, f32::INFINITY,
+                &theme, None, None, &ImageCache::new(), 0, &params, None, 0, f32::INFINITY,
             )
         };
         let t0 = Instant::now();
@@ -1711,7 +1755,7 @@ mod tests {
             |engine: &mut TextEngine, lc: &mut LineCache, rc: &mut RenderCache, cursor: usize| {
                 DocLayout::build(
                     engine, lc, rc, &mut HeightCache::new(), 7, &snapshot, &theme, None, None,
-                    &ImageCache::new(), cursor, &params, None, f32::INFINITY,
+                    &ImageCache::new(), cursor, &params, None, 0, f32::INFINITY,
                 )
             };
 
@@ -1761,7 +1805,8 @@ mod tests {
             0,
             &params,
             None,
-            viewport_h, // measure_to_y = just the first viewport
+            0, // anchor at the top
+            viewport_h,
         );
         let n = doc.line_count();
         assert!(n >= 3000);
@@ -1792,5 +1837,91 @@ mod tests {
         assert_eq!(got, 0);
         // Total content height is finite (estimated tail contributes real numbers).
         assert!(doc.content_height().is_finite() && doc.content_height() > 0.0);
+    }
+
+    /// Building around a deep anchor virtualizes BOTH the head (lines above) and the
+    /// tail — the O(visible) win regardless of scroll depth — while keeping the band
+    /// around the anchor fully laid out.
+    #[test]
+    fn virtualized_build_around_deep_anchor() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let text: String = (0..3000)
+            .map(|i| format!("Line {i}: the quick brown fox jumps over the lazy dog.\n"))
+            .collect();
+        let mut buffer: Buffer = text.parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+        let viewport_h = 600.0f32;
+        let params = test_params(&theme, 1000.0);
+        let anchor = 1500usize;
+        let doc = DocLayout::build(
+            &mut engine,
+            &mut LineCache::new(),
+            &mut RenderCache::new(),
+            &mut HeightCache::new(),
+            1,
+            &snapshot,
+            &theme,
+            None,
+            None,
+            &ImageCache::new(),
+            0,
+            &params,
+            None,
+            anchor,
+            viewport_h,
+        );
+        let n = doc.line_count();
+        // Head virtualized: the band starts near the anchor, not at line 0.
+        assert!(
+            doc.measured_start > 0 && doc.measured_start <= anchor,
+            "head should be virtualized around the anchor, got start={}",
+            doc.measured_start
+        );
+        // Tail virtualized: the band ends past the anchor but well before the end.
+        assert!(
+            doc.measured_count > anchor && doc.measured_count < n,
+            "band should cover the anchor and estimate the tail, got count={} of {n}",
+            doc.measured_count
+        );
+        // Only band lines are laid out; head + tail are empty placeholders (height 0),
+        // while the band's lines have real, non-zero layouts.
+        assert_eq!(doc.layouts[0].height(), 0.0, "head line placeholder");
+        assert_eq!(doc.layouts[n - 1].height(), 0.0, "tail line placeholder");
+        assert!(doc.layouts[anchor].height() > 0.0, "anchor line materialized");
+        // The band is far smaller than the document (true O(visible)).
+        assert!(
+            doc.measured_count - doc.measured_start < 400,
+            "materialized band {} should be a small window of {n}",
+            doc.measured_count - doc.measured_start
+        );
+    }
+
+    /// Re-pinning to a captured anchor keeps the anchor line's on-screen position fixed
+    /// across a rebuild even when off-screen head heights change (the anti-jump core).
+    #[test]
+    fn anchor_repin_is_stable() {
+        // Heights: first 100 lines are "wrong" in doc A (all 10px) vs doc B (all 40px);
+        // the anchor line and below are identical. Pinning the anchor must cancel the
+        // head delta so the anchor stays put.
+        let mut ha = vec![10.0f32; 200];
+        let mut hb = vec![40.0f32; 200];
+        for i in 100..200 {
+            ha[i] = 25.0;
+            hb[i] = 25.0;
+        }
+        let mut a = fixture(&ha, 4.0, 4.0);
+        let b = fixture(&hb, 4.0, 4.0);
+        // Scroll doc A so line 100 sits 5px below the viewport top.
+        a.scroll_y = a.tops[100] + 5.0;
+        let (line, off) = a.scroll_anchor();
+        assert_eq!(line, 100);
+        assert!((off - 5.0).abs() < 1e-3);
+        // Re-pin the same anchor in doc B (whose head is 3× taller).
+        let repinned = b.anchor_scroll_y(line, off);
+        // Line 100's top is 5px above the viewport top in BOTH — its on-screen position
+        // (tops[100] - scroll_y) is identical, so the visible content did not jump.
+        assert!((b.tops[100] - repinned - (a.tops[100] - a.scroll_y)).abs() < 1e-3);
     }
 }
