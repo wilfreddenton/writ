@@ -739,6 +739,13 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
     let mut code_blocks = Vec::new();
     let mut checked_task_stack: Vec<(usize, bool)> = Vec::new();
     let mut code_block_end: Option<usize> = None;
+    // Ancestor kinds, pushed on descent and popped on ascent, so the current node's
+    // parent kind is `kind_stack.last()` in O(1) (avoids re-descending from root).
+    let mut kind_stack: Vec<&'static str> = Vec::new();
+    // Whether the current fenced_code_block's first delimiter has been emitted yet.
+    // Reset on entering each fence (fences don't nest), so the first delimiter child is
+    // flagged without re-walking the parent's children.
+    let mut fence_first_delim_seen = false;
 
     loop {
         let node = cursor.node();
@@ -764,6 +771,7 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
 
         if node.kind() == "fenced_code_block" {
             code_block_end = Some(node.end_byte());
+            fence_first_delim_seen = false;
 
             let block_range = node.start_byte()..node.end_byte();
             let mut content_start: Option<usize> = None;
@@ -809,21 +817,16 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
 
         let in_checked_task = checked_task_stack.iter().any(|(_, checked)| *checked);
         let in_code_block = code_block_end.is_some();
+        let parent_kind = kind_stack.last().copied();
 
         let is_first_fence_delimiter = if node.kind() == "fenced_code_block_delimiter" {
-            node.parent()
-                .map(|parent| {
-                    if parent.kind() == "fenced_code_block" {
-                        let mut child_cursor = parent.walk();
-                        for child in parent.children(&mut child_cursor) {
-                            if child.kind() == "fenced_code_block_delimiter" {
-                                return child.start_byte() == node.start_byte();
-                            }
-                        }
-                    }
-                    true
-                })
-                .unwrap_or(true)
+            if parent_kind == Some("fenced_code_block") {
+                let first = !fence_first_delim_seen;
+                fence_first_delim_seen = true;
+                first
+            } else {
+                true
+            }
         } else {
             false
         };
@@ -832,13 +835,14 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
             kind: node.kind(),
-            parent_kind: node.parent().map(|p| p.kind()),
+            parent_kind,
             is_first_fence_delimiter,
             in_checked_task,
             in_code_block,
         });
 
         if cursor.goto_first_child() {
+            kind_stack.push(node.kind());
             continue;
         }
         if cursor.goto_next_sibling() {
@@ -848,6 +852,7 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
             if !cursor.goto_parent() {
                 return ParsedNodes { nodes, code_blocks };
             }
+            kind_stack.pop();
             if cursor.goto_next_sibling() {
                 break;
             }

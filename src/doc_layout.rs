@@ -27,7 +27,7 @@ use crate::inline::{
     GitHubContext, NakedUrl, RawGitHubMatch, StyledRegion, github_refs_to_styled_regions,
     naked_urls_to_styled_regions,
 };
-use crate::render::{ImageRef, LineRender, build_line_render};
+use crate::render::{ImageRef, InlineImageRef, LineRender, build_line_render};
 use crate::segment_map::SegmentMap;
 use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
 
@@ -98,16 +98,30 @@ fn line_key(
     h.finish()
 }
 
-/// Persistent per-line Parley layout cache (owned by the shell, reused across
-/// rebuilds). Avoids re-shaping unchanged lines every keystroke; entries not
-/// touched in a frame are swept so it stays bounded to the current document.
-#[derive(Default)]
-pub struct LineCache {
-    map: HashMap<u64, Rc<parley::Layout<Brush>>>,
+/// A swept, content-addressed cache shared by the shell across rebuilds: values
+/// keyed by a `u64` content hash and reset each frame via `begin`/`sweep`. `begin`
+/// marks a new frame; every `get`/`set`/`get_or_build` records its key as used; and
+/// `sweep` drops entries not touched that frame, so the cache stays bounded to the
+/// current document (avoiding re-shaping unchanged lines every keystroke). `V` is
+/// `Rc`-wrapped for the layout/render caches, so a hit is a refcount bump rather than
+/// a deep copy of shaped glyphs or a `LineRender`.
+pub struct SweptCache<V> {
+    map: HashMap<u64, V>,
     used: HashSet<u64>,
 }
 
-impl LineCache {
+// Manual `Default` (not derived) so it doesn't require `V: Default` — the maps are
+// always default-constructible regardless of the value type.
+impl<V> Default for SweptCache<V> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            used: HashSet::new(),
+        }
+    }
+}
+
+impl<V: Clone> SweptCache<V> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -116,18 +130,22 @@ impl LineCache {
         self.used.clear();
     }
 
-    /// Returns a shared handle to the (cached) layout. `Rc::clone` is a refcount
-    /// bump, not a deep copy of the shaped glyphs — the win for large documents.
-    fn get_or_build(
-        &mut self,
-        key: u64,
-        build: impl FnOnce() -> parley::Layout<Brush>,
-    ) -> Rc<parley::Layout<Brush>> {
+    fn get(&mut self, key: u64) -> Option<V> {
+        let v = self.map.get(&key).cloned();
+        if v.is_some() {
+            self.used.insert(key);
+        }
+        v
+    }
+
+    fn get_or_build(&mut self, key: u64, build: impl FnOnce() -> V) -> V {
         self.used.insert(key);
-        self.map
-            .entry(key)
-            .or_insert_with(|| Rc::new(build()))
-            .clone()
+        self.map.entry(key).or_insert_with(build).clone()
+    }
+
+    fn set(&mut self, key: u64, value: V) {
+        self.used.insert(key);
+        self.map.insert(key, value);
     }
 
     fn sweep(&mut self) {
@@ -135,6 +153,10 @@ impl LineCache {
         self.map.retain(|k, _| used.contains(k));
     }
 }
+
+/// Per-line Parley layout cache: skips re-shaping lines whose content + style is
+/// unchanged.
+pub type LineCache = SweptCache<Rc<parley::Layout<Brush>>>;
 
 /// Key for the per-line render cache. Within one buffer `version`, line `line_idx`
 /// has fixed text + tree context, so its `LineRender` depends only on whether the
@@ -161,84 +183,19 @@ fn cursor_key_for(range: &Range<usize>, cursor: usize) -> usize {
     if on { cursor } else { usize::MAX }
 }
 
-/// Persistent per-line `LineRender` cache (shell-owned, reused across rebuilds).
-/// Skips the tree-sitter style queries + segment-map build for lines whose render
-/// is unchanged — so cursor moves, scroll, and async-validation rebuilds (which
-/// don't bump the buffer version) recompute only the handful of lines that changed.
-#[derive(Default)]
-pub struct RenderCache {
-    map: HashMap<u64, Rc<LineRender>>,
-    used: HashSet<u64>,
-}
+/// Per-line `LineRender` cache: skips the tree-sitter style queries + segment-map
+/// build for lines whose render is unchanged — so cursor moves, scroll, and
+/// async-validation rebuilds (which don't bump the buffer version) recompute only the
+/// handful of lines that changed.
+pub type RenderCache = SweptCache<Rc<LineRender>>;
 
-impl RenderCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn begin(&mut self) {
-        self.used.clear();
-    }
-
-    /// Returns a shared handle. `Rc::clone` avoids deep-copying the `LineRender`
-    /// (its `String` + style runs + `SegmentMap`) on every cache hit.
-    fn get_or_build(
-        &mut self,
-        key: u64,
-        build: impl FnOnce() -> LineRender,
-    ) -> Rc<LineRender> {
-        self.used.insert(key);
-        self.map
-            .entry(key)
-            .or_insert_with(|| Rc::new(build()))
-            .clone()
-    }
-
-    fn sweep(&mut self) {
-        let used = &self.used;
-        self.map.retain(|k, _| used.contains(k));
-    }
-}
-
-/// Persistent per-line measured *height* cache (device px, the real line only — ghost
-/// blocks are added separately). Keyed by the same `render_key` as the render cache, so
-/// it holds exact heights for lines materialized on any recent frame; un-materialized
-/// (head/tail virtualized) lines read their height from here when present, falling back
-/// to the char-count estimate. This is what lets the layout drop to O(visible) without
-/// the scroll positions of already-seen regions drifting.
-#[derive(Default)]
-pub struct HeightCache {
-    map: HashMap<u64, f32>,
-    used: HashSet<u64>,
-}
-
-impl HeightCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn begin(&mut self) {
-        self.used.clear();
-    }
-
-    fn get(&mut self, key: u64) -> Option<f32> {
-        let h = self.map.get(&key).copied();
-        if h.is_some() {
-            self.used.insert(key);
-        }
-        h
-    }
-
-    fn set(&mut self, key: u64, height: f32) {
-        self.used.insert(key);
-        self.map.insert(key, height);
-    }
-
-    fn sweep(&mut self) {
-        let used = &self.used;
-        self.map.retain(|k, _| used.contains(k));
-    }
-}
+/// Per-line measured *height* cache (device px, the real line only — ghost blocks are
+/// added separately). Keyed by the same `render_key` as the render cache, so it holds
+/// exact heights for lines materialized on any recent frame; un-materialized (head/tail
+/// virtualized) lines read their height from here when present, falling back to the
+/// char-count estimate. This is what lets the layout drop to O(visible) without the
+/// scroll positions of already-seen regions drifting.
+pub type HeightCache = SweptCache<f32>;
 
 /// Vertical padding (logical px) above and below an image block.
 const IMG_VPAD: f32 = 8.0;
@@ -440,6 +397,49 @@ fn build_image_block(
             IMG_PLACEHOLDER_H * scale,
         ),
     }
+}
+
+/// Resolve a line's inline images to `(inline_boxes, draws)`: for each, the box size to
+/// reserve in the layout (natural device size, shrunk to fit `max_advance`) and its draw
+/// spec. Loading/failed/absent images get a small fixed placeholder box. Every referenced
+/// URL is collected into `image_urls` (deduped) so the load pass fetches it.
+fn resolve_inline_images(
+    inline_images: &[InlineImageRef],
+    images: &ImageCache,
+    image_urls: &mut Vec<String>,
+    max_advance: f32,
+    scale: f32,
+) -> (Vec<(usize, f32, f32)>, Vec<InlineImageDraw>) {
+    let mut inline_boxes: Vec<(usize, f32, f32)> = Vec::new();
+    let draws: Vec<InlineImageDraw> = inline_images
+        .iter()
+        .map(|ii| {
+            if !image_urls.iter().any(|u| u == &ii.url) {
+                image_urls.push(ii.url.clone());
+            }
+            let (w, h, draw) = match images.get(&ii.url) {
+                Some(ImageState::Loaded(loaded)) => {
+                    let mut w = loaded.display_w * scale;
+                    let mut h = loaded.display_h * scale;
+                    if w > max_advance && w > 0.0 {
+                        h *= max_advance / w;
+                        w = max_advance;
+                    }
+                    let brush =
+                        Some((loaded.brush.clone(), loaded.width as f32, loaded.height as f32));
+                    (w, h, InlineImageDraw { brush })
+                }
+                _ => (
+                    INLINE_IMG_PLACEHOLDER_W * scale,
+                    INLINE_IMG_PLACEHOLDER_H * scale,
+                    InlineImageDraw { brush: None },
+                ),
+            };
+            inline_boxes.push((ii.display_offset, w, h));
+            draw
+        })
+        .collect();
+    (inline_boxes, draws)
 }
 
 /// Splice an in-progress IME `preedit` string into a line's display `text` at display
@@ -705,7 +705,7 @@ impl DocLayout {
             // a version bump); all others key on (version, line, cursor-on-line).
             let lr = if extra.is_empty() {
                 render_cache.get_or_build(rkey, || {
-                    build_line_render(
+                    Rc::new(build_line_render(
                         snapshot,
                         i,
                         theme,
@@ -713,7 +713,7 @@ impl DocLayout {
                         cursor_offset,
                         &line_styles[i],
                         &[],
-                    )
+                    ))
                 })
             } else {
                 Rc::new(build_line_render(
@@ -726,39 +726,8 @@ impl DocLayout {
                     &extra,
                 ))
             };
-            // Inline images: resolve each to a box size (natural device size, shrunk to
-            // fit the content width) + draw spec, and reserve an inline box in the layout.
-            // Loading/failed/absent images get a small fixed placeholder box.
-            let mut inline_boxes: Vec<(usize, f32, f32)> = Vec::new();
-            let line_inline_draws: Vec<InlineImageDraw> = lr
-                .inline_images
-                .iter()
-                .map(|ii| {
-                    if !image_urls.iter().any(|u| u == &ii.url) {
-                        image_urls.push(ii.url.clone());
-                    }
-                    let (w, h, draw) = match images.get(&ii.url) {
-                        Some(ImageState::Loaded(loaded)) => {
-                            let mut w = loaded.display_w * scale;
-                            let mut h = loaded.display_h * scale;
-                            if w > max_advance && w > 0.0 {
-                                h *= max_advance / w;
-                                w = max_advance;
-                            }
-                            let brush =
-                                Some((loaded.brush.clone(), loaded.width as f32, loaded.height as f32));
-                            (w, h, InlineImageDraw { brush })
-                        }
-                        _ => (
-                            INLINE_IMG_PLACEHOLDER_W * scale,
-                            INLINE_IMG_PLACEHOLDER_H * scale,
-                            InlineImageDraw { brush: None },
-                        ),
-                    };
-                    inline_boxes.push((ii.display_offset, w, h));
-                    draw
-                })
-                .collect();
+            let (inline_boxes, line_inline_draws) =
+                resolve_inline_images(&lr.inline_images, images, &mut image_urls, max_advance, scale);
             let key = line_key(
                 &lr.text,
                 scale,
@@ -773,7 +742,7 @@ impl DocLayout {
             // are rare, so the cost is negligible.
             let layout = if inline_boxes.is_empty() {
                 cache.get_or_build(key, || {
-                    engine.build_line_hanging(
+                    Rc::new(engine.build_line_hanging(
                         &lr.text,
                         scale,
                         lr.font_size,
@@ -783,7 +752,7 @@ impl DocLayout {
                         &lr.runs,
                         lr.content_start,
                         &[],
-                    )
+                    ))
                 })
             } else {
                 Rc::new(engine.build_line_hanging(

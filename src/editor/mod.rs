@@ -1236,21 +1236,11 @@ impl EditorState {
         // Sort by offset descending so we can modify without invalidating earlier offsets
         checkboxes_to_toggle.sort_by_key(|c| std::cmp::Reverse(c.0));
 
-        // Toggle each checkbox
+        // Toggle each checkbox + its line strikethrough. Descending offset order keeps a
+        // strikethrough's byte shift from invalidating the lower offsets processed next;
+        // the state replace is length-preserving.
         for (offset, _currently_checked) in &checkboxes_to_toggle {
-            let content_start = offset + 1; // skip '['
-            let content_end = content_start + 1;
-            let new_content = if new_checked { "x" } else { " " };
-            self.buffer
-                .replace(content_start..content_end, new_content, cursor_pos);
-        }
-
-        // Handle strikethrough for each toggled checkbox's line
-        // Process in reverse order (highest offset first) since strikethrough changes byte offsets
-        for (offset, _) in &checkboxes_to_toggle {
-            let line_idx = self.buffer.byte_to_line(*offset);
-            let adjustment = self.toggle_line_strikethrough(line_idx, new_checked, cursor_pos);
-            cursor_pos = (cursor_pos as isize + adjustment) as usize;
+            self.set_checkbox(*offset, new_checked, &mut cursor_pos);
         }
 
         // Propagate upward: if checking and all siblings are now checked, check parent
@@ -1283,33 +1273,14 @@ impl EditorState {
             let all_checked = siblings.iter().all(|(_, is_checked)| *is_checked);
 
             if all_checked && !parent_checked {
-                // Check the parent
-                let content_start = parent_offset + 1;
-                let content_end = content_start + 1;
-                self.buffer
-                    .replace(content_start..content_end, "x", *cursor_pos);
-
-                // Toggle strikethrough for parent's direct content line
-                let parent_line = self.buffer.byte_to_line(parent_offset);
-                let adjustment = self.toggle_line_strikethrough(parent_line, true, *cursor_pos);
-                *cursor_pos = (*cursor_pos as isize + adjustment) as usize;
-
+                self.set_checkbox(parent_offset, true, cursor_pos);
                 // Recursively propagate up
                 self.propagate_checkbox_up(parent_offset, true, cursor_pos);
             }
         } else {
             // When unchecking: uncheck parent if it was checked
             if parent_checked {
-                let content_start = parent_offset + 1;
-                let content_end = content_start + 1;
-                self.buffer
-                    .replace(content_start..content_end, " ", *cursor_pos);
-
-                // Remove strikethrough from parent's direct content line
-                let parent_line = self.buffer.byte_to_line(parent_offset);
-                let adjustment = self.toggle_line_strikethrough(parent_line, false, *cursor_pos);
-                *cursor_pos = (*cursor_pos as isize + adjustment) as usize;
-
+                self.set_checkbox(parent_offset, false, cursor_pos);
                 // Recursively propagate up
                 self.propagate_checkbox_up(parent_offset, false, cursor_pos);
             }
@@ -1382,31 +1353,29 @@ impl EditorState {
 
         if all_siblings_checked && !parent_checked {
             // All remaining siblings are checked, check the parent
-            let content_start = parent_checkbox_offset + 1;
-            let content_end = content_start + 1;
-            self.buffer
-                .replace(content_start..content_end, "x", cursor_pos);
-
-            let parent_line = self.buffer.byte_to_line(parent_checkbox_offset);
-            let adjustment = self.toggle_line_strikethrough(parent_line, true, cursor_pos);
-            cursor_pos = (cursor_pos as isize + adjustment) as usize;
-
+            self.set_checkbox(parent_checkbox_offset, true, &mut cursor_pos);
             self.propagate_checkbox_up(parent_checkbox_offset, true, &mut cursor_pos);
             self.selection = Selection::new(cursor_pos, cursor_pos);
         } else if !all_siblings_checked && parent_checked {
             // Some siblings unchecked, uncheck the parent
-            let content_start = parent_checkbox_offset + 1;
-            let content_end = content_start + 1;
-            self.buffer
-                .replace(content_start..content_end, " ", cursor_pos);
-
-            let parent_line = self.buffer.byte_to_line(parent_checkbox_offset);
-            let adjustment = self.toggle_line_strikethrough(parent_line, false, cursor_pos);
-            cursor_pos = (cursor_pos as isize + adjustment) as usize;
-
+            self.set_checkbox(parent_checkbox_offset, false, &mut cursor_pos);
             self.propagate_checkbox_up(parent_checkbox_offset, false, &mut cursor_pos);
             self.selection = Selection::new(cursor_pos, cursor_pos);
         }
+    }
+
+    /// Flip a single checkbox's state byte (`[ ]`↔`[x]`), toggle its line's
+    /// strikethrough to match, and advance `cursor_pos` by the strikethrough's byte
+    /// adjustment. The state replace is length-preserving; only strikethrough shifts bytes.
+    fn set_checkbox(&mut self, checkbox_offset: usize, checked: bool, cursor_pos: &mut usize) {
+        let content_start = checkbox_offset + 1; // skip '['
+        let content_end = content_start + 1;
+        let new_content = if checked { "x" } else { " " };
+        self.buffer
+            .replace(content_start..content_end, new_content, *cursor_pos);
+        let line = self.buffer.byte_to_line(checkbox_offset);
+        let adjustment = self.toggle_line_strikethrough(line, checked, *cursor_pos);
+        *cursor_pos = (*cursor_pos as isize + adjustment) as usize;
     }
 
     /// Add or remove strikethrough (`~~`) from a line's content.
