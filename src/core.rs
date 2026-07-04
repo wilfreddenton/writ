@@ -12,6 +12,7 @@
 //! in a later phase. Detection (the synchronous scan) lives here.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::SystemTime;
@@ -349,6 +350,23 @@ impl Editor {
         refs
     }
 
+    /// GitHub references detected on lines within `lines` only — the viewport-bounded
+    /// counterpart of `detected_refs`, used to validate just the visible refs.
+    pub fn detected_refs_in_lines(&self, lines: Range<usize>) -> Vec<GitHubRef> {
+        let mut refs: Vec<GitHubRef> = Vec::new();
+        for (line, matches) in self.github_refs_by_line() {
+            if lines.contains(line) {
+                refs.extend(matches.iter().map(|m| m.reference.clone()));
+            }
+        }
+        for (line, urls) in self.naked_urls_by_line() {
+            if lines.contains(line) {
+                refs.extend(urls.iter().filter_map(|u| u.github_ref.clone()));
+            }
+        }
+        refs
+    }
+
     /// Detect GitHub refs and naked URLs across a line range, returning both keyed
     /// by line index. Pure scan over the render snapshot (no network).
     pub fn detect_links(
@@ -540,7 +558,10 @@ impl Editor {
                 continue;
             }
             let trigger_offset = line_start + pos;
-            if best.as_ref().is_none_or(|(_, off, _)| trigger_offset > *off) {
+            if best
+                .as_ref()
+                .is_none_or(|(_, off, _)| trigger_offset > *off)
+            {
                 best = Some((trigger_type, trigger_offset, prefix));
             }
         }
@@ -565,7 +586,10 @@ impl Editor {
         }
 
         let old = self.autocomplete.take();
-        let same_trigger = old.as_ref().map(|ac| ac.trigger == trigger).unwrap_or(false);
+        let same_trigger = old
+            .as_ref()
+            .map(|ac| ac.trigger == trigger)
+            .unwrap_or(false);
         let should_fetch = match trigger {
             AutocompleteTrigger::Issue => {
                 let already = old
@@ -639,9 +663,7 @@ impl Editor {
             AutocompleteSuggestion::User { login, .. } => format!("@{login}"),
         };
         let cursor = self.state.cursor().offset;
-        self.state
-            .buffer
-            .delete(ac.trigger_offset..cursor, cursor);
+        self.state.buffer.delete(ac.trigger_offset..cursor, cursor);
         self.state
             .buffer
             .insert(ac.trigger_offset, &replacement, ac.trigger_offset);
@@ -876,6 +898,35 @@ mod tests {
         assert!(editor.accept_autocomplete_suggestion());
         assert_eq!(editor.text(), "Working on #999\n");
         assert!(editor.autocomplete().is_none(), "popup closes on accept");
+    }
+
+    #[test]
+    fn detected_refs_in_lines_is_viewport_bounded() {
+        let mut editor = Editor::new("See #1 here\n\n\nAnd #2 there\n");
+        editor.set_github_context(ctx());
+        editor.set_github_client(GitHubClient::new("dummy".into()));
+        editor.refresh_detection();
+
+        let numbers = |refs: Vec<GitHubRef>| {
+            refs.iter()
+                .filter_map(|r| match r {
+                    GitHubRef::Issue { number, .. } => Some(*number),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Line 0 only sees #1, not the line-3 #2.
+        let line0 = numbers(editor.detected_refs_in_lines(0..1));
+        assert!(line0.contains(&1), "line 0 range should include #1");
+        assert!(!line0.contains(&2), "line 0 range should exclude line-3 #2");
+
+        // A wide range covers both refs.
+        let all = numbers(editor.detected_refs_in_lines(0..10));
+        assert!(
+            all.contains(&1) && all.contains(&2),
+            "wide range should include both refs"
+        );
     }
 
     #[test]

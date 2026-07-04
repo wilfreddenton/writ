@@ -14,6 +14,7 @@
 //! `WRIT_SHELL_SNAPSHOT=out.ppm` (+ optional `WRIT_SHELL_{W,H,SCROLL,CURSOR,SEL_A,SEL_B}`)
 //! to render one frame headlessly instead.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -47,15 +48,14 @@ use crate::doc_layout::{
 };
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
-use crate::image_cache::{ImageCache, decode};
 use crate::github::{
     GitHubClient, IssueOrPr, IssueStatus, MentionableUser, ValidatedRefData, ValidationResult,
     ValidationState,
 };
+use crate::image_cache::{ImageCache, decode};
 use crate::inline::{GitHubContext, GitHubRef};
 use crate::marker::MarkerKind;
 use crate::text_engine::{StyleRun, TextEngine, peniko_color};
-
 
 /// Chrome layout in device px: y where editor content begins, and its height.
 fn chrome_metrics(scale: f32, height_dev: f32) -> (f32, f32) {
@@ -269,7 +269,14 @@ impl App {
     /// Post-edit async side effects: validate freshly-detected GitHub refs and start
     /// loading any newly-appeared standalone images. Both are idempotent (cache-guarded).
     fn spawn_validations(&self) {
-        spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+        let visible = self.state.as_ref().and_then(|s| {
+            let (_, vh) = chrome_metrics(s.scale, s.surface.config.height as f32);
+            self.doc_engine.doc.as_ref().map(|d| {
+                let (a, b) = d.visible_range(vh);
+                a..b
+            })
+        });
+        spawn_ref_validations(&self.doc_engine.editor, visible, &self.runtime, &self.proxy);
         self.sync_images();
     }
 
@@ -392,6 +399,7 @@ fn spawn_image_loads(
 /// `GitHubValidationCache`; a `GithubUpdated` wakeup triggers a redraw.
 fn spawn_ref_validations(
     editor: &Editor,
+    visible: Option<Range<usize>>,
     runtime: &tokio::runtime::Handle,
     proxy: &EventLoopProxy<WritEvent>,
 ) {
@@ -400,7 +408,12 @@ fn spawn_ref_validations(
     };
     let cache = editor.github_validation_cache();
 
-    for reference in editor.detected_refs() {
+    // No layout yet → validate all; otherwise only the refs on visible lines.
+    let refs = match visible {
+        Some(r) => editor.detected_refs_in_lines(r),
+        None => editor.detected_refs(),
+    };
+    for reference in refs {
         if cache.get(&reference).is_some() {
             continue; // already pending/valid/invalid
         }
@@ -1191,10 +1204,22 @@ impl ApplicationHandler<WritEvent> for App {
                 if remeasure {
                     let w = state.surface.config.width as f32;
                     let scale = state.scale;
-                    self.doc_engine.rebuild_preserving_scroll(w, scale, editor_h);
+                    self.doc_engine
+                        .rebuild_preserving_scroll(w, scale, editor_h);
                     // Image lines scrolled into the materialized range need loading.
                     sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                 }
+                // Visible refs change with scroll_y alone (no rebuild needed); the cache
+                // dedups, so validating on every wheel tick is cheap and safe.
+                spawn_ref_validations(
+                    &self.doc_engine.editor,
+                    self.doc_engine.doc.as_ref().map(|d| {
+                        let (a, b) = d.visible_range(editor_h);
+                        a..b
+                    }),
+                    &self.runtime,
+                    &self.proxy,
+                );
                 if self.doc_engine.doc.is_some() {
                     state.window.request_redraw();
                 }
@@ -1211,7 +1236,15 @@ impl ApplicationHandler<WritEvent> for App {
                     let w = state.surface.config.width as f32;
                     let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     self.doc_engine.refresh(w, state.scale, vh);
-                    spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+                    spawn_ref_validations(
+                        &self.doc_engine.editor,
+                        self.doc_engine.doc.as_ref().map(|d| {
+                            let (a, b) = d.visible_range(vh);
+                            a..b
+                        }),
+                        &self.runtime,
+                        &self.proxy,
+                    );
                     sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                     state.window.request_redraw();
                 }
@@ -1273,7 +1306,15 @@ impl ApplicationHandler<WritEvent> for App {
                     if self.doc_engine.editor.accept_autocomplete_suggestion() {
                         self.hovered = None;
                         self.doc_engine.refresh(w, state.scale, vh);
-                        spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+                        spawn_ref_validations(
+                            &self.doc_engine.editor,
+                            self.doc_engine.doc.as_ref().map(|d| {
+                                let (a, b) = d.visible_range(vh);
+                                a..b
+                            }),
+                            &self.runtime,
+                            &self.proxy,
+                        );
                         sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                         state.window.request_redraw();
                     }
@@ -1362,6 +1403,10 @@ impl ApplicationHandler<WritEvent> for App {
                                 self.doc_engine.refresh(w, state.scale, vh);
                                 spawn_ref_validations(
                                     &self.doc_engine.editor,
+                                    self.doc_engine.doc.as_ref().map(|d| {
+                                        let (a, b) = d.visible_range(vh);
+                                        a..b
+                                    }),
                                     &self.runtime,
                                     &self.proxy,
                                 );
@@ -1379,6 +1424,10 @@ impl ApplicationHandler<WritEvent> for App {
                                 self.doc_engine.refresh(w, state.scale, vh);
                                 spawn_ref_validations(
                                     &self.doc_engine.editor,
+                                    self.doc_engine.doc.as_ref().map(|d| {
+                                        let (a, b) = d.visible_range(vh);
+                                        a..b
+                                    }),
                                     &self.runtime,
                                     &self.proxy,
                                 );
@@ -1429,7 +1478,15 @@ impl ApplicationHandler<WritEvent> for App {
                         {
                             self.hovered = None;
                             self.doc_engine.refresh(w, state.scale, vh);
-                            spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+                            spawn_ref_validations(
+                                &self.doc_engine.editor,
+                                self.doc_engine.doc.as_ref().map(|d| {
+                                    let (a, b) = d.visible_range(vh);
+                                    a..b
+                                }),
+                                &self.runtime,
+                                &self.proxy,
+                            );
                             sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                             state.window.request_redraw();
                             return;
@@ -1441,7 +1498,15 @@ impl ApplicationHandler<WritEvent> for App {
                 if apply_key(&mut self.doc_engine.editor, self.modifiers, &event) {
                     self.hovered = None;
                     self.doc_engine.refresh(w, state.scale, vh);
-                    spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+                    spawn_ref_validations(
+                        &self.doc_engine.editor,
+                        self.doc_engine.doc.as_ref().map(|d| {
+                            let (a, b) = d.visible_range(vh);
+                            a..b
+                        }),
+                        &self.runtime,
+                        &self.proxy,
+                    );
                     sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                     sync_autocomplete(
                         &mut self.doc_engine.editor,
@@ -1632,7 +1697,15 @@ impl ApplicationHandler<WritEvent> for App {
             let window = state.window.clone();
             let scale = state.scale;
             self.doc_engine.refresh(w, scale, editor_h);
-            spawn_ref_validations(&self.doc_engine.editor, &self.runtime, &self.proxy);
+            spawn_ref_validations(
+                &self.doc_engine.editor,
+                self.doc_engine.doc.as_ref().map(|d| {
+                    let (a, b) = d.visible_range(editor_h);
+                    a..b
+                }),
+                &self.runtime,
+                &self.proxy,
+            );
             sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
             window.request_redraw();
         }
@@ -1941,7 +2014,10 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     }
 
     // Optional autocomplete golden image (see WRIT_SHELL_AUTOCOMPLETE above).
-    if let Some(ac) = de.editor.autocomplete().filter(|ac| !ac.suggestions.is_empty())
+    if let Some(ac) = de
+        .editor
+        .autocomplete()
+        .filter(|ac| !ac.suggestions.is_empty())
         && let Some(caret) = doc.caret_rect(de.editor.cursor_position(), 2.0)
     {
         draw_autocomplete(
