@@ -407,6 +407,27 @@ fn spawn_image_loads(
     }
 }
 
+/// The async side effects every buffer edit needs, in one place so an edit entry point
+/// can't silently skip one: rebuild+re-detect, spawn validation for newly-visible refs,
+/// and load newly-appeared images. Callers still own the surrounding UI (clearing the
+/// hover, autocomplete sync, and `request_redraw`) since those vary per site.
+fn after_edit(
+    doc_engine: &mut DocEngine,
+    runtime: &tokio::runtime::Handle,
+    proxy: &EventLoopProxy<WritEvent>,
+    w: f32,
+    scale: f32,
+    editor_h: f32,
+) {
+    doc_engine.refresh(w, scale, editor_h);
+    let visible = doc_engine.doc.as_ref().map(|d| {
+        let (a, b) = d.visible_range(editor_h);
+        a..b
+    });
+    spawn_ref_validations(&doc_engine.editor, visible, runtime, proxy);
+    sync_image_loads(doc_engine, runtime, proxy);
+}
+
 /// For each detected GitHub ref (from refs + naked URLs) with no cache entry yet,
 /// mark it pending and spawn a tokio task to validate it. Results land in the shared
 /// `GitHubValidationCache`; a `GithubUpdated` wakeup triggers a redraw.
@@ -1394,17 +1415,7 @@ impl ApplicationHandler<WritEvent> for App {
                 if !text.is_empty() {
                     self.doc_engine.editor.insert_str(&text);
                     self.hovered = None;
-                    self.doc_engine.refresh(w, state.scale, vh);
-                    spawn_ref_validations(
-                        &self.doc_engine.editor,
-                        self.doc_engine.doc.as_ref().map(|d| {
-                            let (a, b) = d.visible_range(vh);
-                            a..b
-                        }),
-                        &self.runtime,
-                        &self.proxy,
-                    );
-                    sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                    after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
                     state.window.request_redraw();
                 } else if had_preedit {
                     // Composition cancelled (empty commit): drop the spliced preedit.
@@ -1477,17 +1488,7 @@ impl ApplicationHandler<WritEvent> for App {
                     self.doc_engine.editor.autocomplete_select(row);
                     if self.doc_engine.editor.accept_autocomplete_suggestion() {
                         self.hovered = None;
-                        self.doc_engine.refresh(w, state.scale, vh);
-                        spawn_ref_validations(
-                            &self.doc_engine.editor,
-                            self.doc_engine.doc.as_ref().map(|d| {
-                                let (a, b) = d.visible_range(vh);
-                                a..b
-                            }),
-                            &self.runtime,
-                            &self.proxy,
-                        );
-                        sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                        after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
                         state.window.request_redraw();
                     }
                     return;
@@ -1572,17 +1573,7 @@ impl ApplicationHandler<WritEvent> for App {
                             }
                             if c.as_str().eq_ignore_ascii_case("x") {
                                 self.doc_engine.editor.backspace(); // delete the selection
-                                self.doc_engine.refresh(w, state.scale, vh);
-                                spawn_ref_validations(
-                                    &self.doc_engine.editor,
-                                    self.doc_engine.doc.as_ref().map(|d| {
-                                        let (a, b) = d.visible_range(vh);
-                                        a..b
-                                    }),
-                                    &self.runtime,
-                                    &self.proxy,
-                                );
-                                sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                                after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
                                 state.window.request_redraw();
                             }
                             return;
@@ -1593,17 +1584,7 @@ impl ApplicationHandler<WritEvent> for App {
                                 && !text.is_empty()
                             {
                                 self.doc_engine.editor.insert_str(&text);
-                                self.doc_engine.refresh(w, state.scale, vh);
-                                spawn_ref_validations(
-                                    &self.doc_engine.editor,
-                                    self.doc_engine.doc.as_ref().map(|d| {
-                                        let (a, b) = d.visible_range(vh);
-                                        a..b
-                                    }),
-                                    &self.runtime,
-                                    &self.proxy,
-                                );
-                                sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                                after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
                                 sync_autocomplete(
                                     &mut self.doc_engine.editor,
                                     &self.runtime,
@@ -1649,17 +1630,7 @@ impl ApplicationHandler<WritEvent> for App {
                             if has && self.doc_engine.editor.accept_autocomplete_suggestion() =>
                         {
                             self.hovered = None;
-                            self.doc_engine.refresh(w, state.scale, vh);
-                            spawn_ref_validations(
-                                &self.doc_engine.editor,
-                                self.doc_engine.doc.as_ref().map(|d| {
-                                    let (a, b) = d.visible_range(vh);
-                                    a..b
-                                }),
-                                &self.runtime,
-                                &self.proxy,
-                            );
-                            sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                            after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
                             state.window.request_redraw();
                             return;
                         }
@@ -1669,17 +1640,7 @@ impl ApplicationHandler<WritEvent> for App {
 
                 if apply_key(&mut self.doc_engine.editor, self.modifiers, &event) {
                     self.hovered = None;
-                    self.doc_engine.refresh(w, state.scale, vh);
-                    spawn_ref_validations(
-                        &self.doc_engine.editor,
-                        self.doc_engine.doc.as_ref().map(|d| {
-                            let (a, b) = d.visible_range(vh);
-                            a..b
-                        }),
-                        &self.runtime,
-                        &self.proxy,
-                    );
-                    sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                    after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
                     sync_autocomplete(
                         &mut self.doc_engine.editor,
                         &self.runtime,
@@ -1869,17 +1830,7 @@ impl ApplicationHandler<WritEvent> for App {
             let (_, editor_h) = chrome_metrics(state.scale, state.surface.config.height as f32);
             let window = state.window.clone();
             let scale = state.scale;
-            self.doc_engine.refresh(w, scale, editor_h);
-            spawn_ref_validations(
-                &self.doc_engine.editor,
-                self.doc_engine.doc.as_ref().map(|d| {
-                    let (a, b) = d.visible_range(editor_h);
-                    a..b
-                }),
-                &self.runtime,
-                &self.proxy,
-            );
-            sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+            after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, scale, editor_h);
             window.request_redraw();
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(
