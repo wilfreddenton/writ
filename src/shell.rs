@@ -238,6 +238,9 @@ struct App {
     /// Timestamp of the last auto-scroll tick, so scrolling integrates against real
     /// elapsed time (frame-rate independent) rather than a fixed amount per tick.
     last_drag_tick: Option<std::time::Instant>,
+    /// Set by async completions (validation/image); the next redraw does a single
+    /// rebuild, coalescing many same-frame completions into one relayout.
+    pending_rebuild: bool,
     /// System clipboard for copy/cut/paste. Held for the app's lifetime (on Wayland the
     /// instance keeps serving the copied data). `None` if the platform init failed.
     clipboard: Option<arboard::Clipboard>,
@@ -300,6 +303,7 @@ impl App {
             click_count: 0,
             drag_scroll_dy: 0.0,
             last_drag_tick: None,
+            pending_rebuild: false,
             clipboard: arboard::Clipboard::new().ok(),
             title,
             hovered: None,
@@ -377,10 +381,9 @@ fn load_local_image(doc_dir: Option<&Path>, url: &str) -> Option<LoadedImage> {
         .and_then(|bytes| decode(&bytes))
 }
 
-/// GET + decode a remote image. Mirrors the reqwest/rustls client pattern in github.rs.
-/// Logs (rather than silently drops) the failure reason — a non-2xx status, a transport
-/// error, or an undecodable body (e.g. SVG, which the `image` crate can't rasterize).
-async fn load_remote_image(url: &str) -> Option<crate::image_cache::LoadedImage> {
+/// GET the raw bytes of a remote image (async, on the reactor). Logs a non-2xx status or
+/// transport error. Decoding is deliberately separate so it can run off the reactor.
+async fn fetch_remote_image(url: &str) -> Option<Vec<u8>> {
     let resp = match IMAGE_CLIENT
         .get(url)
         .header("User-Agent", "writ")
@@ -394,8 +397,13 @@ async fn load_remote_image(url: &str) -> Option<crate::image_cache::LoadedImage>
             return None;
         }
     };
-    let bytes = resp.bytes().await.ok()?;
-    match decode(&bytes) {
+    resp.bytes().await.ok().map(|b| b.to_vec())
+}
+
+/// Decode image bytes (CPU-heavy — run on a blocking thread, not the async reactor).
+/// Logs an undecodable body (e.g. SVG, which the `image` crate can't rasterize).
+fn decode_image_bytes(url: &str, bytes: &[u8]) -> Option<LoadedImage> {
+    match decode(bytes) {
         Some(img) => Some(img),
         None => {
             eprintln!(
@@ -405,6 +413,13 @@ async fn load_remote_image(url: &str) -> Option<crate::image_cache::LoadedImage>
             None
         }
     }
+}
+
+/// GET + decode a remote image inline. Used by the blocking snapshot path; the live GUI
+/// path fetches then decodes on a blocking thread (see `spawn_image_loads`).
+async fn load_remote_image(url: &str) -> Option<LoadedImage> {
+    let bytes = fetch_remote_image(url).await?;
+    decode_image_bytes(url, &bytes)
 }
 
 /// For each standalone-image URL with no cache entry, mark it loading and spawn a
@@ -428,7 +443,19 @@ fn spawn_image_loads(
         let url = url.clone();
         if url.starts_with("http://") || url.starts_with("https://") {
             runtime.spawn(async move {
-                match load_remote_image(&url).await {
+                // Fetch on the reactor, but decode on a blocking thread so CPU-heavy
+                // rasterization doesn't stall the async workers shared with GitHub validation.
+                let loaded = match fetch_remote_image(&url).await {
+                    Some(bytes) => {
+                        let u = url.clone();
+                        tokio::task::spawn_blocking(move || decode_image_bytes(&u, &bytes))
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                    None => None,
+                };
+                match loaded {
                     Some(img) => cache.set_loaded(&url, img),
                     None => cache.set_failed(&url),
                 }
@@ -700,6 +727,12 @@ fn apply_key(
                         editor.select_all();
                         return true;
                     }
+                    if c.eq_ignore_ascii_case("r") {
+                        // Force GitHub refs to re-validate (bust a stale/invalid cache);
+                        // returning true runs after_edit, which re-spawns validation.
+                        editor.revalidate_github_refs();
+                        return true;
+                    }
                 }
                 return false;
             }
@@ -925,6 +958,14 @@ fn apply_fetched(editor: &mut Editor, fetched: FetchedSuggestions) {
 
 /// Find the GitHub ref (regular or naked-URL) under a screen point, with its
 /// on-screen anchor rect. Returns None when the pointer isn't over a detected ref.
+/// Index of the autocomplete row whose rect contains `pos` (physical px), if any.
+fn ac_row_at(rects: &[ScreenRect], pos: (f32, f32)) -> Option<usize> {
+    let (px, py) = (pos.0 as f64, pos.1 as f64);
+    rects
+        .iter()
+        .position(|&(x0, y0, x1, y1)| px >= x0 && px <= x1 && py >= y0 && py <= y1)
+}
+
 fn find_hover_target(editor: &Editor, doc: &DocLayout, x: f32, y: f32) -> Option<HoverTarget> {
     let off = doc.hit_test(x, y)?;
     hover_target_at_offset(editor, doc, off)
@@ -1391,14 +1432,11 @@ impl ApplicationHandler<WritEvent> for App {
                 apply_fetched(&mut self.doc_engine.editor, fetched);
             }
         }
+        // Defer the relayout to the next redraw so a burst of completions (many refs /
+        // images finishing in the same frame) collapses into a single rebuild.
         if let Some(state) = self.state.as_ref() {
-            let w = state.surface.config.width as f32;
-            let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
-            let scale = state.scale;
-            let window = state.window.clone();
-            self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
-            self.sync_images();
-            window.request_redraw();
+            self.pending_rebuild = true;
+            state.window.request_redraw();
         }
     }
 
@@ -1451,9 +1489,9 @@ impl ApplicationHandler<WritEvent> for App {
             window,
             scale,
         });
-        // Validate refs already present in the loaded file, and start loading images.
+        // Validate refs already present in the loaded file, and start loading images
+        // (spawn_validations already calls sync_images).
         self.spawn_validations();
-        self.sync_images();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1579,6 +1617,12 @@ impl ApplicationHandler<WritEvent> for App {
                     self.drag_scroll_dy = drag_edge_velocity(self.mouse_pos.1, vh, state.scale);
                     drag_extend_step(&mut self.doc_engine, self.mouse_pos, 0.0, w, state.scale, vh);
                     state.window.request_redraw();
+                } else if self.doc_engine.editor.autocomplete().is_some() {
+                    // Autocomplete popup open: the highlighted row follows the pointer.
+                    if let Some(row) = ac_row_at(&self.ac_row_rects, self.mouse_pos) {
+                        self.doc_engine.editor.autocomplete_select(row);
+                        state.window.request_redraw();
+                    }
                 } else {
                     // Not dragging: update the hovered GitHub ref (popover source).
                     let new = self.doc_engine.doc.as_ref().and_then(|d| {
@@ -1608,13 +1652,7 @@ impl ApplicationHandler<WritEvent> for App {
 
                 // Autocomplete row click: accept that suggestion, don't move the caret.
                 if self.doc_engine.editor.autocomplete().is_some()
-                    && let Some(row) = self.ac_row_rects.iter().position(|r| {
-                        let (x0, y0, x1, y1) = *r;
-                        (self.mouse_pos.0 as f64) >= x0
-                            && (self.mouse_pos.0 as f64) <= x1
-                            && (self.mouse_pos.1 as f64) >= y0
-                            && (self.mouse_pos.1 as f64) <= y1
-                    })
+                    && let Some(row) = ac_row_at(&self.ac_row_rects, self.mouse_pos)
                 {
                     self.doc_engine.editor.autocomplete_select(row);
                     if self.doc_engine.editor.accept_autocomplete_suggestion() {
@@ -1808,6 +1846,14 @@ impl ApplicationHandler<WritEvent> for App {
                 let width = state.surface.config.width as f32;
                 let height = state.surface.config.height as f32;
                 let (content_top, editor_h) = chrome_metrics(state.scale, height);
+
+                // Apply any coalesced async-completion rebuild once, before drawing.
+                if self.pending_rebuild {
+                    self.doc_engine
+                        .rebuild_preserving_scroll(width, state.scale, editor_h);
+                    sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                    self.pending_rebuild = false;
+                }
 
                 if let Some(doc) = self.doc_engine.doc.as_ref() {
                     // Editor content, clipped to the region between the chrome bars.

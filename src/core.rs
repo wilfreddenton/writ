@@ -360,6 +360,16 @@ impl Editor {
         &self.github_validation_cache
     }
 
+    /// Clear the GitHub ref-validation and autocomplete caches so every detected ref
+    /// re-validates from scratch — the Ctrl+R escape hatch for stale/invalid results.
+    pub fn revalidate_github_refs(&self) {
+        self.github_validation_cache.clear();
+        if let Some(client) = self.github_client.as_ref() {
+            client.clear_autocomplete_cache();
+            client.clear_user_cache();
+        }
+    }
+
     pub fn github_refs_by_line(&self) -> &HashMap<usize, Vec<RawGitHubMatch>> {
         &self.github_refs_by_line
     }
