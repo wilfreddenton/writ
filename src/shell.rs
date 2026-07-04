@@ -1425,6 +1425,83 @@ fn draw_autocomplete(
     rects
 }
 
+/// Paint the clipped document body (diff backgrounds, quote gutters, rules, images,
+/// selection, glyphs, caret) plus the bottom status bar into `scene`. Overlays
+/// (hover popover / autocomplete) differ per caller and are drawn separately. Shared by
+/// the live redraw and the headless snapshot so the golden frame can't drift from the
+/// real one. Takes the doc-engine's fields individually so callers can pass a `doc`
+/// borrowed from the same engine alongside `&mut` access to its text engine.
+#[allow(clippy::too_many_arguments)]
+fn paint_document(
+    scene: &mut Scene,
+    engine: &mut TextEngine,
+    theme: &EditorTheme,
+    editor: &Editor,
+    doc: &DocLayout,
+    content_top: f32,
+    editor_h: f32,
+    width: f32,
+    height: f32,
+    scale: f32,
+) {
+    let clip = Rect::new(
+        0.0,
+        content_top as f64,
+        width as f64,
+        (content_top + editor_h) as f64,
+    );
+    scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+    // Draw order (all before glyphs): diff row/word bg, quote gutters, rules, images,
+    // then selection.
+    doc.draw_added_backgrounds(scene, editor_h);
+    doc.draw_blockquote_gutters(scene, editor_h);
+    doc.draw_horizontal_rules(scene, editor_h);
+    doc.draw_images(engine, scene, editor_h);
+    if let Some(sel) = editor.selection_range() {
+        let color = peniko_color(theme.selection);
+        for (x0, y0, x1, y1) in doc.selection_rects(sel) {
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                color,
+                None,
+                &Rect::new(x0, y0, x1, y1),
+            );
+        }
+    }
+    doc.draw(engine, scene, editor_h);
+    let cw = CARET_WIDTH * scale;
+    let caret = doc
+        .preedit_caret_rect(cw)
+        .or_else(|| doc.caret_rect(editor.cursor_position(), cw));
+    if let Some((x0, y0, x1, y1)) = caret {
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            peniko_color(theme.foreground),
+            None,
+            &Rect::new(x0, y0, x1.max(x0 + 1.0), y1),
+        );
+    }
+    scene.pop_layer();
+
+    // Chrome: status bar (bottom). The title bar is the OS/compositor's native one.
+    let info = build_status_info(editor, doc, editor_h);
+    draw_status_bar(
+        engine,
+        scene,
+        theme,
+        &BarRect {
+            x0: 0.0,
+            y0: (content_top + editor_h) as f64,
+            x1: width as f64,
+            y1: height as f64,
+        },
+        &info,
+        scale,
+    );
+}
+
 impl ApplicationHandler<WritEvent> for App {
     /// A tokio task finished (validation/suggestion). Results are already in the
     /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
@@ -1888,64 +1965,16 @@ impl ApplicationHandler<WritEvent> for App {
                 }
 
                 if let Some(doc) = self.doc_engine.doc.as_ref() {
-                    // Editor content, clipped to the region between the chrome bars.
-                    let clip = Rect::new(
-                        0.0,
-                        content_top as f64,
-                        width as f64,
-                        (content_top + editor_h) as f64,
-                    );
-                    self.scene
-                        .push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
-                    // Draw order (all before glyphs): diff row/word bg, quote gutters,
-                    // then selection.
-                    doc.draw_added_backgrounds(&mut self.scene, editor_h);
-                    doc.draw_blockquote_gutters(&mut self.scene, editor_h);
-                    doc.draw_horizontal_rules(&mut self.scene, editor_h);
-                    doc.draw_images(&mut self.doc_engine.text_engine, &mut self.scene, editor_h);
-                    if let Some(sel) = self.doc_engine.editor.selection_range() {
-                        let color = peniko_color(self.doc_engine.theme.selection);
-                        for (x0, y0, x1, y1) in doc.selection_rects(sel) {
-                            self.scene.fill(
-                                Fill::NonZero,
-                                Affine::IDENTITY,
-                                color,
-                                None,
-                                &Rect::new(x0, y0, x1, y1),
-                            );
-                        }
-                    }
-                    doc.draw(&self.doc_engine.text_engine, &mut self.scene, editor_h);
-                    let cw = CARET_WIDTH * state.scale;
-                    let caret = doc.preedit_caret_rect(cw).or_else(|| {
-                        doc.caret_rect(self.doc_engine.editor.cursor_position(), cw)
-                    });
-                    if let Some((x0, y0, x1, y1)) = caret {
-                        self.scene.fill(
-                            Fill::NonZero,
-                            Affine::IDENTITY,
-                            peniko_color(self.doc_engine.theme.foreground),
-                            None,
-                            &Rect::new(x0, y0, x1.max(x0 + 1.0), y1),
-                        );
-                    }
-                    self.scene.pop_layer();
-
-                    // Chrome: status bar (bottom). The title bar is the OS/compositor's
-                    // native one (filename goes there via `set_title`); we don't draw our
-                    // own — that would double up on the native decoration.
-                    let info = build_status_info(&self.doc_engine.editor, doc, editor_h);
-                    draw_status_bar(
-                        &mut self.doc_engine.text_engine,
+                    paint_document(
                         &mut self.scene,
+                        &mut self.doc_engine.text_engine,
                         &self.doc_engine.theme,
-                        &BarRect {
-                            x0: 0.0,
-                            y0: (content_top + editor_h) as f64,
-                            x1: width as f64,
-                            y1: height as f64,
-                        },
-                        &info,
+                        &self.doc_engine.editor,
+                        doc,
+                        content_top,
+                        editor_h,
+                        width,
+                        height,
                         state.scale,
                     );
 
@@ -2294,52 +2323,16 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     doc = de.rebuild(width as f32, 1.0, 0, f32::INFINITY);
     doc.scroll_by(scroll_y, editor_h);
     let mut scene = Scene::new();
-    let clip = Rect::new(
-        0.0,
-        content_top as f64,
-        width as f64,
-        (content_top + editor_h) as f64,
-    );
-    scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
-    doc.draw_added_backgrounds(&mut scene, editor_h);
-    doc.draw_blockquote_gutters(&mut scene, editor_h);
-    doc.draw_horizontal_rules(&mut scene, editor_h);
-    doc.draw_images(&mut de.text_engine, &mut scene, editor_h);
-    if let Some(sel) = de.editor.selection_range() {
-        let color = peniko_color(de.theme.selection);
-        for (x0, y0, x1, y1) in doc.selection_rects(sel) {
-            scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                color,
-                None,
-                &Rect::new(x0, y0, x1, y1),
-            );
-        }
-    }
-    doc.draw(&de.text_engine, &mut scene, editor_h);
-    if let Some((x0, y0, x1, y1)) = doc.caret_rect(de.editor.cursor_position(), 2.0) {
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            peniko_color(de.theme.foreground),
-            None,
-            &Rect::new(x0, y0, x1.max(x0 + 1.0), y1),
-        );
-    }
-    scene.pop_layer();
-    let info = build_status_info(&de.editor, &doc, editor_h);
-    draw_status_bar(
-        &mut de.text_engine,
+    paint_document(
         &mut scene,
+        &mut de.text_engine,
         &de.theme,
-        &BarRect {
-            x0: 0.0,
-            y0: (content_top + editor_h) as f64,
-            x1: width as f64,
-            y1: height as f64,
-        },
-        &info,
+        &de.editor,
+        &doc,
+        content_top,
+        editor_h,
+        width as f32,
+        height as f32,
         1.0,
     );
 
