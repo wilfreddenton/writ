@@ -1,5 +1,9 @@
 # writ: gpui → winit+wgpu+Vello+Parley migration plan
 
+> **Status: COMPLETE.** This migration shipped — gpui is fully removed and writ runs on
+> winit + wgpu + Vello + Parley (all 8 phases done). This document is kept as a historical
+> record of the plan; see the README for the current architecture.
+
 ## Strategy
 
 This is a one-shot clean cut: gpui, gpui_platform, and the `[patch.crates-io]` block are deleted at the end, and no gpui-compat shim runs in parallel during the migration. We take a walking-skeleton approach — get pixels on screen against the real published stack (winit 0.30 + wgpu 29 + Vello 0.9 + Parley 0.11) as fast as possible with a hard-coded string (Phase 0–1), then layer document rendering, scrolling, input, diff, and chrome onto that skeleton one independently-runnable milestone at a time. The ~8600 lines of gpui-free logic (`marker.rs`, `parser.rs`, `cursor.rs`, `highlight.rs`, `inline.rs` with its `full_range`/`content_range` hidden-marker model, `buffer.rs` rope+`RenderSnapshot`, `diff.rs`, `github.rs`/`git.rs`, `paste.rs`, `demo.rs`, `writd.rs`) stay untouched as pure logic and are the ballast that makes this feasible; the work is concentrated in `line.rs`, the `Render` half of `editor/mod.rs`, `main.rs`, and the chrome files. The load-bearing new invariant threaded through every render/input phase is the **display→buffer segment map** that replaces gpui's `buffer_to_visual_pos`/`visual_to_buffer_pos`, because Parley lays out the *display* string (markers hidden) while cursor/selection/click/diff math all speak *buffer* bytes.
