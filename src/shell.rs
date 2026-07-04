@@ -227,6 +227,17 @@ struct App {
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
     mouse_down: bool,
+    /// Click-count tracking for double/triple-click select (winit doesn't provide it):
+    /// the last press's time + position, and the running count (cycles 1→2→3).
+    last_click: Option<(std::time::Instant, (f32, f32))>,
+    click_count: usize,
+    /// Non-zero while a drag is in a top/bottom edge hot zone: the auto-scroll velocity
+    /// in physical px/second. Drives continuous auto-scroll from `about_to_wait` so the
+    /// selection keeps growing even when the pointer is held still at the edge.
+    drag_scroll_dy: f32,
+    /// Timestamp of the last auto-scroll tick, so scrolling integrates against real
+    /// elapsed time (frame-rate independent) rather than a fixed amount per tick.
+    last_drag_tick: Option<std::time::Instant>,
     /// System clipboard for copy/cut/paste. Held for the app's lifetime (on Wayland the
     /// instance keeps serving the copied data). `None` if the platform init failed.
     clipboard: Option<arboard::Clipboard>,
@@ -285,6 +296,10 @@ impl App {
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             mouse_down: false,
+            last_click: None,
+            click_count: 0,
+            drag_scroll_dy: 0.0,
+            last_drag_tick: None,
             clipboard: arboard::Clipboard::new().ok(),
             title,
             hovered: None,
@@ -510,6 +525,67 @@ const PAGE_LINES: usize = 20;
 /// spans every line the layout materializes and draws (viewport + measure overscan),
 /// keeping scrolled-in refs colored while bounding the per-keystroke scan.
 const DETECT_OVERSCAN_LINES: usize = 200;
+
+/// Max gap between presses (and max pointer travel, in physical px) still counted as a
+/// repeated click for double/triple-click selection.
+const MULTI_CLICK_MS: u128 = 400;
+const MULTI_CLICK_DIST: f32 = 6.0;
+
+// Drag-select autoscroll tuning. Follows the de-facto pattern (VS Code, CodeMirror 6,
+// AppKit, GTK): a hot zone at the viewport edge, speed that eases in across the zone then
+// grows with how far the pointer is past the edge, capped so a flick can't teleport — all
+// integrated against real elapsed time (frame-rate independent) like VS Code's
+// dragScrolling. Values are logical px; the caller multiplies by elapsed seconds.
+/// Depth of the top/bottom hot zone; speed eases 0→`EDGE_SPEED` across it.
+const DRAG_SCROLL_ZONE: f32 = 24.0;
+/// Speed right at the viewport edge (~6 lines/s) — the calm baseline.
+const DRAG_SCROLL_EDGE_SPEED: f32 = 140.0;
+/// Extra px/s per px the pointer is *past* the edge (e.g. dragged outside the window).
+const DRAG_SCROLL_GAIN: f32 = 10.0;
+/// Hard cap so pushing far past the edge stays fast-but-controllable (~36 lines/s).
+const DRAG_SCROLL_MAX_SPEED: f32 = 800.0;
+
+/// Auto-scroll velocity (physical px/second) when a drag pointer sits at height `y` in a
+/// `[0, editor_h]` viewport: 0 in the middle; eases in across the hot zone; grows
+/// linearly once past the edge; clamped to `MAX_SPEED`. Negative = scroll up. The caller
+/// multiplies by real elapsed seconds so speed is independent of tick/frame rate.
+fn drag_edge_velocity(y: f32, editor_h: f32, scale: f32) -> f32 {
+    let zone = DRAG_SCROLL_ZONE * scale;
+    let edge = DRAG_SCROLL_EDGE_SPEED * scale;
+    let cap = DRAG_SCROLL_MAX_SPEED * scale;
+    // `depth` = physical px past the inner edge of the zone (== zone at the viewport edge,
+    // > zone once outside the window). Sign picks scroll direction.
+    let (depth, dir) = if y < zone {
+        (zone - y, -1.0)
+    } else if y > editor_h - zone {
+        (y - (editor_h - zone), 1.0)
+    } else {
+        return 0.0;
+    };
+    let speed = edge * (depth / zone).min(1.0) + DRAG_SCROLL_GAIN * (depth - zone).max(0.0);
+    dir * speed.min(cap)
+}
+
+/// One drag step: scroll by `dy` (if any), then extend the selection to whatever sits
+/// under the viewport-clamped pointer (so dragging into the margin still grows it).
+/// Takes `&mut DocEngine` (not `&mut self`) so it composes while `state` is borrowed.
+fn drag_extend_step(
+    doc_engine: &mut DocEngine,
+    mouse: (f32, f32),
+    dy: f32,
+    w: f32,
+    scale: f32,
+    editor_h: f32,
+) {
+    if dy != 0.0 && let Some(doc) = doc_engine.doc.as_mut() {
+        doc.scroll_by(dy, editor_h);
+    }
+    let hy = mouse.1.clamp(0.0, editor_h);
+    if let Some(off) = doc_engine.doc.as_ref().and_then(|d| d.hit_test(mouse.0, hy)) {
+        doc_engine.editor.drag(off);
+    }
+    doc_engine.refresh(w, scale, editor_h);
+}
 
 fn apply_key(
     editor: &mut Editor,
@@ -1495,19 +1571,14 @@ impl ApplicationHandler<WritEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x as f32, position.y as f32);
                 if self.mouse_down {
-                    if let Some(off) = self
-                        .doc_engine
-                        .doc
-                        .as_ref()
-                        .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
-                    {
-                        self.doc_engine.editor.drag(off);
-                        let w = state.surface.config.width as f32;
-                        let (_, vh) =
-                            chrome_metrics(state.scale, state.surface.config.height as f32);
-                        self.doc_engine.refresh(w, state.scale, vh);
-                        state.window.request_redraw();
-                    }
+                    let w = state.surface.config.width as f32;
+                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                    // Record the edge auto-scroll velocity for the timer tick; the move
+                    // itself only extends the selection (dy=0), so scroll speed stays
+                    // fixed to the tick cadence rather than the mouse-move rate.
+                    self.drag_scroll_dy = drag_edge_velocity(self.mouse_pos.1, vh, state.scale);
+                    drag_extend_step(&mut self.doc_engine, self.mouse_pos, 0.0, w, state.scale, vh);
+                    state.window.request_redraw();
                 } else {
                     // Not dragging: update the hovered GitHub ref (popover source).
                     let new = self.doc_engine.doc.as_ref().and_then(|d| {
@@ -1576,9 +1647,21 @@ impl ApplicationHandler<WritEvent> for App {
                         let line = self.doc_engine.editor.line_of(off);
                         d.is_image_line(line).then_some(line)
                     });
+                    // Advance the click-count state machine (winit gives no click count):
+                    // within the time+distance threshold it cycles 1→2→3→1 (double = word,
+                    // triple = line select), else restarts at 1. Inlined (not a &mut self
+                    // method) so it uses disjoint fields while `state` stays borrowed.
+                    let now = std::time::Instant::now();
+                    let repeat = self.last_click.is_some_and(|(t, p)| {
+                        now.duration_since(t).as_millis() <= MULTI_CLICK_MS
+                            && (p.0 - self.mouse_pos.0).hypot(p.1 - self.mouse_pos.1)
+                                <= MULTI_CLICK_DIST
+                    });
+                    self.click_count = if repeat { (self.click_count % 3) + 1 } else { 1 };
+                    self.last_click = Some((now, self.mouse_pos));
                     self.doc_engine
                         .editor
-                        .click(off, self.modifiers.shift_key(), 1);
+                        .click(off, self.modifiers.shift_key(), self.click_count);
                     self.doc_engine.refresh(w, state.scale, vh);
                     if let Some(line) = image_line
                         && let Some(off2) = self
@@ -1609,6 +1692,7 @@ impl ApplicationHandler<WritEvent> for App {
                 ..
             } => {
                 self.mouse_down = false;
+                self.drag_scroll_dy = 0.0;
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // Ctrl-W / Super-W closes the window (does not auto-save; use Ctrl-S).
@@ -1882,9 +1966,39 @@ impl ApplicationHandler<WritEvent> for App {
 
     /// Park the loop until the next real event. External file edits arrive as
     /// `WritEvent::FileChanged` (forwarded from the watcher thread), so there's no
-    /// need to wake on a timer.
+    /// need to poll on a timer — EXCEPT while a drag sits in an edge hot zone, when we
+    /// tick a short timer to keep auto-scrolling the selection even if the pointer is
+    /// held still.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::Wait);
+        if self.mouse_down && self.drag_scroll_dy != 0.0 {
+            // Integrate velocity against real elapsed time: a first tick (no prior
+            // timestamp) scrolls nothing and just starts the clock, so the amount can't
+            // spike regardless of how the loop woke.
+            let now = std::time::Instant::now();
+            let dt = self
+                .last_drag_tick
+                .map_or(0.0, |t| now.duration_since(t).as_secs_f32());
+            self.last_drag_tick = Some(now);
+            let dy = self.drag_scroll_dy * dt;
+            if let Some((w, editor_h, scale, window)) = self.state.as_ref().map(|s| {
+                let (_, editor_h) = chrome_metrics(s.scale, s.surface.config.height as f32);
+                (
+                    s.surface.config.width as f32,
+                    editor_h,
+                    s.scale,
+                    s.window.clone(),
+                )
+            }) {
+                drag_extend_step(&mut self.doc_engine, self.mouse_pos, dy, w, scale, editor_h);
+                window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                now + std::time::Duration::from_millis(16),
+            ));
+        } else {
+            self.last_drag_tick = None;
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 }
 
@@ -2289,6 +2403,27 @@ mod tests {
 
     fn texts(segs: &[PanelSeg]) -> Vec<&str> {
         segs.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn drag_edge_velocity_zones() {
+        let h = 400.0;
+        // Middle of the viewport: no auto-scroll.
+        assert_eq!(drag_edge_velocity(200.0, h, 1.0), 0.0);
+        // Top zone: negative (scroll up), deeper = faster.
+        assert!(drag_edge_velocity(5.0, h, 1.0) < drag_edge_velocity(20.0, h, 1.0));
+        assert!(drag_edge_velocity(5.0, h, 1.0) < 0.0);
+        // Bottom zone: positive (scroll down).
+        assert!(drag_edge_velocity(h - 2.0, h, 1.0) > 0.0);
+        // At the exact edge the speed eases to EDGE_SPEED (not the cap).
+        assert!((drag_edge_velocity(0.0, h, 1.0) + DRAG_SCROLL_EDGE_SPEED).abs() < 1e-3);
+        // Past the edge (outside the window) it grows but never exceeds the cap.
+        assert!(drag_edge_velocity(-10.0, h, 1.0).abs() > DRAG_SCROLL_EDGE_SPEED);
+        assert!(drag_edge_velocity(-100_000.0, h, 1.0).abs() <= DRAG_SCROLL_MAX_SPEED + 1e-3);
+        assert!(drag_edge_velocity(h + 100_000.0, h, 1.0) <= DRAG_SCROLL_MAX_SPEED + 1e-3);
+        // Scale widens the zone: 30px from the top is inside the zone at 2x, not at 1x.
+        assert!(drag_edge_velocity(30.0, h, 2.0) < 0.0);
+        assert_eq!(drag_edge_velocity(30.0, h, 1.0), 0.0);
     }
 
     #[test]
