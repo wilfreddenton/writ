@@ -35,6 +35,19 @@ pub struct ImageRef {
     pub alt: String,
 }
 
+/// An image appearing inline within a line (e.g. a badge row, or mixed with text) —
+/// as opposed to a standalone-image paragraph. Its `![alt](url)` span is collapsed to
+/// a zero-width point in the display; the layout reserves a Parley inline box there and
+/// the draw path paints the image (or a placeholder) at the box's position.
+#[derive(Clone)]
+pub struct InlineImageRef {
+    pub url: String,
+    pub alt: String,
+    /// Display byte offset of the collapsed image's zero-width point (where the inline
+    /// box sits). Ordered left-to-right across a line.
+    pub display_offset: usize,
+}
+
 /// Fully-resolved styling for one line, ready to hand to `TextEngine::build_line`.
 #[derive(Clone)]
 pub struct LineRender {
@@ -60,6 +73,11 @@ pub struct LineRender {
     /// markdown text is hidden and an image block is drawn instead. `None` while the
     /// cursor is on the line, so the raw markdown is revealed for editing.
     pub image: Option<ImageRef>,
+    /// Inline images on the line (`![alt](url)` mixed with text or other images), each
+    /// collapsed to a zero-width point where the draw path reserves an inline box. Empty
+    /// while the cursor is on the line (raw markdown revealed) and on standalone-image
+    /// lines (mutually exclusive with `image`). Ordered by `display_offset`.
+    pub inline_images: Vec<InlineImageRef>,
 }
 
 /// Font-size multiplier for a heading level (1 = largest). 0 = body text.
@@ -193,6 +211,9 @@ pub fn build_line_render(
     // render as a drawn rule (unless the cursor is on the line, for editing).
     let is_hr = markers.is_thematic_break() && !cursor_on_line && !in_code_block;
     let mut specials: Vec<Special> = Vec::new();
+    // Inline images collected during the specials pass: (buffer offset of the collapsed
+    // `![alt](url)` span, url, alt). Resolved to display offsets once the map is built.
+    let mut inline_image_specs: Vec<(usize, String, String)> = Vec::new();
     if !in_code_block {
         // Heading `# ` prefix hides when the cursor is elsewhere.
         if heading_level > 0
@@ -249,6 +270,22 @@ pub fn build_line_render(
             if cursor_inside[i] {
                 continue; // reveal the whole region (markers included) for editing
             }
+            // Inline image: collapse the whole `![alt](url)` span to a zero-width point
+            // and record it. The draw path reserves an inline box there and paints the
+            // image; unlike the delimiter-hiding fallback, no alt/link text shows.
+            if region.is_image
+                && !cursor_on_line
+                && region.content_range.start >= line_start
+                && region.content_range.end <= line_end
+                && let Some(url) = &region.link_url
+            {
+                specials.push(Special::Hidden(region.full_range.clone()));
+                let alt = line_text
+                    [region.content_range.start - line_start..region.content_range.end - line_start]
+                    .to_string();
+                inline_image_specs.push((region.full_range.start, url.clone(), alt));
+                continue;
+            }
             if let Some(dt) = &region.display_text {
                 specials.push(Special::Collapsed {
                     buffer: region.full_range.clone(),
@@ -271,6 +308,19 @@ pub fn build_line_render(
     }
 
     let (text, map) = SegmentMap::build(&line_text, line_start, &specials);
+
+    // Resolve each collapsed inline image to its zero-width display point, ordered
+    // left-to-right. The `![alt](url)` span was hidden, so this offset is where the
+    // draw path anchors the inline box.
+    let mut inline_images: Vec<InlineImageRef> = inline_image_specs
+        .into_iter()
+        .map(|(buffer_start, url, alt)| InlineImageRef {
+            url,
+            alt,
+            display_offset: map.buffer_to_display(buffer_start),
+        })
+        .collect();
+    inline_images.sort_by_key(|i| i.display_offset);
 
     // Display offsets of each blockquote marker (outermost first), for the drawn gutter
     // rules. Skipped inside code blocks, where `> ` isn't a quote marker.
@@ -374,6 +424,7 @@ pub fn build_line_render(
         is_hr,
         image,
         code_ranges,
+        inline_images,
     }
 }
 
@@ -533,6 +584,35 @@ mod tests {
         let styles = snap.inline_styles_by_line();
         let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &styles[0], &[]);
         assert!(lr.image.is_none(), "image amid other text is not standalone");
+    }
+
+    /// Two images on one line (a badge row) become inline-image refs off-cursor: their
+    /// `![...](...)` markdown is hidden and their display offsets ascend. With the cursor
+    /// on the line the refs vanish and the raw markdown is revealed for editing.
+    #[test]
+    fn inline_images_collapsed_off_line_revealed_on_line() {
+        let theme = EditorTheme::dracula();
+        let mut buffer: Buffer = "![a](x.png) and ![b](y.png)\n".parse().unwrap();
+        let snap = buffer.render_snapshot();
+        let styles = snap.inline_styles_by_line();
+
+        let off = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &styles[0], &[]);
+        assert_eq!(off.inline_images.len(), 2, "both inline images detected");
+        assert!(
+            off.inline_images[0].display_offset <= off.inline_images[1].display_offset,
+            "display offsets ascend left-to-right"
+        );
+        assert!(
+            !off.text.contains("!["),
+            "the `![...](...)` markdown is hidden, got {:?}",
+            off.text
+        );
+        assert!(off.image.is_none(), "not a standalone image");
+
+        // Cursor on the line: raw markdown revealed, no inline boxes.
+        let on = build_line_render(&snap, 0, &theme, 18.0, 0, &styles[0], &[]);
+        assert!(on.inline_images.is_empty(), "cursor on the line reveals markdown");
+        assert!(on.text.contains("!["), "raw markdown shown, got {:?}", on.text);
     }
 
     /// The blockquote bar is no longer a `▎` glyph in the text — the marker collapses

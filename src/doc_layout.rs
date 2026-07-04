@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
 
-use parley::{Affinity, Cluster, Cursor, Selection};
+use parley::{Affinity, Cluster, Cursor, PositionedLayoutItem, Selection};
 use vello::Scene;
 use vello::kurbo::{Affine, Rect, Stroke};
 use vello::peniko::{Brush, Color, Fill, ImageBrush};
@@ -195,6 +195,10 @@ impl RenderCache {
 const IMG_VPAD: f32 = 8.0;
 /// Block height (logical px) reserved for a loading/failed image placeholder.
 const IMG_PLACEHOLDER_H: f32 = 120.0;
+/// Placeholder box size (logical px) reserved inline for an image that hasn't loaded
+/// yet (or failed) — small, since the real size is unknown until decode.
+const INLINE_IMG_PLACEHOLDER_W: f32 = 80.0;
+const INLINE_IMG_PLACEHOLDER_H: f32 = 20.0;
 
 /// A standalone image to paint on a line: its load state plus the sizing the draw
 /// pass needs. `dest_*` are device px on screen; `nat_*` are the image's intrinsic
@@ -215,6 +219,15 @@ enum ImageBlockKind {
     },
     Loading,
     Failed,
+}
+
+/// Draw data for one inline image, indexed by its Parley inline-box `id`. The box's
+/// on-line position + size come from the laid-out `PositionedInlineBox`; this carries
+/// only what's needed to paint there — the brush + intrinsic pixel size for a loaded
+/// image, or `None` for a loading/failed/absent placeholder rect.
+struct InlineImageDraw {
+    /// `(brush, nat_w, nat_h)` for a loaded image; `None` paints a placeholder box.
+    brush: Option<(ImageBrush, f32, f32)>,
 }
 
 /// Inline git-diff decorations for one real line (added-line bg + word ranges).
@@ -298,6 +311,7 @@ fn build_ghosts_before(
             Some(max_advance),
             &lr.runs,
             lr.content_start,
+            &[],
         );
         let line_start = old.line_markers(old_line).range.start;
         let inline = d
@@ -414,6 +428,10 @@ pub struct DocLayout {
     /// line's height with the image (or placeholder) block and is painted by
     /// `draw_images`; `None` for ordinary lines.
     image_blocks: Vec<Option<ImageBlock>>,
+    /// Per-line inline-image draw data, parallel to `layouts`. Each inner vec is indexed
+    /// by the Parley inline-box `id` (= its order on the line). Empty for lines without
+    /// inline images.
+    inline_draws: Vec<Vec<InlineImageDraw>>,
     /// Distinct image URLs across the materialized lines, for the shell to kick off
     /// loads (diffed against the shared cache).
     image_urls: Vec<String>,
@@ -512,6 +530,7 @@ impl DocLayout {
             is_hr: false,
             image: None,
             code_ranges: Vec::new(),
+            inline_images: Vec::new(),
         });
         let mut measured_y = pad_top * scale; // tops-space y consumed by materialized lines
         let mut estimating = false;
@@ -528,6 +547,7 @@ impl DocLayout {
         let mut ghost_height = Vec::with_capacity(n);
         let mut quote_bars: Vec<Vec<f32>> = Vec::with_capacity(n);
         let mut image_blocks: Vec<Option<ImageBlock>> = Vec::with_capacity(n);
+        let mut inline_draws: Vec<Vec<InlineImageDraw>> = Vec::with_capacity(n);
         let mut image_urls: Vec<String> = Vec::new();
         // Content width available to an image (device px), same basis as `max_advance`.
         let content_w = max_advance;
@@ -560,6 +580,7 @@ impl DocLayout {
                 ghost_height.push(0.0);
                 quote_bars.push(Vec::new());
                 image_blocks.push(None);
+                inline_draws.push(Vec::new());
                 continue;
             }
             // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
@@ -595,6 +616,39 @@ impl DocLayout {
                     &extra,
                 ))
             };
+            // Inline images: resolve each to a box size (natural device size, shrunk to
+            // fit the content width) + draw spec, and reserve an inline box in the layout.
+            // Loading/failed/absent images get a small fixed placeholder box.
+            let mut inline_boxes: Vec<(usize, f32, f32)> = Vec::new();
+            let line_inline_draws: Vec<InlineImageDraw> = lr
+                .inline_images
+                .iter()
+                .map(|ii| {
+                    if !image_urls.iter().any(|u| u == &ii.url) {
+                        image_urls.push(ii.url.clone());
+                    }
+                    let (w, h, draw) = match images.get(&ii.url) {
+                        Some(ImageState::Loaded(loaded)) => {
+                            let mut w = loaded.display_w * scale;
+                            let mut h = loaded.display_h * scale;
+                            if w > max_advance && w > 0.0 {
+                                h *= max_advance / w;
+                                w = max_advance;
+                            }
+                            let brush =
+                                Some((loaded.brush.clone(), loaded.width as f32, loaded.height as f32));
+                            (w, h, InlineImageDraw { brush })
+                        }
+                        _ => (
+                            INLINE_IMG_PLACEHOLDER_W * scale,
+                            INLINE_IMG_PLACEHOLDER_H * scale,
+                            InlineImageDraw { brush: None },
+                        ),
+                    };
+                    inline_boxes.push((ii.display_offset, w, h));
+                    draw
+                })
+                .collect();
             let key = line_key(
                 &lr.text,
                 scale,
@@ -604,8 +658,25 @@ impl DocLayout {
                 &lr.runs,
                 lr.content_start,
             );
-            let layout = cache.get_or_build(key, || {
-                engine.build_line_hanging(
+            // Lines with inline images bypass the layout cache: the box sizes change when
+            // an image loads (without any change to the cache key), so build fresh. They
+            // are rare, so the cost is negligible.
+            let layout = if inline_boxes.is_empty() {
+                cache.get_or_build(key, || {
+                    engine.build_line_hanging(
+                        &lr.text,
+                        scale,
+                        lr.font_size,
+                        line_height,
+                        fg,
+                        Some(max_advance),
+                        &lr.runs,
+                        lr.content_start,
+                        &[],
+                    )
+                })
+            } else {
+                Rc::new(engine.build_line_hanging(
                     &lr.text,
                     scale,
                     lr.font_size,
@@ -614,8 +685,9 @@ impl DocLayout {
                     Some(max_advance),
                     &lr.runs,
                     lr.content_start,
-                )
-            });
+                    &inline_boxes,
+                ))
+            };
             let range = snapshot.line_markers(i).range;
             // Inline diff: map added word ranges (line-relative buffer bytes) through
             // this line's segment map into display ranges.
@@ -663,6 +735,7 @@ impl DocLayout {
             ghosts.push(line_ghosts);
             ghost_height.push(gh);
             image_blocks.push(image_block);
+            inline_draws.push(line_inline_draws);
         }
         cache.sweep();
         render_cache.sweep();
@@ -681,6 +754,7 @@ impl DocLayout {
             ghost_height,
             quote_bars,
             image_blocks,
+            inline_draws,
             image_urls,
             img_vpad,
             img_label_size: 14.0 * scale,
@@ -906,6 +980,52 @@ impl DocLayout {
         }
     }
 
+    /// Paint line `i`'s inline images at their laid-out inline-box positions. `gy` is
+    /// the real line's top (device px, scroll-applied). A box's `id` indexes
+    /// `inline_draws[i]`: a loaded image is drawn scaled to the box; otherwise a faint
+    /// bordered placeholder rect fills the reserved space.
+    fn draw_inline_images(&self, scene: &mut Scene, i: usize, gy: f32) {
+        let draws = &self.inline_draws[i];
+        if draws.is_empty() {
+            return;
+        }
+        for line in self.layouts[i].lines() {
+            for item in line.items() {
+                let PositionedLayoutItem::InlineBox(pib) = item else {
+                    continue;
+                };
+                let Some(draw) = draws.get(pib.id as usize) else {
+                    continue;
+                };
+                let x = self.pad_x as f64 + pib.x as f64;
+                let y = gy as f64 + pib.y as f64;
+                match &draw.brush {
+                    Some((brush, nat_w, nat_h)) => {
+                        // draw_image paints at native pixel size, so scale box/intrinsic.
+                        let transform = Affine::translate((x, y))
+                            * Affine::scale_non_uniform(
+                                pib.width as f64 / *nat_w as f64,
+                                pib.height as f64 / *nat_h as f64,
+                            );
+                        scene.draw_image(brush, transform);
+                    }
+                    None => {
+                        let rect = Rect::new(x, y, x + pib.width as f64, y + pib.height as f64)
+                            .to_rounded_rect(3.0);
+                        scene.fill(Fill::NonZero, Affine::IDENTITY, self.image_bg, None, &rect);
+                        scene.stroke(
+                            &Stroke::new(1.0),
+                            Affine::IDENTITY,
+                            self.image_border,
+                            None,
+                            &rect,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Paint visible lines: ghost (deleted) rows above each line, then real glyphs.
     pub fn draw(&self, engine: &TextEngine, scene: &mut Scene, viewport_h: f32) {
         let (first, last) = self.visible_range(viewport_h);
@@ -937,6 +1057,9 @@ impl DocLayout {
             if !code.is_empty() {
                 self.fill_word_ranges(scene, &self.layouts[i], code, gy as f64, self.code_bg);
             }
+            // Inline images: paint each at its laid-out box position (a loaded image, or a
+            // faint bordered placeholder). Parley left a gap in the glyphs where the box is.
+            self.draw_inline_images(scene, i, gy);
             // The real line, below its ghost block.
             engine.draw_line(scene, &self.layouts[i], (self.pad_x, gy));
         }
@@ -1213,6 +1336,7 @@ mod tests {
                         is_hr: false,
                         image: None,
                         code_ranges: Vec::new(),
+                        inline_images: Vec::new(),
                     })
                 })
                 .collect(),
@@ -1222,6 +1346,7 @@ mod tests {
             ghost_height: heights.iter().map(|_| 0.0).collect(),
             quote_bars: heights.iter().map(|_| Vec::new()).collect(),
             image_blocks: heights.iter().map(|_| None).collect(),
+            inline_draws: heights.iter().map(|_| Vec::new()).collect(),
             image_urls: Vec::new(),
             img_vpad: 0.0,
             img_label_size: 14.0,

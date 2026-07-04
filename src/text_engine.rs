@@ -9,8 +9,8 @@ use std::ops::Range;
 
 use parley::{
     Alignment, AlignmentOptions, CHROMIUM_LINE_BREAK_OVERRIDE, Cluster, FontContext, FontFamily,
-    FontFamilyName, FontStyle, FontWeight, GenericFamily, IndentOptions, Layout, LayoutContext,
-    LineHeight, PositionedLayoutItem, StyleProperty,
+    FontFamilyName, FontStyle, FontWeight, GenericFamily, IndentOptions, InlineBox, InlineBoxKind,
+    Layout, LayoutContext, LineHeight, PositionedLayoutItem, StyleProperty,
 };
 use vello::Scene;
 use vello::kurbo::{Affine, Line, Stroke};
@@ -87,6 +87,7 @@ impl TextEngine {
             max_advance,
             runs,
             0,
+            &[],
         )
     }
 
@@ -96,6 +97,12 @@ impl TextEngine {
     /// instead of returning to the margin. `content_start == 0` (or ≥ `text.len()`)
     /// disables the hang. The prefix width is measured with a throwaway no-wrap break,
     /// then applied via Parley's native `text-indent: hanging`.
+    ///
+    /// `inline_boxes` are in-flow boxes to reserve space for (inline images): each is a
+    /// `(display byte offset, width, height)` in device px; text flows around them and
+    /// the line grows to fit the tallest. A box's `id` is its index here, so the caller
+    /// can match `PositionedLayoutItem::InlineBox` back to a parallel draw list. Boxes at
+    /// a non-char-boundary or past the text end are skipped defensively.
     #[allow(clippy::too_many_arguments)]
     pub fn build_line_hanging(
         &mut self,
@@ -107,6 +114,7 @@ impl TextEngine {
         max_advance: Option<f32>,
         runs: &[StyleRun],
         content_start: usize,
+        inline_boxes: &[(usize, f32, f32)],
     ) -> Layout<Brush> {
         let mut builder = self.lcx.ranged_builder(&mut self.fcx, text, scale, true);
         builder.push_default(StyleProperty::FontSize(font_size));
@@ -154,6 +162,19 @@ impl TextEngine {
         // Browser-grade line breaking: don't break before closing punctuation or
         // after opening punctuation (the fix we couldn't land in gpui).
         builder.set_line_break_override(Some(CHROMIUM_LINE_BREAK_OVERRIDE));
+
+        for (i, &(offset, width, height)) in inline_boxes.iter().enumerate() {
+            if offset > text.len() || !text.is_char_boundary(offset) {
+                continue;
+            }
+            builder.push_inline_box(InlineBox {
+                id: i as u64,
+                kind: InlineBoxKind::InFlow,
+                index: offset,
+                width,
+                height,
+            });
+        }
 
         let mut layout = builder.build(text);
 
@@ -422,6 +443,7 @@ mod tests {
             Some(wrap),
             runs,
             content_start,
+            &[],
         );
         let flat = engine.build_line(text, 1.0, 16.0, 1.4, Color::WHITE, Some(wrap), runs);
         let hung_x = row_x(&hung);
