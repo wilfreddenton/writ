@@ -34,6 +34,15 @@ use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha}
 /// A screen-space rectangle (device px), already offset by padding + scroll.
 pub type ScreenRect = (f64, f64, f64, f64);
 
+/// A borrowed view of the in-progress IME composition for `DocLayout::build`: the
+/// composing `text` and its caret/selection `cursor` (byte offsets *within* `text`,
+/// `None` = hidden caret). Spliced into the caret line at render time and drawn
+/// underlined; never mutates the buffer.
+pub struct PreeditView<'a> {
+    pub text: &'a str,
+    pub cursor: Option<(usize, usize)>,
+}
+
 /// GitHub autolink data threaded into layout so validated refs render as colored,
 /// possibly-shortened links. Borrowed from `core::Editor` for the build call.
 pub struct GithubRenderData<'a> {
@@ -393,6 +402,38 @@ fn build_image_block(
     }
 }
 
+/// Splice an in-progress IME `preedit` string into a line's display `text` at display
+/// byte `caret_disp`, returning the new text plus the shifted style runs with an added
+/// underline run over the composition span. Runs starting at/after the caret shift right
+/// by `preedit.len()` (the caret sits between clusters, so a straddling run is rare and
+/// the same shift keeps it aligned). Pure (no layout) so it's unit-testable headlessly.
+fn splice_preedit(
+    text: &str,
+    runs: &[StyleRun],
+    caret_disp: usize,
+    preedit: &str,
+    fg: Color,
+) -> (String, Vec<StyleRun>) {
+    let spliced_text = format!("{}{}{}", &text[..caret_disp], preedit, &text[caret_disp..]);
+    let shift = preedit.len();
+    let mut spliced_runs: Vec<StyleRun> = runs
+        .iter()
+        .map(|r| {
+            let mut r = r.clone();
+            if r.range.start >= caret_disp {
+                r.range = r.range.start + shift..r.range.end + shift;
+            }
+            r
+        })
+        .collect();
+    // Underline the composition; keep it mono so metrics match the body (stable caret math).
+    let mut under = StyleRun::new(caret_disp..caret_disp + shift, fg);
+    under.underline = true;
+    under.mono = true;
+    spliced_runs.push(under);
+    (spliced_text, spliced_runs)
+}
+
 /// Prefix-sum tops for `heights`: `out[0] = pad_top`, `out[i+1] = out[i] +
 /// heights[i]`. Length is `heights.len() + 1`.
 fn compute_tops(heights: &[f32], pad_top: f32) -> Vec<f32> {
@@ -454,6 +495,9 @@ pub struct DocLayout {
     /// Number of lines from the top that are fully laid out; `[measured_count..]` are
     /// height-estimated placeholders. Equals `line_count()` when nothing was estimated.
     measured_count: usize,
+    /// `(line, display byte offset)` of the IME composition caret within the spliced
+    /// caret line, when a preedit is active. Drives the drawn caret + candidate popup.
+    preedit_caret: Option<(usize, usize)>,
     diff_colors: DiffColors,
     /// Width (device px) and color of the painted blockquote gutter rules.
     quote_bar_width: f32,
@@ -482,6 +526,9 @@ impl DocLayout {
         images: &ImageCache,
         cursor_offset: usize,
         params: &LayoutParams,
+        // In-progress IME composition to splice into the caret line (render-only; no
+        // buffer mutation). `None` outside composition and on the headless snapshot path.
+        preedit: Option<&PreeditView>,
         // Materialize (fully lay out) lines from the top until their cumulative height
         // reaches `measure_to_y` (device px, = scroll_y + viewport_h) + overscan; the
         // rest of the document is cheaply height-*estimated* and left un-laid-out.
@@ -535,6 +582,7 @@ impl DocLayout {
         let mut measured_y = pad_top * scale; // tops-space y consumed by materialized lines
         let mut estimating = false;
         let mut measured_count = n;
+        let mut preedit_caret: Option<(usize, usize)> = None;
         // Bucket inline styles per line once (O(n + styles)) instead of the O(n²)
         // per-line `styles_in_range` scan — the dominant per-keystroke cost on large
         // docs. (Ghost lines style themselves lazily; see `build_ghosts_before`.)
@@ -688,6 +736,31 @@ impl DocLayout {
                     &inline_boxes,
                 ))
             };
+            // IME composition: on the caret's line, splice the preedit into a *fresh*
+            // layout (unique per keystroke, so it bypasses the line cache). The original
+            // `lr` (map/text) is kept for hit-testing; only the drawn layout changes.
+            let layout = match preedit {
+                Some(pv) if i == cursor_line => {
+                    let caret_disp = lr.map.buffer_to_display(cursor_offset);
+                    let (sp_text, sp_runs) =
+                        splice_preedit(&lr.text, &lr.runs, caret_disp, pv.text, fg);
+                    let caret_off =
+                        caret_disp + pv.cursor.map(|(s, _)| s).unwrap_or(pv.text.len());
+                    preedit_caret = Some((i, caret_off));
+                    Rc::new(engine.build_line_hanging(
+                        &sp_text,
+                        scale,
+                        lr.font_size,
+                        line_height,
+                        fg,
+                        Some(max_advance),
+                        &sp_runs,
+                        lr.content_start,
+                        &[],
+                    ))
+                }
+                _ => layout,
+            };
             let range = snapshot.line_markers(i).range;
             // Inline diff: map added word ranges (line-relative buffer bytes) through
             // this line's segment map into display ranges.
@@ -767,6 +840,7 @@ impl DocLayout {
             quote_bar_color: peniko_color(theme.comment),
             tops: compute_tops(&heights, pad_top * scale),
             measured_count,
+            preedit_caret,
             scroll_y: 0.0,
             width: device_width,
             pad_top: pad_top * scale,
@@ -817,17 +891,32 @@ impl DocLayout {
         Some(self.renders[line].map.display_to_buffer(display_off))
     }
 
-    /// Screen-space caret rectangle for a buffer offset, or None if empty doc.
-    /// `caret_width` is in device px.
-    pub fn caret_rect(&self, buffer_off: usize, caret_width: f32) -> Option<ScreenRect> {
-        let line = self.line_of(buffer_off);
+    /// Screen-space caret rectangle at a *display* byte offset within `line`'s layout.
+    /// Shared by the buffer caret and the IME preedit caret (which live in different
+    /// coordinate spaces: the latter indexes the spliced layout directly).
+    fn caret_rect_at(&self, line: usize, display_off: usize, caret_width: f32) -> Option<ScreenRect> {
         let layout = self.layouts.get(line)?;
-        let display_off = self.renders[line].map.buffer_to_display(buffer_off);
         let cursor = Cursor::from_byte_index(layout, display_off, Affinity::Downstream);
         let bb = cursor.geometry(layout, caret_width);
         let dx = self.pad_x as f64;
         let dy = (self.real_top(line) - self.scroll_y) as f64;
         Some((bb.x0 + dx, bb.y0 + dy, bb.x1 + dx, bb.y1 + dy))
+    }
+
+    /// Screen-space caret rectangle for a buffer offset, or None if empty doc.
+    /// `caret_width` is in device px.
+    pub fn caret_rect(&self, buffer_off: usize, caret_width: f32) -> Option<ScreenRect> {
+        let line = self.line_of(buffer_off);
+        let display_off = self.renders.get(line)?.map.buffer_to_display(buffer_off);
+        self.caret_rect_at(line, display_off, caret_width)
+    }
+
+    /// Screen-space caret rectangle *inside* an active IME composition (the spliced
+    /// layout), or None when no preedit is active. Positions the drawn caret + the OS
+    /// candidate popup at the composition point.
+    pub fn preedit_caret_rect(&self, caret_width: f32) -> Option<ScreenRect> {
+        let (line, display_off) = self.preedit_caret?;
+        self.caret_rect_at(line, display_off, caret_width)
     }
 
     /// Screen-space fill rectangles covering the buffer selection range. Handles
@@ -1304,6 +1393,27 @@ mod tests {
         assert_eq!(block_h, IMG_PLACEHOLDER_H);
     }
 
+    /// The pure IME splice: text is `text[..caret] + preedit + text[caret..]`, runs
+    /// before the caret are untouched, runs at/after shift by `preedit.len()`, and
+    /// exactly one underline run covers the composition span.
+    #[test]
+    fn splice_preedit_inserts_underlined_composition() {
+        let fg = Color::WHITE;
+        let text = "abcdef";
+        let before = StyleRun::new(0..2, fg); // entirely before the caret
+        let after = StyleRun::new(4..6, fg); // entirely at/after the caret
+        let runs = vec![before, after];
+        let caret = 3;
+        let preedit = "XY"; // len 2
+        let (out_text, out_runs) = splice_preedit(text, &runs, caret, preedit, fg);
+        assert_eq!(out_text, "abcXYdef");
+        assert_eq!(out_runs[0].range, 0..2, "run before caret is unchanged");
+        assert_eq!(out_runs[1].range, 6..8, "run at/after caret shifts by preedit.len()");
+        let unders: Vec<_> = out_runs.iter().filter(|r| r.underline).collect();
+        assert_eq!(unders.len(), 1, "exactly one underline run");
+        assert_eq!(unders[0].range, 3..5, "underline covers the preedit span");
+    }
+
     #[test]
     fn tops_prefix_sum_has_n_plus_one() {
         let heights = [10.0, 20.0, 5.0];
@@ -1356,6 +1466,7 @@ mod tests {
             quote_bar_width: 2.0,
             quote_bar_color: Color::TRANSPARENT,
             measured_count: heights.len(),
+            preedit_caret: None,
             diff_colors: DiffColors {
                 added_bg: Color::TRANSPARENT,
                 added_inline: Color::TRANSPARENT,
@@ -1423,6 +1534,7 @@ mod tests {
             &ImageCache::new(),
             0,
             &params,
+            None,
             f32::INFINITY,
         );
         // Several buffer offsets (incl. second line) should map to a caret rect
@@ -1465,6 +1577,7 @@ mod tests {
             &ImageCache::new(),
             usize::MAX,
             &params,
+            None,
             f32::INFINITY,
         );
         // Line 0's changed version has a deleted ghost stacked above it.
@@ -1498,7 +1611,7 @@ mod tests {
         let build = |engine: &mut TextEngine, cache: &mut LineCache| {
             DocLayout::build(
                 engine, cache, &mut RenderCache::new(), 0, &snapshot, &theme, None, None,
-                &ImageCache::new(), 0, &params, f32::INFINITY,
+                &ImageCache::new(), 0, &params, None, f32::INFINITY,
             )
         };
         let t0 = Instant::now();
@@ -1538,7 +1651,7 @@ mod tests {
             |engine: &mut TextEngine, lc: &mut LineCache, rc: &mut RenderCache, cursor: usize| {
                 DocLayout::build(
                     engine, lc, rc, 7, &snapshot, &theme, None, None, &ImageCache::new(),
-                    cursor, &params, f32::INFINITY,
+                    cursor, &params, None, f32::INFINITY,
                 )
             };
 
@@ -1586,6 +1699,7 @@ mod tests {
             &ImageCache::new(),
             0,
             &params,
+            None,
             viewport_h, // measure_to_y = just the first viewport
         );
         let n = doc.line_count();

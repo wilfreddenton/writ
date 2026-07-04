@@ -31,6 +31,7 @@ use vello::wgpu;
 use vello::wgpu::CurrentSurfaceTexture;
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -44,7 +45,7 @@ use crate::config::Config;
 use crate::consts::{CARET_WIDTH, FONT_SIZE, LINE_HEIGHT, PADDING, STATUS_BAR_H, WHEEL_LINE_STEP};
 use crate::core::{AutocompleteState, AutocompleteSuggestion, AutocompleteTrigger, Editor};
 use crate::doc_layout::{
-    DocLayout, GithubRenderData, LayoutParams, LineCache, RenderCache, ScreenRect,
+    DocLayout, GithubRenderData, LayoutParams, LineCache, PreeditView, RenderCache, ScreenRect,
 };
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
@@ -190,6 +191,14 @@ struct HoverTarget {
 /// borrows — the split that lets a rebuild run while the surface stays borrowed at
 /// the call site. The per-line caches + `Rc`-wrapped layouts/renders avoid deep
 /// clones on the typing hot path.
+/// In-progress IME composition (owned form of [`PreeditView`]): the composing `text`
+/// and its caret/selection `cursor` (byte offsets within `text`). Held on `DocEngine`
+/// so `rebuild` can splice it into the caret line without threading a param everywhere.
+struct Preedit {
+    text: String,
+    cursor: Option<(usize, usize)>,
+}
+
 struct DocEngine {
     text_engine: TextEngine,
     line_cache: LineCache,
@@ -199,6 +208,9 @@ struct DocEngine {
     doc: Option<DocLayout>,
     /// Shared cache of decoded standalone images, threaded into `DocLayout::build`.
     images: ImageCache,
+    /// Active IME composition, spliced into the caret line at render time. `None` when
+    /// not composing.
+    preedit: Option<Preedit>,
 }
 
 struct App {
@@ -251,6 +263,7 @@ impl App {
                 editor,
                 doc: None,
                 images: ImageCache::new(),
+                preedit: None,
             },
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
@@ -587,6 +600,10 @@ impl DocEngine {
             line_height: LINE_HEIGHT,
             fg: peniko_color(self.theme.foreground),
         };
+        let preedit = self.preedit.as_ref().map(|p| PreeditView {
+            text: &p.text,
+            cursor: p.cursor,
+        });
         DocLayout::build(
             &mut self.text_engine,
             &mut self.line_cache,
@@ -599,6 +616,7 @@ impl DocEngine {
             &self.images,
             cursor_offset,
             &params,
+            preedit.as_ref(),
             measure_to_y,
         )
     }
@@ -1275,14 +1293,40 @@ impl ApplicationHandler<WritEvent> for App {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
-            // Minimal IME: insert committed text. Preedit (composition) rendering
-            // is a follow-up; committing already covers most Latin input methods.
+            WindowEvent::Ime(winit::event::Ime::Enabled) => {
+                self.doc_engine.preedit = None;
+            }
+            // In-progress composition: splice it into the caret line (render-only, no
+            // buffer mutation) and move the OS candidate popup to the composition caret.
+            WindowEvent::Ime(winit::event::Ime::Preedit(text, cursor)) => {
+                eprintln!("[writ][ime] preedit {text:?} cursor {cursor:?}");
+                self.doc_engine.preedit =
+                    (!text.is_empty()).then_some(Preedit { text, cursor });
+                let w = state.surface.config.width as f32;
+                let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                self.doc_engine.rebuild_preserving_scroll(w, state.scale, vh);
+                if let Some(doc) = self.doc_engine.doc.as_ref() {
+                    let cw = CARET_WIDTH * state.scale;
+                    let rect = doc.preedit_caret_rect(cw).or_else(|| {
+                        doc.caret_rect(self.doc_engine.editor.cursor_position(), cw)
+                    });
+                    if let Some((x0, y0, x1, y1)) = rect {
+                        state.window.set_ime_cursor_area(
+                            PhysicalPosition::new(x0, y0),
+                            PhysicalSize::new((x1 - x0).max(1.0), (y1 - y0).max(1.0)),
+                        );
+                    }
+                }
+                state.window.request_redraw();
+            }
+            // Commit: clear the composition, then insert the finalized text.
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
+                let had_preedit = self.doc_engine.preedit.take().is_some();
+                let w = state.surface.config.width as f32;
+                let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                 if !text.is_empty() {
                     self.doc_engine.editor.insert_str(&text);
                     self.hovered = None;
-                    let w = state.surface.config.width as f32;
-                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
                     self.doc_engine.refresh(w, state.scale, vh);
                     spawn_ref_validations(
                         &self.doc_engine.editor,
@@ -1294,6 +1338,19 @@ impl ApplicationHandler<WritEvent> for App {
                         &self.proxy,
                     );
                     sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                    state.window.request_redraw();
+                } else if had_preedit {
+                    // Composition cancelled (empty commit): drop the spliced preedit.
+                    self.doc_engine.rebuild_preserving_scroll(w, state.scale, vh);
+                    state.window.request_redraw();
+                }
+            }
+            WindowEvent::Ime(winit::event::Ime::Disabled) => {
+                if self.doc_engine.preedit.take().is_some() {
+                    let w = state.surface.config.width as f32;
+                    let (_, vh) =
+                        chrome_metrics(state.scale, state.surface.config.height as f32);
+                    self.doc_engine.rebuild_preserving_scroll(w, state.scale, vh);
                     state.window.request_redraw();
                 }
             }
@@ -1609,10 +1666,11 @@ impl ApplicationHandler<WritEvent> for App {
                         }
                     }
                     doc.draw(&self.doc_engine.text_engine, &mut self.scene, editor_h);
-                    if let Some((x0, y0, x1, y1)) = doc.caret_rect(
-                        self.doc_engine.editor.cursor_position(),
-                        CARET_WIDTH * state.scale,
-                    ) {
+                    let cw = CARET_WIDTH * state.scale;
+                    let caret = doc.preedit_caret_rect(cw).or_else(|| {
+                        doc.caret_rect(self.doc_engine.editor.cursor_position(), cw)
+                    });
+                    if let Some((x0, y0, x1, y1)) = caret {
                         self.scene.fill(
                             Fill::NonZero,
                             Affine::IDENTITY,
@@ -1981,6 +2039,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         editor,
         doc: None,
         images: ImageCache::new(),
+        preedit: None,
     };
     let mut doc = de.rebuild(width as f32, 1.0, scroll_y + editor_h);
     // Synchronously decode local standalone images so they appear in the single frame
