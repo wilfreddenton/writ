@@ -1080,6 +1080,9 @@ mod tests {
     use super::*;
     use crate::text_engine::peniko_color;
 
+    /// Device-px content width shared by the image-sizing tests (scale 1.0).
+    const TEST_CONTENT_W: f32 = 800.0;
+
     /// Frame constants for the headless tests (scale 1.0, the shell's PADDING/FONT).
     fn test_params(theme: &EditorTheme, device_width: f32) -> LayoutParams {
         LayoutParams {
@@ -1116,7 +1119,7 @@ mod tests {
     #[test]
     fn image_block_fills_width_preserving_aspect() {
         let cache = ImageCache::new();
-        let content_w = 800.0f32;
+        let content_w = TEST_CONTENT_W;
         let vpad = IMG_VPAD;
 
         // Wide: 2000x100 → clamps to content width, height scaled to keep aspect.
@@ -1156,7 +1159,7 @@ mod tests {
             url: "pending.png".to_string(),
             alt: "x".to_string(),
         };
-        let (block, block_h) = build_image_block(&cache, &img, 800.0, 1.0, IMG_VPAD);
+        let (block, block_h) = build_image_block(&cache, &img, TEST_CONTENT_W, 1.0, IMG_VPAD);
         assert!(matches!(block.kind, ImageBlockKind::Loading));
         assert_eq!(block_h, IMG_PLACEHOLDER_H);
     }
