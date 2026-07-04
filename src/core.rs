@@ -28,6 +28,7 @@ use crate::inline::{
     detect_naked_urls,
 };
 use crate::marker::MarkerKind;
+use crate::paste::{PasteContext, transform_paste};
 
 /// The kind of autocomplete triggered at the cursor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -198,6 +199,15 @@ impl Editor {
 
     pub fn insert_str(&mut self, text: &str) {
         self.state.insert_text(text);
+        self.recompute_diff();
+    }
+
+    /// Insert clipboard text with context-aware paste normalization (CRLF→LF,
+    /// curly→straight quotes, blockquote-prefix continuation, code-block literal).
+    pub fn paste(&mut self, text: &str) {
+        let ctx = PasteContext::from_buffer(&self.state.buffer, self.cursor_position());
+        let transformed = transform_paste(text, &ctx);
+        self.state.insert_text(&transformed);
         self.recompute_diff();
     }
 
@@ -879,6 +889,17 @@ mod tests {
             e.insert_str("    ");
         }
         assert_eq!(e.text(), "```    \n```", "Tab in code block inserts 4 spaces");
+
+        // Paste routes through transform_paste: CRLF→LF, curly quotes→straight,
+        // blockquote continuation. (Regression: shell was inserting raw text.)
+        let mut e = Editor::new("> ");
+        e.set_cursor(e.len());
+        e.paste("line 1\r\nline 2 \u{201C}quoted\u{201D}");
+        assert_eq!(
+            e.text(),
+            "> line 1\n> line 2 \"quoted\"",
+            "paste normalizes CRLF, quotes, and continues the blockquote"
+        );
     }
 
     /// Phase 2 DoD: a headless editor opens a doc, applies edits, toggles a

@@ -1582,7 +1582,7 @@ impl ApplicationHandler<WritEvent> for App {
                                 && let Ok(text) = cb.get_text()
                                 && !text.is_empty()
                             {
-                                self.doc_engine.editor.insert_str(&text);
+                                self.doc_engine.editor.paste(&text);
                                 after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
                                 sync_autocomplete(
                                     &mut self.doc_engine.editor,
