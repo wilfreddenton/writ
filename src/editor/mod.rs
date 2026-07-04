@@ -2457,6 +2457,37 @@ mod tests {
         }
 
         #[test]
+        fn checkbox_cascade_caches_match_fresh_parse() {
+            // The suspend_caches batching must leave the derived inline styles identical
+            // to a from-scratch parse of the resulting text (rebuilt once at the end).
+            let mut state =
+                editor_with_cursor("- [ ] |parent\n  - [ ] child1\n  - [ ] child2\n");
+            state.toggle_checkbox(0); // cascades to children
+            let mut fresh: Buffer = state.text().parse().unwrap();
+            assert_eq!(
+                *state.buffer.render_snapshot().inline_styles,
+                *fresh.render_snapshot().inline_styles,
+                "styles after the cascade equal a fresh parse"
+            );
+        }
+
+        #[test]
+        fn caches_not_frozen_after_cascade() {
+            // suspend_caches must reset on every exit, so a later edit re-derives caches.
+            let mut state = editor_with_cursor("- [ ] |task\nplain line\n");
+            state.toggle_checkbox(0);
+            let at = state.text().find("plain").unwrap();
+            state.set_cursor(at);
+            state.insert_text("**bold** ");
+            let mut fresh: Buffer = state.text().parse().unwrap();
+            assert_eq!(
+                *state.buffer.render_snapshot().inline_styles,
+                *fresh.render_snapshot().inline_styles,
+                "caches re-derived after a post-cascade edit (not frozen)"
+            );
+        }
+
+        #[test]
         fn deeply_nested_propagation_down() {
             let mut state = editor_with_cursor("- [ ] |level1\n  - [ ] level2\n    - [ ] level3\n");
             state.toggle_checkbox(0);

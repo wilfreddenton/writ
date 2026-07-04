@@ -818,8 +818,9 @@ impl Editor {
         let Some(path) = self.file_path.clone() else {
             return Ok(());
         };
-        let content = self.state.buffer.text();
-        std::fs::write(&path, &content)?;
+        // Stream the rope's chunks straight to the file — no whole-document String alloc.
+        let file = std::fs::File::create(&path)?;
+        self.state.buffer.rope().write_to(std::io::BufWriter::new(file))?;
         if let Ok(metadata) = std::fs::metadata(&path) {
             self.last_save_mtime = metadata.modified().ok();
         }
@@ -864,7 +865,7 @@ impl Editor {
     /// the cursor line) and set the diff base from `base_text`, then recompute the diff.
     /// Only parse/snapshot/diff work — no IO.
     pub fn apply_reload(&mut self, content: String, base_text: Option<String>) {
-        if content != self.state.buffer.text() {
+        if !self.state.buffer.content_eq(&content) {
             let cursor_line = self.state.buffer.byte_to_line(self.state.selection.head);
             self.set_text(&content);
             let line = cursor_line.min(self.state.buffer.line_count().saturating_sub(1));

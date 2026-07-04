@@ -314,6 +314,11 @@ pub struct BufferContent {
     inline_styles: Rc<Vec<StyledRegion>>,
     /// Version counter, incremented on each edit. Used by Editor to detect changes.
     version: u64,
+    /// When set, `apply_edit` skips the whole-doc `update_caches` (nodes + inline styles).
+    /// Used to batch a compound action (a checkbox toggle cascades through many
+    /// revert/reapply edits via history) so the O(n) caches rebuild once at the end
+    /// instead of per sub-edit. No consumer may read `parsed`/`inline_styles` while set.
+    suspend_caches: bool,
 }
 
 impl BufferContent {
@@ -327,6 +332,7 @@ impl BufferContent {
             parsed: Rc::new(ParsedNodes::default()),
             inline_styles: Rc::new(Vec::new()),
             version: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
+            suspend_caches: false,
         }
     }
 
@@ -397,7 +403,9 @@ impl BufferContent {
         if self.edit_in_ordered_list(offset, offset + insert_len) {
             self.normalize_ordered_lists();
         }
-        self.update_caches();
+        if !self.suspend_caches {
+            self.update_caches();
+        }
         self.code_highlight_cache.valid = false;
         self.version += 1;
     }
@@ -571,6 +579,11 @@ impl BufferContent {
 
     pub fn text(&self) -> String {
         self.text.to_string()
+    }
+
+    /// Whether the content equals `other`, comparing the rope in place (no `String` alloc).
+    pub fn content_eq(&self, other: &str) -> bool {
+        self.text == *other
     }
 
     pub fn len_bytes(&self) -> usize {
@@ -858,22 +871,26 @@ impl Buffer {
         cursor_after: usize,
     ) {
         let (start, old_end, replacement) = minimal_diff(text_before, text_after);
-        // Discard the reverted batch either way; only push a new entry if the
-        // batch produced a net visible change.
+        // Suspend the whole-doc cache rebuild across the batch's revert + reapply; rebuild
+        // once at the end. Every exit path below runs the reset+rebuild, so the caches can
+        // never stay frozen. Discard the reverted batch either way; only push a new entry
+        // if the batch produced a net visible change.
+        self.content.suspend_caches = true;
         self.history.go_to(&mut self.content, head);
-        if start == old_end && replacement.is_empty() {
-            return;
+        if start != old_end || !replacement.is_empty() {
+            let mut edit = TextEdit::new(
+                start,
+                text_before[start..old_end].to_string(),
+                replacement,
+                cursor_before,
+                cursor_after,
+            );
+            // A coalesced batch is one discrete action — never fold it into prior typing.
+            edit.coalescable = false;
+            self.history.edit(&mut self.content, edit);
         }
-        let mut edit = TextEdit::new(
-            start,
-            text_before[start..old_end].to_string(),
-            replacement,
-            cursor_before,
-            cursor_after,
-        );
-        // A coalesced batch is one discrete action — never fold it into prior typing.
-        edit.coalescable = false;
-        self.history.edit(&mut self.content, edit);
+        self.content.suspend_caches = false;
+        self.content.update_caches();
     }
 
     pub fn undo(&mut self) -> Option<usize> {
@@ -962,6 +979,7 @@ impl FromStr for Buffer {
             parsed: Rc::new(ParsedNodes::default()),
             inline_styles: Rc::new(Vec::new()),
             version: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
+            suspend_caches: false,
         };
 
         content.update_caches();
