@@ -18,7 +18,7 @@ use vello::kurbo::{Affine, Rect, Stroke};
 use vello::peniko::{Brush, Color, Fill, ImageBrush};
 
 use crate::buffer::RenderSnapshot;
-use crate::consts::MAX_CONTENT_WIDTH;
+use crate::consts::{MAX_CONTENT_WIDTH, UI_LINE_HEIGHT};
 use crate::diff::{DiffState, InlineChange};
 use crate::editor::EditorTheme;
 use crate::github::GitHubValidationCache;
@@ -1327,7 +1327,7 @@ impl DocLayout {
                         &label,
                         1.0,
                         self.img_label_size,
-                        1.3,
+                        UI_LINE_HEIGHT,
                         self.image_border,
                         Some(((x1 - x) as f32 - 2.0 * pad).max(1.0)),
                         &[],

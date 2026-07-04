@@ -294,7 +294,7 @@ impl Editor {
     }
 
     pub fn toggle_checkbox(&mut self, line_number: usize) {
-        self.edit(|s| s.toggle_checkbox_for_test(line_number));
+        self.edit(|s| s.toggle_checkbox(line_number));
     }
 
     /// If buffer `offset` lands on a checkbox marker (`[ ]`/`[x]`), the line to toggle.
@@ -710,13 +710,10 @@ impl Editor {
             AutocompleteSuggestion::User { login, .. } => format!("@{login}"),
         };
         let cursor = self.state.cursor().offset;
-        self.state.buffer.delete(ac.trigger_offset..cursor, cursor);
-        self.state
-            .buffer
-            .insert(ac.trigger_offset, &replacement, ac.trigger_offset);
-        let new_pos = ac.trigger_offset + replacement.len();
-        self.state.selection = Selection::new(new_pos, new_pos);
-        self.recompute_diff();
+        // Select the trigger token (`#…`/`@…`) and replace it through the normal insert
+        // path, so diff-recompute and undo semantics match a hand-typed edit.
+        self.state.selection = Selection::new(ac.trigger_offset, cursor);
+        self.insert_str(&replacement);
         true
     }
 

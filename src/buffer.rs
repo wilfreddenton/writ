@@ -41,6 +41,11 @@ fn compute_line_byte_range(rope: &Rope, line_idx: usize) -> Range<usize> {
     start_byte..adjusted_end
 }
 
+/// Whether a tree-sitter-md node kind is an ordered-list marker (`1.` or `1)`).
+fn is_ordered_list_marker(kind: &str) -> bool {
+    kind == "list_marker_dot" || kind == "list_marker_parenthesis"
+}
+
 /// Compute `LineMarkers` for `line_idx` from parsed nodes and a rope. Shared by
 /// `RenderSnapshot` and `BufferContent`, which differ only in their rope field.
 fn line_markers_from(parsed: &ParsedNodes, rope: &Rope, line_idx: usize) -> LineMarkers {
@@ -460,9 +465,7 @@ impl BufferContent {
             if child.kind() == "list_item"
                 && let Some(marker) = child.children(&mut child.walk()).next()
             {
-                return marker.kind().starts_with("list_marker_decimal")
-                    || marker.kind() == "list_marker_dot"
-                    || marker.kind() == "list_marker_parenthesis";
+                return is_ordered_list_marker(marker.kind());
             }
         }
         false
@@ -474,10 +477,7 @@ impl BufferContent {
         list_item: &tree_sitter::Node,
     ) -> Option<(Range<usize>, usize, bool)> {
         for marker in list_item.children(&mut list_item.walk()) {
-            if marker.kind().starts_with("list_marker_decimal")
-                || marker.kind() == "list_marker_dot"
-                || marker.kind() == "list_marker_parenthesis"
-            {
+            if is_ordered_list_marker(marker.kind()) {
                 let start = marker.start_byte();
                 let end = marker.end_byte();
                 let is_parenthesis = marker.kind() == "list_marker_parenthesis";

@@ -7,6 +7,7 @@ use vello::Scene;
 use vello::kurbo::{Affine, Line, Rect, RoundedRect, Stroke};
 use vello::peniko::{Color, Fill};
 
+use crate::consts::{PADDING, UI_LINE_HEIGHT};
 use crate::editor::EditorTheme;
 use crate::marker::MarkerKind;
 use crate::status_bar::build_context_display;
@@ -68,7 +69,7 @@ fn hline(scene: &mut Scene, color: Color, x0: f64, x1: f64, y: f64, width: f64) 
 
 /// Vertically-center a single line of `font_size` (device px) within a bar.
 fn baseline_top(bar: &BarRect, font_size: f32) -> f32 {
-    (bar.y0 as f32) + ((bar.y1 - bar.y0) as f32 - font_size * 1.3) / 2.0
+    (bar.y0 as f32) + ((bar.y1 - bar.y0) as f32 - font_size * UI_LINE_HEIGHT) / 2.0
 }
 
 /// Draw the top title bar: centered filename with a leading `*` when dirty.
@@ -98,7 +99,7 @@ pub fn draw_title_bar(
     };
     let font_size = 15.0;
     let color = peniko_color(theme.foreground);
-    let layout = engine.build_line(&title, scale, font_size, 1.3, color, None, &[]);
+    let layout = engine.build_line(&title, scale, font_size, UI_LINE_HEIGHT, color, None, &[]);
     let w = layout.width();
     let cx = ((bar.x0 + bar.x1) as f32 / 2.0) - w / 2.0;
     engine.draw_line(
@@ -129,7 +130,7 @@ pub fn draw_status_bar(
     );
 
     let font_size = 13.0;
-    let pad = 24.0 * scale;
+    let pad = PADDING * scale;
     let y = baseline_top(bar, font_size);
 
     // --- left: context markers, colored by nesting depth ---
@@ -151,7 +152,10 @@ pub fn draw_status_bar(
         }
         let start = text.len();
         text.push_str(s);
-        let mut run = StyleRun::new(start..text.len(), peniko_color(depth_colors[depth % 6]));
+        let mut run = StyleRun::new(
+            start..text.len(),
+            peniko_color(depth_colors[depth % depth_colors.len()]),
+        );
         run.mono = true;
         runs.push(run);
     }
@@ -160,7 +164,7 @@ pub fn draw_status_bar(
             &text,
             scale,
             font_size,
-            1.3,
+            UI_LINE_HEIGHT,
             peniko_color(theme.comment),
             None,
             &runs,
@@ -195,7 +199,7 @@ pub fn draw_status_bar(
         &right,
         scale,
         font_size,
-        1.3,
+        UI_LINE_HEIGHT,
         peniko_color(theme.comment),
         None,
         &[],

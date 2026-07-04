@@ -10,7 +10,7 @@ use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Brush, Fill};
 
 use crate::chrome::draw_panel;
-use crate::consts::PADDING;
+use crate::consts::{PADDING, UI_LINE_HEIGHT};
 use crate::core::{AutocompleteState, AutocompleteSuggestion, Editor};
 use crate::doc_layout::{DocLayout, ScreenRect};
 use crate::editor::EditorTheme;
@@ -237,7 +237,7 @@ fn segments_to_line(
         &text,
         scale,
         font_size,
-        1.3,
+        UI_LINE_HEIGHT,
         peniko_color(theme.foreground),
         Some(max_text),
         &runs,

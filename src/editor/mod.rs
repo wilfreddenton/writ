@@ -33,6 +33,19 @@ struct TabCycleCache {
     states: Vec<String>,
 }
 
+/// Ascend from `node` (inclusive) through its parents, returning the first node
+/// whose kind is `kind`.
+fn ancestor_of_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == kind {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
 /// Core editing state that can be used without GPUI context.
 /// This contains the buffer and selection, and all editing logic.
 pub struct EditorState {
@@ -162,14 +175,7 @@ impl EditorState {
             return false;
         };
 
-        let mut current = Some(node);
-        while let Some(n) = current {
-            if n.kind() == "fenced_code_block" {
-                return true;
-            }
-            current = n.parent();
-        }
-        false
+        ancestor_of_kind(node, "fenced_code_block").is_some()
     }
 
     /// Check if a line has content after its markers.
@@ -593,14 +599,7 @@ impl EditorState {
     }
 
     fn is_in_error_node(&self, node: tree_sitter::Node) -> bool {
-        let mut current = Some(node);
-        while let Some(n) = current {
-            if n.kind() == "ERROR" {
-                return true;
-            }
-            current = n.parent();
-        }
-        false
+        ancestor_of_kind(node, "ERROR").is_some()
     }
 
     fn find_context_from_error<'a>(
@@ -645,14 +644,7 @@ impl EditorState {
         let root = tree.block_tree().root_node();
         let node = root.descendant_for_byte_range(byte_offset, byte_offset)?;
 
-        let mut current = Some(node);
-        while let Some(n) = current {
-            if n.kind() == "list_item" {
-                return Some(n);
-            }
-            current = n.parent();
-        }
-        None
+        ancestor_of_kind(node, "list_item")
     }
 
     /// Find the checkbox marker among a list_item's direct children, if any.
@@ -871,14 +863,8 @@ impl EditorState {
         let our_list_item = self.list_item_at(list_item_start)?;
 
         // Walk up to find parent list_item, then read its direct checkbox
-        let mut current = our_list_item.parent();
-        while let Some(n) = current {
-            if n.kind() == "list_item" {
-                return self.direct_checkbox(n);
-            }
-            current = n.parent();
-        }
-        None
+        let parent = ancestor_of_kind(our_list_item.parent()?, "list_item")?;
+        self.direct_checkbox(parent)
     }
 
     /// Find all sibling checkboxes (same nesting level).
@@ -1055,14 +1041,7 @@ impl EditorState {
         let node = root.descendant_for_byte_range(cursor_pos.saturating_sub(1), cursor_pos)?;
 
         // Walk up to find fenced_code_block
-        let mut current = Some(node);
-        let code_block = loop {
-            match current {
-                Some(n) if n.kind() == "fenced_code_block" => break n,
-                Some(n) => current = n.parent(),
-                None => return None,
-            }
-        };
+        let code_block = ancestor_of_kind(node, "fenced_code_block")?;
 
         let block_start = code_block.start_byte();
         let block_end = code_block.end_byte();
@@ -1187,7 +1166,7 @@ impl EditorState {
         Some(line.range.start + relative)
     }
 
-    pub fn toggle_checkbox_for_test(&mut self, line_number: usize) {
+    pub fn toggle_checkbox(&mut self, line_number: usize) {
         // Capture pre-toggle state so the whole cascade (child + parent + all
         // strikethrough edits) collapses to a single undo entry at the end.
         let head_before = self.buffer.undo_head();
@@ -2375,7 +2354,7 @@ mod tests {
         #[test]
         fn check_parent_checks_all_children() {
             let mut state = editor_with_cursor("- [ ] |parent\n  - [ ] child1\n  - [ ] child2\n");
-            state.toggle_checkbox_for_test(0);
+            state.toggle_checkbox(0);
             let text = state.text();
             assert!(text.contains("[x] ~~parent~~"), "parent should be checked");
             assert!(text.contains("[x] ~~child1~~"), "child1 should be checked");
@@ -2386,7 +2365,7 @@ mod tests {
         fn uncheck_parent_unchecks_all_children() {
             let mut state =
                 editor_with_cursor("- [x] ~~|parent~~\n  - [x] ~~child1~~\n  - [x] ~~child2~~\n");
-            state.toggle_checkbox_for_test(0);
+            state.toggle_checkbox(0);
             let text = state.text();
             assert!(text.contains("[ ] parent"), "parent should be unchecked");
             assert!(text.contains("[ ] child1"), "child1 should be unchecked");
@@ -2398,7 +2377,7 @@ mod tests {
         fn check_all_siblings_checks_parent() {
             let mut state =
                 editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
-            state.toggle_checkbox_for_test(2);
+            state.toggle_checkbox(2);
             let text = state.text();
             assert!(
                 text.contains("[x] ~~parent~~"),
@@ -2415,7 +2394,7 @@ mod tests {
         fn uncheck_child_unchecks_parent() {
             let mut state =
                 editor_with_cursor("- [x] ~~parent~~\n  - [x] ~~|child1~~\n  - [x] ~~child2~~\n");
-            state.toggle_checkbox_for_test(1);
+            state.toggle_checkbox(1);
             let text = state.text();
             assert!(text.contains("[ ] parent"), "parent should be unchecked");
             assert!(text.contains("[ ] child1"), "child1 should be unchecked");
@@ -2428,7 +2407,7 @@ mod tests {
         #[test]
         fn deeply_nested_propagation_down() {
             let mut state = editor_with_cursor("- [ ] |level1\n  - [ ] level2\n    - [ ] level3\n");
-            state.toggle_checkbox_for_test(0);
+            state.toggle_checkbox(0);
             let text = state.text();
             assert!(text.contains("[x] ~~level1~~"), "level1 should be checked");
             assert!(text.contains("[x] ~~level2~~"), "level2 should be checked");
@@ -2438,7 +2417,7 @@ mod tests {
         #[test]
         fn deeply_nested_propagation_up() {
             let mut state = editor_with_cursor("- [ ] level1\n  - [ ] level2\n    - [ ] |level3\n");
-            state.toggle_checkbox_for_test(2);
+            state.toggle_checkbox(2);
             let text = state.text();
             assert!(
                 text.contains("[x] ~~level1~~"),
@@ -2454,7 +2433,7 @@ mod tests {
         #[test]
         fn mixed_siblings_parent_stays_unchecked() {
             let mut state = editor_with_cursor("- [ ] parent\n  - [ ] |child1\n  - [ ] child2\n");
-            state.toggle_checkbox_for_test(1);
+            state.toggle_checkbox(1);
             let text = state.text();
             assert!(text.contains("[ ] parent"), "parent should stay unchecked");
             assert!(text.contains("[x] ~~child1~~"), "child1 should be checked");
@@ -2471,7 +2450,7 @@ mod tests {
             // spanning multiple lines. One undo must revert the entire toggle.
             let before = trim_raw("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] child2\n");
             let mut state = editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
-            state.toggle_checkbox_for_test(2);
+            state.toggle_checkbox(2);
             assert!(state.text().contains("[x] ~~parent~~"), "parent auto-checked");
             assert!(state.text().contains("[x] ~~child2~~"), "child2 checked");
 
@@ -2483,7 +2462,7 @@ mod tests {
         #[test]
         fn redo_reapplies_full_cascade() {
             let mut state = editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
-            state.toggle_checkbox_for_test(2);
+            state.toggle_checkbox(2);
             let after = state.text();
 
             state.buffer.undo();
@@ -2494,7 +2473,7 @@ mod tests {
         #[test]
         fn toggle_leaf_box_text_and_single_entry() {
             let mut state = editor_with_cursor("- [ ] |task\n");
-            state.toggle_checkbox_for_test(0);
+            state.toggle_checkbox(0);
             assert_eq!(state.text(), "- [x] ~~task~~\n");
             state.buffer.undo();
             assert_eq!(state.text(), "- [ ] task\n");
@@ -2504,7 +2483,7 @@ mod tests {
         #[test]
         fn toggle_parent_all_children_text() {
             let mut state = editor_with_cursor("- [ ] |parent\n  - [ ] child1\n  - [ ] child2\n");
-            state.toggle_checkbox_for_test(0);
+            state.toggle_checkbox(0);
             assert_eq!(
                 state.text(),
                 "- [x] ~~parent~~\n  - [x] ~~child1~~\n  - [x] ~~child2~~\n"
@@ -2516,7 +2495,7 @@ mod tests {
             let mut state = editor_with_cursor(
                 "- [x] ~~parent~~\n  - [x] ~~|child1~~\n  - [x] ~~child2~~\n",
             );
-            state.toggle_checkbox_for_test(1);
+            state.toggle_checkbox(1);
             assert_eq!(
                 state.text(),
                 "- [ ] parent\n  - [ ] child1\n  - [x] ~~child2~~\n"

@@ -13,6 +13,9 @@ pub const MAX_CONTENT_WIDTH: f32 = 880.0;
 pub const FONT_SIZE: f32 = 18.0;
 /// Line height as a multiple of the font size (CSS-unitless semantics).
 pub const LINE_HEIGHT: f32 = 1.5;
+/// Line height for chrome/overlay UI text (title bar, status bar, popovers, image
+/// labels) — tighter than the document body.
+pub const UI_LINE_HEIGHT: f32 = 1.3;
 /// Height of the bottom status bar.
 pub const STATUS_BAR_H: f32 = 24.0;
 /// Text caret width.

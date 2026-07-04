@@ -184,6 +184,15 @@ struct ActiveSurface {
     scale: f32,
 }
 
+impl ActiveSurface {
+    /// The editor viewport in device px: (surface width, editor content height, scale).
+    /// The content height excludes the bottom status-bar strip.
+    fn viewport(&self) -> (f32, f32, f32) {
+        let (_, editor_h) = chrome_metrics(self.scale, self.surface.config.height as f32);
+        (self.surface.config.width as f32, editor_h, self.scale)
+    }
+}
+
 /// The document engine: the editor/buffer plus the caches and Parley/Vello text
 /// engine that lay it out into `doc`. Held as one field kept SEPARATE from `state`
 /// (the GPU surface) so `&mut self.doc_engine` and `&self.state` are disjoint
@@ -316,7 +325,7 @@ impl App {
     /// loading any newly-appeared standalone images. Both are idempotent (cache-guarded).
     fn spawn_validations(&self) {
         let visible = self.state.as_ref().and_then(|s| {
-            let (_, vh) = chrome_metrics(s.scale, s.surface.config.height as f32);
+            let (_, vh, _) = s.viewport();
             self.doc_engine.doc.as_ref().map(|d| {
                 let (a, b) = d.visible_range(vh);
                 a..b
@@ -662,23 +671,28 @@ impl DocEngine {
         }
     }
 
-    fn refresh(&mut self, device_width: f32, scale: f32, editor_h: f32) {
-        self.editor.refresh_detection(self.detection_range(editor_h));
+    /// Rebuild at the current doc's scroll anchor and restore that scroll position
+    /// (clamped). The shared core of `refresh` and `rebuild_preserving_scroll`; callers
+    /// run detection and any cursor reveal around it.
+    fn relayout_at_anchor(&mut self, device_width: f32, scale: f32, editor_h: f32) -> DocLayout {
         let (anchor_line, anchor_off) =
             self.doc.as_ref().map(|d| d.scroll_anchor()).unwrap_or((0, 0.0));
         let mut new_doc = self.rebuild(device_width, scale, anchor_line, editor_h);
         new_doc.scroll_y = new_doc.anchor_scroll_y(anchor_line, anchor_off);
         new_doc.clamp_scroll(editor_h);
+        new_doc
+    }
+
+    fn refresh(&mut self, device_width: f32, scale: f32, editor_h: f32) {
+        self.editor.refresh_detection(self.detection_range(editor_h));
+        let mut new_doc = self.relayout_at_anchor(device_width, scale, editor_h);
         new_doc.scroll_to(self.editor.cursor_position(), editor_h);
+        self.doc = Some(new_doc);
         // A cursor jump (Ctrl+End / PageDown) can reveal lines outside the band built
         // around the old anchor; rebuild once around the new position so it's laid out.
-        if new_doc.needs_remeasure(editor_h) {
-            let (line, off) = new_doc.scroll_anchor();
-            new_doc = self.rebuild(device_width, scale, line, editor_h);
-            new_doc.scroll_y = new_doc.anchor_scroll_y(line, off);
-            new_doc.clamp_scroll(editor_h);
+        if self.doc.as_ref().is_some_and(|d| d.needs_remeasure(editor_h)) {
+            self.doc = Some(self.relayout_at_anchor(device_width, scale, editor_h));
         }
-        self.doc = Some(new_doc);
     }
 
     /// Rebuild preserving the current scroll (no cursor reveal): the freshly-validated-
@@ -687,12 +701,7 @@ impl DocEngine {
     /// wakeup doesn't rescan, but scrolling into new lines detects their refs.
     fn rebuild_preserving_scroll(&mut self, device_width: f32, scale: f32, editor_h: f32) {
         self.editor.refresh_detection(self.detection_range(editor_h));
-        let (anchor_line, anchor_off) =
-            self.doc.as_ref().map(|d| d.scroll_anchor()).unwrap_or((0, 0.0));
-        let mut new_doc = self.rebuild(device_width, scale, anchor_line, editor_h);
-        new_doc.scroll_y = new_doc.anchor_scroll_y(anchor_line, anchor_off);
-        new_doc.clamp_scroll(editor_h);
-        self.doc = Some(new_doc);
+        self.doc = Some(self.relayout_at_anchor(device_width, scale, editor_h));
     }
 
     /// Lay out the document at `device_width`, materializing a band around `anchor_line`
@@ -953,8 +962,7 @@ impl ApplicationHandler<WritEvent> for App {
             if self.doc_engine.editor.reload_from_disk()
                 && let Some(state) = self.state.as_ref()
             {
-                let w = state.surface.config.width as f32;
-                let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                let (w, vh, _) = state.viewport();
                 let window = state.window.clone();
                 self.hovered = None;
                 after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
@@ -1046,20 +1054,11 @@ impl ApplicationHandler<WritEvent> for App {
                     size.width.max(1),
                     size.height.max(1),
                 );
-                let (_, editor_h) = chrome_metrics(state.scale, size.height as f32);
-                let scale = state.scale;
-                let (anchor_line, anchor_off) = self
-                    .doc_engine
-                    .doc
-                    .as_ref()
-                    .map(|d| d.scroll_anchor())
-                    .unwrap_or((0, 0.0));
-                let mut doc = self
-                    .doc_engine
-                    .rebuild(size.width as f32, scale, anchor_line, editor_h);
-                doc.scroll_y = doc.anchor_scroll_y(anchor_line, anchor_off);
-                doc.clamp_scroll(editor_h);
-                self.doc_engine.doc = Some(doc);
+                // A width change re-wraps, so re-run detection + relayout at the anchor —
+                // the same preserve-scroll path used for recolor/remeasure rebuilds.
+                let (w, editor_h, scale) = state.viewport();
+                self.doc_engine
+                    .rebuild_preserving_scroll(w, scale, editor_h);
                 state.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -1114,8 +1113,7 @@ impl ApplicationHandler<WritEvent> for App {
             WindowEvent::Ime(winit::event::Ime::Preedit(text, cursor)) => {
                 self.doc_engine.preedit =
                     (!text.is_empty()).then_some(Preedit { text, cursor });
-                let w = state.surface.config.width as f32;
-                let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                let (w, vh, _) = state.viewport();
                 self.doc_engine.rebuild_preserving_scroll(w, state.scale, vh);
                 if let Some(doc) = self.doc_engine.doc.as_ref() {
                     let cw = CARET_WIDTH * state.scale;
@@ -1134,8 +1132,7 @@ impl ApplicationHandler<WritEvent> for App {
             // Commit: clear the composition, then insert the finalized text.
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 let had_preedit = self.doc_engine.preedit.take().is_some();
-                let w = state.surface.config.width as f32;
-                let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                let (w, vh, _) = state.viewport();
                 if !text.is_empty() {
                     self.doc_engine.editor.insert_str(&text);
                     self.hovered = None;
@@ -1149,9 +1146,7 @@ impl ApplicationHandler<WritEvent> for App {
             }
             WindowEvent::Ime(winit::event::Ime::Disabled) => {
                 if self.doc_engine.preedit.take().is_some() {
-                    let w = state.surface.config.width as f32;
-                    let (_, vh) =
-                        chrome_metrics(state.scale, state.surface.config.height as f32);
+                    let (w, vh, _) = state.viewport();
                     self.doc_engine.rebuild_preserving_scroll(w, state.scale, vh);
                     state.window.request_redraw();
                 }
@@ -1159,8 +1154,7 @@ impl ApplicationHandler<WritEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x as f32, position.y as f32);
                 if self.mouse_down {
-                    let w = state.surface.config.width as f32;
-                    let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                    let (w, vh, _) = state.viewport();
                     // Record the edge auto-scroll velocity for the timer tick; the move
                     // itself only extends the selection (dy=0), so scroll speed stays
                     // fixed to the tick cadence rather than the mouse-move rate.
@@ -1197,8 +1191,7 @@ impl ApplicationHandler<WritEvent> for App {
                 ..
             } => {
                 self.mouse_down = true;
-                let w = state.surface.config.width as f32;
-                let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                let (w, vh, _) = state.viewport();
 
                 // Autocomplete row click: accept that suggestion, don't move the caret.
                 if self.doc_engine.editor.autocomplete().is_some()
@@ -1291,8 +1284,7 @@ impl ApplicationHandler<WritEvent> for App {
                     event_loop.exit();
                     return;
                 }
-                let w = state.surface.config.width as f32;
-                let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                let (w, vh, _) = state.viewport();
 
                 // Clipboard: Ctrl/Super + C copy, X cut, V paste.
                 if cmd && let Key::Character(c) = &event.logical_key {
@@ -1529,13 +1521,8 @@ impl ApplicationHandler<WritEvent> for App {
             self.last_drag_tick = Some(now);
             let dy = self.drag_scroll_dy * dt;
             if let Some((w, editor_h, scale, window)) = self.state.as_ref().map(|s| {
-                let (_, editor_h) = chrome_metrics(s.scale, s.surface.config.height as f32);
-                (
-                    s.surface.config.width as f32,
-                    editor_h,
-                    s.scale,
-                    s.window.clone(),
-                )
+                let (w, editor_h, scale) = s.viewport();
+                (w, editor_h, scale, s.window.clone())
             }) {
                 drag_extend_step(&mut self.doc_engine, self.mouse_pos, dy, w, scale, editor_h);
                 window.request_redraw();
