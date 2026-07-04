@@ -1212,6 +1212,16 @@ impl ApplicationHandler<WritEvent> for App {
                     .as_ref()
                     .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
                 {
+                    // Ctrl/Cmd-click on a link (markdown link, naked URL, or GitHub ref)
+                    // opens it in the browser instead of placing the caret.
+                    if (self.modifiers.control_key() || self.modifiers.super_key())
+                        && let Some(url) = self.doc_engine.editor.link_at(off)
+                    {
+                        if let Err(e) = open::that_detached(&url) {
+                            eprintln!("[writ] failed to open {url}: {e}");
+                        }
+                        return;
+                    }
                     // Clicking a checkbox toggles it (leaving the caret where it was)
                     // rather than placing the caret in the box.
                     if let Some(line) = self.doc_engine.editor.checkbox_at(off) {

@@ -378,6 +378,30 @@ impl Editor {
         self.github_context.as_ref()
     }
 
+    /// The URL to open for a Ctrl/Cmd-click at buffer `offset`: a GitHub ref's web page,
+    /// a naked URL, or a markdown link target — whichever covers the offset.
+    pub fn link_at(&mut self, offset: usize) -> Option<String> {
+        let line = self.line_of(offset);
+        if let Some(refs) = self.github_refs_by_line.get(&line)
+            && let Some(m) = refs.iter().find(|m| m.byte_range.contains(&offset))
+        {
+            return Some(m.reference.url());
+        }
+        if let Some(urls) = self.naked_urls_by_line.get(&line)
+            && let Some(u) = urls.iter().find(|u| u.byte_range.contains(&offset))
+        {
+            return Some(u.url.clone());
+        }
+        // Markdown link [text](url): the styled region spans the whole link source.
+        self.state
+            .buffer
+            .render_snapshot()
+            .inline_styles_for_line(line)
+            .into_iter()
+            .find(|r| r.link_url.is_some() && r.full_range.contains(&offset))
+            .and_then(|r| r.link_url)
+    }
+
     pub fn github_validation_cache(&self) -> &GitHubValidationCache {
         &self.github_validation_cache
     }
@@ -882,6 +906,30 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "start\n");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Ctrl/Cmd-click link resolution: a markdown link target, a naked URL, and a
+    /// non-link position (None). Drives opening links in the browser.
+    #[test]
+    fn link_at_resolves_links() {
+        let mut e = Editor::new("See [docs](https://example.com/docs) and https://plain.url/x\n");
+        // Inside the markdown link source → its target URL (no detection needed).
+        let md = e.text().find("docs]").unwrap();
+        assert_eq!(
+            e.link_at(md).as_deref(),
+            Some("https://example.com/docs"),
+            "markdown link target"
+        );
+        // Naked URL needs detection to populate the per-line index.
+        e.refresh_detection(0..usize::MAX);
+        let naked = e.text().find("plain.url").unwrap();
+        assert_eq!(
+            e.link_at(naked).as_deref(),
+            Some("https://plain.url/x"),
+            "naked URL"
+        );
+        // Plain text position → no link.
+        assert_eq!(e.link_at(0), None);
     }
 
     /// The input behaviors restored from the gpui `on_key_down` (Home/End/doc-boundary
