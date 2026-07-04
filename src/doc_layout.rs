@@ -190,9 +190,6 @@ impl RenderCache {
     }
 }
 
-/// Cap on a displayed image's height in logical px; if it bites, width shrinks to
-/// preserve aspect. Images never upscale beyond their intrinsic size.
-const MAX_IMG_H: f32 = 400.0;
 /// Vertical padding (logical px) above and below an image block.
 const IMG_VPAD: f32 = 8.0;
 /// Block height (logical px) reserved for a loading/failed image placeholder.
@@ -332,15 +329,15 @@ fn map_changes_to_display(
 }
 
 /// Build the image block for a standalone image and its device-px block height (used
-/// as the line height). Fits to `content_w`, preserves aspect, never upscales beyond
-/// intrinsic, and caps height at `max_img_h` (shrinking width to keep aspect). Loading
-/// and failed states get a fixed placeholder height.
+/// as the line height). Fits to `content_w`, preserving aspect: an image at least as
+/// wide as the body fills the full content width; a narrower one keeps its intrinsic
+/// size (never upscaled). Height follows from the aspect — no cap, so wide/landscape
+/// images aren't shrunk below the body width. Loading/failed states get a placeholder.
 fn build_image_block(
     images: &ImageCache,
     img: &ImageRef,
     content_w: f32,
     scale: f32,
-    max_img_h: f32,
     vpad: f32,
 ) -> (ImageBlock, f32) {
     match images.get(&img.url) {
@@ -348,12 +345,8 @@ fn build_image_block(
             // Intrinsic size in device px (treat intrinsic px as logical, so ×scale).
             let iw = loaded.width as f32 * scale;
             let ih = loaded.height as f32 * scale;
-            let mut dw = iw.min(content_w);
-            let mut dh = if iw > 0.0 { ih * dw / iw } else { 0.0 };
-            if dh > max_img_h && ih > 0.0 {
-                dh = max_img_h;
-                dw = iw * dh / ih;
-            }
+            let dw = iw.min(content_w);
+            let dh = if iw > 0.0 { ih * dw / iw } else { 0.0 };
             let block = ImageBlock {
                 alt: img.alt.clone(),
                 kind: ImageBlockKind::Loaded {
@@ -529,7 +522,6 @@ impl DocLayout {
         let mut image_urls: Vec<String> = Vec::new();
         // Content width available to an image (device px), same basis as `max_advance`.
         let content_w = max_advance;
-        let max_img_h = MAX_IMG_H * scale;
         let img_vpad = IMG_VPAD * scale;
         // Each line's total height = its ghost block above + the real line.
         let mut heights = Vec::with_capacity(n);
@@ -646,7 +638,7 @@ impl DocLayout {
                         image_urls.push(img.url.clone());
                     }
                     let (block, block_h) =
-                        build_image_block(images, img, content_w, scale, max_img_h, img_vpad);
+                        build_image_block(images, img, content_w, scale, img_vpad);
                     (Some(block), block_h)
                 }
                 None => (None, layout.height()),
@@ -1118,38 +1110,37 @@ mod tests {
         }
     }
 
-    /// A wide image fits the content width (never overflows), and its height scales to
-    /// preserve aspect. A tall image's displayed height is capped at `max_img_h`, with
-    /// width re-derived so the aspect ratio is still preserved. A small image is not
-    /// upscaled beyond its intrinsic size.
+    /// Any image at least as wide as the body fills the full content width (aspect
+    /// preserved), with no height cap — so a tall-but-wide-enough image isn't shrunk
+    /// below the body width. A smaller image keeps its intrinsic size (no upscale).
     #[test]
-    fn image_block_fits_width_and_caps_height() {
+    fn image_block_fills_width_preserving_aspect() {
         let cache = ImageCache::new();
         let content_w = 800.0f32;
-        let max_h = MAX_IMG_H; // scale 1.0
         let vpad = IMG_VPAD;
 
         // Wide: 2000x100 → clamps to content width, height scaled to keep aspect.
         let wide = cache_image(&cache, "wide", 2000, 100);
-        let (block, _) = build_image_block(&cache, &wide, content_w, 1.0, max_h, vpad);
+        let (block, _) = build_image_block(&cache, &wide, content_w, 1.0, vpad);
         let ImageBlockKind::Loaded { dest_w, dest_h, .. } = block.kind else {
             panic!("expected loaded");
         };
         assert!((dest_w - content_w).abs() < 0.5, "wide image fills content width");
         assert!((dest_h - content_w * 100.0 / 2000.0).abs() < 0.5, "aspect preserved");
 
-        // Tall: 100x2000 → height capped, width re-derived to keep aspect.
-        let tall = cache_image(&cache, "tall", 100, 2000);
-        let (block, _) = build_image_block(&cache, &tall, content_w, 1.0, max_h, vpad);
+        // Tall but wide enough: 1000x2000 → still fills the width (no cap), height
+        // follows aspect (1600), rather than being shrunk to fit a height limit.
+        let big = cache_image(&cache, "big", 1000, 2000);
+        let (block, _) = build_image_block(&cache, &big, content_w, 1.0, vpad);
         let ImageBlockKind::Loaded { dest_w, dest_h, .. } = block.kind else {
             panic!("expected loaded");
         };
-        assert!((dest_h - max_h).abs() < 0.5, "tall image height is capped");
-        assert!((dest_w - max_h * 100.0 / 2000.0).abs() < 0.5, "capped width keeps aspect");
+        assert!((dest_w - content_w).abs() < 0.5, "fills width even when tall");
+        assert!((dest_h - content_w * 2000.0 / 1000.0).abs() < 0.5, "height uncapped");
 
-        // Small: 40x30, well under both limits → shown at intrinsic size (no upscale).
+        // Small: 40x30, under the width → shown at intrinsic size (no upscale).
         let small = cache_image(&cache, "small", 40, 30);
-        let (block, block_h) = build_image_block(&cache, &small, content_w, 1.0, max_h, vpad);
+        let (block, block_h) = build_image_block(&cache, &small, content_w, 1.0, vpad);
         let ImageBlockKind::Loaded { dest_w, dest_h, .. } = block.kind else {
             panic!("expected loaded");
         };
@@ -1165,7 +1156,7 @@ mod tests {
             url: "pending.png".to_string(),
             alt: "x".to_string(),
         };
-        let (block, block_h) = build_image_block(&cache, &img, 800.0, 1.0, MAX_IMG_H, IMG_VPAD);
+        let (block, block_h) = build_image_block(&cache, &img, 800.0, 1.0, IMG_VPAD);
         assert!(matches!(block.kind, ImageBlockKind::Loading));
         assert_eq!(block_h, IMG_PLACEHOLDER_H);
     }
