@@ -18,6 +18,7 @@ use vello::kurbo::{Affine, Rect, Stroke};
 use vello::peniko::{Brush, Color, Fill, ImageBrush};
 
 use crate::buffer::RenderSnapshot;
+use crate::consts::MAX_CONTENT_WIDTH;
 use crate::diff::{DiffState, InlineChange};
 use crate::editor::EditorTheme;
 use crate::github::GitHubValidationCache;
@@ -476,7 +477,11 @@ impl DocLayout {
             line_height,
             fg,
         } = *params;
-        let max_advance = (device_width - 2.0 * pad_x * scale).max(1.0);
+        // Cap the body width for readability and center it: the left margin is the base
+        // padding, widened to a centering inset once the window exceeds MAX_CONTENT_WIDTH
+        // plus that padding. `left` is the draw origin and both margins for `max_advance`.
+        let left = (pad_x * scale).max((device_width - MAX_CONTENT_WIDTH * scale) / 2.0);
+        let max_advance = (device_width - 2.0 * left).max(1.0);
         let n = snapshot.line_count();
         cache.begin();
         render_cache.begin();
@@ -687,7 +692,7 @@ impl DocLayout {
             width: device_width,
             pad_top: pad_top * scale,
             pad_bottom: pad_bottom * scale,
-            pad_x: pad_x * scale,
+            pad_x: left,
         }
     }
 
@@ -910,7 +915,7 @@ impl DocLayout {
                     Affine::IDENTITY,
                     self.diff_colors.deleted_bg,
                     None,
-                    &Rect::new(0.0, top, self.width as f64, bottom),
+                    &Rect::new(self.pad_x as f64, top, (self.width - self.pad_x) as f64, bottom),
                 );
                 self.fill_word_ranges(
                     scene,
@@ -1062,7 +1067,7 @@ impl DocLayout {
                 Affine::IDENTITY,
                 self.diff_colors.added_bg,
                 None,
-                &Rect::new(0.0, top, self.width as f64, bottom),
+                &Rect::new(self.pad_x as f64, top, (self.width - self.pad_x) as f64, bottom),
             );
             self.fill_word_ranges(
                 scene,
