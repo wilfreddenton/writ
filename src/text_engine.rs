@@ -10,7 +10,7 @@ use std::ops::Range;
 use parley::{
     Alignment, AlignmentOptions, CHROMIUM_LINE_BREAK_OVERRIDE, Cluster, FontContext, FontFamily,
     FontFamilyName, FontStyle, FontWeight, GenericFamily, IndentOptions, InlineBox, InlineBoxKind,
-    Layout, LayoutContext, LineHeight, PositionedLayoutItem, StyleProperty,
+    Layout, LayoutContext, LineHeight, OverflowWrap, PositionedLayoutItem, StyleProperty,
 };
 use vello::Scene;
 use vello::kurbo::{Affine, Line, Stroke};
@@ -125,6 +125,10 @@ impl TextEngine {
             FontFamilyName::Generic(GenericFamily::Monospace),
         )));
         builder.push_default(StyleProperty::Brush(Brush::Solid(base_color)));
+        // A word too long to fit the wrap width breaks at an arbitrary point instead of
+        // overflowing off the right edge (CSS `overflow-wrap: anywhere`); normal text
+        // still wraps only at word boundaries.
+        builder.push_default(StyleProperty::OverflowWrap(OverflowWrap::Anywhere));
 
         for run in runs {
             builder.push(
