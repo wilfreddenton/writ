@@ -323,17 +323,33 @@ fn resolve_local_image(doc_dir: Option<&Path>, url: &str) -> Option<PathBuf> {
 }
 
 /// GET + decode a remote image. Mirrors the reqwest/rustls client pattern in github.rs.
+/// Logs (rather than silently drops) the failure reason — a non-2xx status, a transport
+/// error, or an undecodable body (e.g. SVG, which the `image` crate can't rasterize).
 async fn load_remote_image(url: &str) -> Option<crate::image_cache::LoadedImage> {
-    let bytes = reqwest::Client::new()
+    let resp = match reqwest::Client::new()
         .get(url)
         .header("User-Agent", "writ")
         .send()
         .await
-        .ok()?
-        .bytes()
-        .await
-        .ok()?;
-    decode(&bytes)
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[writ] image fetch failed ({url}): {e}");
+            return None;
+        }
+    };
+    let bytes = resp.bytes().await.ok()?;
+    match decode(&bytes) {
+        Some(img) => Some(img),
+        None => {
+            eprintln!(
+                "[writ] image decode failed ({url}): {} bytes, unsupported format (SVG is not supported)",
+                bytes.len()
+            );
+            None
+        }
+    }
 }
 
 /// For each standalone-image URL with no cache entry, mark it loading and spawn a
@@ -1609,18 +1625,18 @@ fn load_editor_from_cli() -> Editor {
     editor
 }
 
-/// Synchronously read + decode local standalone images into the cache (headless
-/// snapshot path). Remote `http(s)` images are marked loading and left as a placeholder
-/// (no network in the golden frame). Local reads are relative to the doc's directory.
+/// Synchronously decode standalone images into the cache for the headless snapshot
+/// frame: local reads (relative to the doc's directory) plus remote `http(s)` fetched
+/// by blocking on the current runtime, so the golden frame reflects the real result.
 fn load_local_images_blocking(doc_dir: Option<&Path>, urls: &[String], cache: &ImageCache) {
     for url in urls {
-        if url.starts_with("http://") || url.starts_with("https://") {
-            cache.mark_loading(url);
-            continue;
-        }
-        let loaded = resolve_local_image(doc_dir, url)
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|bytes| decode(&bytes));
+        let loaded = if url.starts_with("http://") || url.starts_with("https://") {
+            tokio::runtime::Handle::current().block_on(load_remote_image(url))
+        } else {
+            resolve_local_image(doc_dir, url)
+                .and_then(|p| std::fs::read(p).ok())
+                .and_then(|bytes| decode(&bytes))
+        };
         match loaded {
             Some(img) => cache.set_loaded(url, img),
             None => cache.set_failed(url),
