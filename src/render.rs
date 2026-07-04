@@ -460,6 +460,25 @@ mod tests {
         );
     }
 
+    /// Inline code spans expose their display ranges (for the background chip); a line
+    /// with no inline code exposes none.
+    #[test]
+    fn inline_code_exposes_code_ranges() {
+        let theme = EditorTheme::dracula();
+        let mut buf: Buffer = "call `foo()` now\nplain line\n".parse().unwrap();
+        let snap = buf.render_snapshot();
+        let styles = snap.inline_styles_by_line();
+
+        let coded = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &styles[0], &[]);
+        assert_eq!(coded.code_ranges.len(), 1, "one code span");
+        // The chip covers the visible `foo()` (backticks hidden off-cursor).
+        let (s, e) = (coded.code_ranges[0].start, coded.code_ranges[0].end);
+        assert_eq!(&coded.text[s..e], "foo()");
+
+        let plain = build_line_render(&snap, 1, &theme, 18.0, usize::MAX, &styles[1], &[]);
+        assert!(plain.code_ranges.is_empty(), "no code span, no chip");
+    }
+
     /// A thematic break hides its `---` and flags `is_hr` for the drawn rule — but
     /// reveals the text (no rule) while the cursor is on the line, for editing.
     #[test]
