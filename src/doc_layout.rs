@@ -200,6 +200,46 @@ impl RenderCache {
     }
 }
 
+/// Persistent per-line measured *height* cache (device px, the real line only — ghost
+/// blocks are added separately). Keyed by the same `render_key` as the render cache, so
+/// it holds exact heights for lines materialized on any recent frame; un-materialized
+/// (head/tail virtualized) lines read their height from here when present, falling back
+/// to the char-count estimate. This is what lets the layout drop to O(visible) without
+/// the scroll positions of already-seen regions drifting.
+#[derive(Default)]
+pub struct HeightCache {
+    map: HashMap<u64, f32>,
+    used: HashSet<u64>,
+}
+
+impl HeightCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn begin(&mut self) {
+        self.used.clear();
+    }
+
+    fn get(&mut self, key: u64) -> Option<f32> {
+        let h = self.map.get(&key).copied();
+        if h.is_some() {
+            self.used.insert(key);
+        }
+        h
+    }
+
+    fn set(&mut self, key: u64, height: f32) {
+        self.used.insert(key);
+        self.map.insert(key, height);
+    }
+
+    fn sweep(&mut self) {
+        let used = &self.used;
+        self.map.retain(|k, _| used.contains(k));
+    }
+}
+
 /// Vertical padding (logical px) above and below an image block.
 const IMG_VPAD: f32 = 8.0;
 /// Block height (logical px) reserved for a loading/failed image placeholder.
@@ -518,6 +558,7 @@ impl DocLayout {
         engine: &mut TextEngine,
         cache: &mut LineCache,
         render_cache: &mut RenderCache,
+        height_cache: &mut HeightCache,
         version: u64,
         snapshot: &RenderSnapshot,
         theme: &EditorTheme,
@@ -553,6 +594,7 @@ impl DocLayout {
         let n = snapshot.line_count();
         cache.begin();
         render_cache.begin();
+        height_cache.begin();
         // Off-screen height estimate: average glyph advance (device px/char) from one
         // unwrapped sample line, and the body row height. Predicts soft-wrap row count
         // from a line's byte length without laying it out (see writ-virtualization-plan).
@@ -617,9 +659,15 @@ impl DocLayout {
             }
             if estimating {
                 let range = snapshot.line_byte_range(i);
-                let byte_len = range.len().saturating_sub(1) as f32; // minus trailing '\n'
-                let est_rows = (byte_len * k / max_advance).ceil().max(1.0);
-                heights.push(est_rows * min_row);
+                // Prefer an exact height measured on a recent frame; fall back to the
+                // char-count soft-wrap estimate for never-seen lines.
+                let rkey = render_key(version, i, cursor_key_for(&range, cursor_offset));
+                let h = height_cache.get(rkey).unwrap_or_else(|| {
+                    let byte_len = range.len().saturating_sub(1) as f32; // minus trailing '\n'
+                    let est_rows = (byte_len * k / max_advance).ceil().max(1.0);
+                    est_rows * min_row
+                });
+                heights.push(h);
                 layouts.push(empty_layout.clone());
                 renders.push(empty_render.clone());
                 line_ranges.push(range);
@@ -797,6 +845,15 @@ impl DocLayout {
                 }
                 None => (None, layout.height()),
             };
+            // Cache the exact real-line height (ghost excluded) so a later frame that
+            // only estimates this line reuses it instead of the char-count guess. Key by
+            // `line_byte_range` to match the estimate-branch lookup + render cache.
+            let hkey = render_key(
+                version,
+                i,
+                cursor_key_for(&snapshot.line_byte_range(i), cursor_offset),
+            );
+            height_cache.set(hkey, line_h);
             let total_h = gh + line_h;
             measured_y += total_h;
             heights.push(total_h);
@@ -812,6 +869,7 @@ impl DocLayout {
         }
         cache.sweep();
         render_cache.sweep();
+        height_cache.sweep();
         let diff_colors = DiffColors {
             added_bg: peniko_color_alpha(theme.green, 0.05),
             added_inline: peniko_color_alpha(theme.green, 0.25),
@@ -1526,6 +1584,7 @@ mod tests {
             &mut engine,
             &mut LineCache::new(),
             &mut RenderCache::new(),
+            &mut HeightCache::new(),
             0,
             &snapshot,
             &theme,
@@ -1569,6 +1628,7 @@ mod tests {
             &mut engine,
             &mut LineCache::new(),
             &mut RenderCache::new(),
+            &mut HeightCache::new(),
             0,
             &snapshot,
             &theme,
@@ -1610,8 +1670,8 @@ mod tests {
         let params = test_params(&theme, 1000.0);
         let build = |engine: &mut TextEngine, cache: &mut LineCache| {
             DocLayout::build(
-                engine, cache, &mut RenderCache::new(), 0, &snapshot, &theme, None, None,
-                &ImageCache::new(), 0, &params, None, f32::INFINITY,
+                engine, cache, &mut RenderCache::new(), &mut HeightCache::new(), 0, &snapshot,
+                &theme, None, None, &ImageCache::new(), 0, &params, None, f32::INFINITY,
             )
         };
         let t0 = Instant::now();
@@ -1650,8 +1710,8 @@ mod tests {
         let build =
             |engine: &mut TextEngine, lc: &mut LineCache, rc: &mut RenderCache, cursor: usize| {
                 DocLayout::build(
-                    engine, lc, rc, 7, &snapshot, &theme, None, None, &ImageCache::new(),
-                    cursor, &params, None, f32::INFINITY,
+                    engine, lc, rc, &mut HeightCache::new(), 7, &snapshot, &theme, None, None,
+                    &ImageCache::new(), cursor, &params, None, f32::INFINITY,
                 )
             };
 
@@ -1691,6 +1751,7 @@ mod tests {
             &mut engine,
             &mut LineCache::new(),
             &mut RenderCache::new(),
+            &mut HeightCache::new(),
             1,
             &snapshot,
             &theme,

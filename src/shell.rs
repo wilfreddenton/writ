@@ -46,7 +46,8 @@ use crate::config::Config;
 use crate::consts::{CARET_WIDTH, FONT_SIZE, LINE_HEIGHT, PADDING, STATUS_BAR_H, WHEEL_LINE_STEP};
 use crate::core::{AutocompleteState, AutocompleteSuggestion, AutocompleteTrigger, Editor};
 use crate::doc_layout::{
-    DocLayout, GithubRenderData, LayoutParams, LineCache, PreeditView, RenderCache, ScreenRect,
+    DocLayout, GithubRenderData, HeightCache, LayoutParams, LineCache, PreeditView, RenderCache,
+    ScreenRect,
 };
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
@@ -207,6 +208,7 @@ struct DocEngine {
     text_engine: TextEngine,
     line_cache: LineCache,
     render_cache: RenderCache,
+    height_cache: HeightCache,
     theme: EditorTheme,
     editor: Editor,
     doc: Option<DocLayout>,
@@ -290,6 +292,7 @@ impl App {
                 text_engine: TextEngine::new(),
                 line_cache: LineCache::new(),
                 render_cache: RenderCache::new(),
+                height_cache: HeightCache::new(),
                 theme: EditorTheme::dracula(),
                 editor,
                 doc: None,
@@ -840,6 +843,7 @@ impl DocEngine {
             &mut self.text_engine,
             &mut self.line_cache,
             &mut self.render_cache,
+            &mut self.height_cache,
             version,
             &snapshot,
             &self.theme,
@@ -2242,6 +2246,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         text_engine: TextEngine::new(),
         line_cache: LineCache::new(),
         render_cache: RenderCache::new(),
+        height_cache: HeightCache::new(),
         theme: EditorTheme::dracula(),
         editor,
         doc: None,
