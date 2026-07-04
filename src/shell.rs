@@ -154,15 +154,21 @@ land in the next phases. For now this proves the render + scroll skeleton.
 /// Wakeups sent from tokio worker tasks back into the winit loop. The work's
 /// results are already written to the shared `Arc<Mutex>` caches; the event just
 /// tells the loop to redraw (and, for autocomplete, drain the suggestion slot).
+/// `(new file content, git HEAD blob text)` read off-thread for a file reload.
+type ReloadData = (String, Option<String>);
+
 #[derive(Debug, Clone)]
 pub(crate) enum WritEvent {
     GithubUpdated,
     /// A standalone image finished loading (local or remote). A load changes a line's
     /// height, so the loop rebuilds (not just redraws) to reflow around it.
     ImageLoaded,
-    /// The watched file changed on disk (forwarded from the file-watcher thread), so
-    /// the loop reloads the buffer. Lets the loop park on `Wait` instead of polling.
+    /// The watched file changed on disk (forwarded from the file-watcher thread). The
+    /// loop kicks off a blocking read off-thread rather than touching disk here.
     FileChanged,
+    /// The off-thread file read finished; its `(content, base_text)` is in `reload_slot`,
+    /// ready for the cheap main-thread apply (buffer swap + diff).
+    FileReloaded,
 }
 
 /// Autocomplete results a tokio task fetched, handed back to the main thread (via a
@@ -246,6 +252,9 @@ struct App {
     /// Set by async completions (validation/image); the next redraw does a single
     /// rebuild, coalescing many same-frame completions into one relayout.
     pending_rebuild: bool,
+    /// Where the off-thread file read drops `(content, head_base_text)` for the
+    /// main-thread `apply_reload` (keeps disk IO off the render thread).
+    reload_slot: Arc<Mutex<Option<ReloadData>>>,
     /// System clipboard for copy/cut/paste. Held for the app's lifetime (on Wayland the
     /// instance keeps serving the copied data). `None` if the platform init failed.
     clipboard: Option<arboard::Clipboard>,
@@ -310,6 +319,7 @@ impl App {
             drag_scroll_dy: 0.0,
             last_drag_tick: None,
             pending_rebuild: false,
+            reload_slot: Arc::new(Mutex::new(None)),
             clipboard: arboard::Clipboard::new().ok(),
             title,
             hovered: None,
@@ -956,16 +966,35 @@ impl ApplicationHandler<WritEvent> for App {
     /// A tokio task finished (validation/suggestion). Results are already in the
     /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WritEvent) {
-        // The watched file changed on disk: reload the buffer and treat it like an edit
-        // (refresh detection / revalidate refs / reload images) rather than just reflow.
+        // The watched file changed on disk: read it (fs + git HEAD) on a blocking worker
+        // so the render thread never touches disk, then finish on FileReloaded.
         if matches!(event, WritEvent::FileChanged) {
-            if self.doc_engine.editor.reload_from_disk()
+            let Some(path) = self.doc_engine.editor.file_path().map(|p| p.to_path_buf()) else {
+                return;
+            };
+            let last_mtime = self.doc_engine.editor.last_save_mtime();
+            let slot = self.reload_slot.clone();
+            let proxy = self.proxy.clone();
+            self.runtime.spawn_blocking(move || {
+                if let Some(data) = Editor::read_reload(&path, last_mtime) {
+                    *slot.lock().unwrap() = Some(data);
+                    let _ = proxy.send_event(WritEvent::FileReloaded);
+                }
+            });
+            return;
+        }
+        // The off-thread read finished: apply it (cheap parse/diff) and treat it like an
+        // edit (refresh detection / revalidate refs / reload images).
+        if matches!(event, WritEvent::FileReloaded) {
+            let data = self.reload_slot.lock().unwrap().take();
+            if let Some((content, base_text)) = data
                 && let Some(state) = self.state.as_ref()
             {
-                let (w, vh, _) = state.viewport();
+                let (w, vh, scale) = state.viewport();
                 let window = state.window.clone();
+                self.doc_engine.editor.apply_reload(content, base_text);
                 self.hovered = None;
-                after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
+                after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, scale, vh);
                 window.request_redraw();
             }
             return;

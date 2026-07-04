@@ -835,22 +835,35 @@ impl Editor {
         self.file_watcher_rx.take()
     }
 
-    /// Reload the buffer from disk if the on-disk content differs (skipping our own
-    /// saves via `last_save_mtime`). Returns true if the buffer changed.
-    pub fn reload_from_disk(&mut self) -> bool {
-        let Some(path) = self.file_path.clone() else {
-            return false;
-        };
-        if let Some(last) = self.last_save_mtime
-            && let Ok(meta) = std::fs::metadata(&path)
+    pub fn last_save_mtime(&self) -> Option<SystemTime> {
+        self.last_save_mtime
+    }
+
+    /// The blocking half of an external-file reload: read the file + the git HEAD blob.
+    /// Pure/`Send` (no editor state, no `Rc`), so the shell runs it on a blocking worker
+    /// off the render thread — the diff hot path must not touch disk on the UI thread.
+    /// Returns `(new_content, head_base_text)`, or `None` to skip (our own save, or a
+    /// read error). The cheap parse/snapshot/diff is done on the main thread by
+    /// [`apply_reload`].
+    pub fn read_reload(
+        path: &Path,
+        last_save_mtime: Option<SystemTime>,
+    ) -> Option<(String, Option<String>)> {
+        if let Some(last) = last_save_mtime
+            && let Ok(meta) = std::fs::metadata(path)
             && let Ok(mtime) = meta.modified()
             && mtime == last
         {
-            return false;
+            return None; // our own write
         }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return false;
-        };
+        let content = std::fs::read_to_string(path).ok()?;
+        Some((content, head_blob_text(path)))
+    }
+
+    /// The main-thread half of a reload: swap in the freshly-read `content` (preserving
+    /// the cursor line) and set the diff base from `base_text`, then recompute the diff.
+    /// Only parse/snapshot/diff work — no IO.
+    pub fn apply_reload(&mut self, content: String, base_text: Option<String>) {
         if content != self.state.buffer.text() {
             let cursor_line = self.state.buffer.byte_to_line(self.state.selection.head);
             self.set_text(&content);
@@ -858,8 +871,15 @@ impl Editor {
             let offset = self.state.buffer.line_to_byte(line);
             self.state.selection = Selection::new(offset, offset);
         }
-        self.refresh_git_base();
-        true
+        match base_text {
+            Some(text) => {
+                let mut base: Buffer = text.parse().expect("Buffer parsing is infallible");
+                let snapshot = base.render_snapshot();
+                self.head_base = Some((text, snapshot));
+            }
+            None => self.head_base = None,
+        }
+        self.recompute_diff();
     }
 
     /// Start watching `file_path` for external modifications.
