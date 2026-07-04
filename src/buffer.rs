@@ -216,6 +216,10 @@ pub struct TextEdit {
     inserted: String,
     cursor_before: usize,
     cursor_after: usize,
+    /// Single-character typing/backspace, eligible to merge into a run so one Ctrl+Z
+    /// undoes a whole word rather than one character. Multi-char (paste), replacements,
+    /// and programmatic edits are false and stay their own undo step.
+    coalescable: bool,
 }
 
 impl TextEdit {
@@ -226,14 +230,23 @@ impl TextEdit {
         cursor_before: usize,
         cursor_after: usize,
     ) -> Self {
+        // A pure single-character insert or delete is coalescable.
+        let coalescable = deleted.chars().count() + inserted.chars().count() == 1;
         Self {
             offset,
             deleted,
             inserted,
             cursor_before,
             cursor_after,
+            coalescable,
         }
     }
+}
+
+/// Word characters extend the current typing group; anything else (space, punctuation,
+/// newline) starts a fresh undo step — the common word-granular undo behavior.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 impl undo::Edit for TextEdit {
@@ -248,6 +261,41 @@ impl undo::Edit for TextEdit {
     fn undo(&mut self, target: &mut BufferContent) -> Self::Output {
         target.apply_edit(self.offset, &self.inserted, &self.deleted);
         self.cursor_before
+    }
+
+    /// Coalesce contiguous single-character word typing (or backspacing) into one undo
+    /// step. `self` is the edit already on the stack; `other` the incoming one.
+    fn merge(&mut self, other: Self) -> undo::Merged<Self> {
+        if !self.coalescable || !other.coalescable {
+            return undo::Merged::No(other);
+        }
+        // Forward typing: `other` inserts a word char right where `self`'s insert ended.
+        if self.deleted.is_empty() && other.deleted.is_empty() {
+            let ends_at = self.offset + self.inserted.len();
+            let last = self.inserted.chars().next_back();
+            let next = other.inserted.chars().next();
+            if ends_at == other.offset
+                && matches!((last, next), (Some(l), Some(n)) if is_word_char(l) && is_word_char(n))
+            {
+                self.inserted.push_str(&other.inserted);
+                self.cursor_after = other.cursor_after;
+                return undo::Merged::Yes;
+            }
+        }
+        // Backspacing: `other` deletes the word char immediately before `self`'s deletion.
+        if self.inserted.is_empty() && other.inserted.is_empty() {
+            let first = self.deleted.chars().next();
+            let prev = other.deleted.chars().next();
+            if other.offset + other.deleted.len() == self.offset
+                && matches!((first, prev), (Some(f), Some(p)) if is_word_char(f) && is_word_char(p))
+            {
+                self.deleted.insert_str(0, &other.deleted);
+                self.offset = other.offset;
+                self.cursor_after = other.cursor_after;
+                return undo::Merged::Yes;
+            }
+        }
+        undo::Merged::No(other)
     }
 }
 
@@ -816,13 +864,15 @@ impl Buffer {
         if start == old_end && replacement.is_empty() {
             return;
         }
-        let edit = TextEdit::new(
+        let mut edit = TextEdit::new(
             start,
             text_before[start..old_end].to_string(),
             replacement,
             cursor_before,
             cursor_after,
         );
+        // A coalesced batch is one discrete action — never fold it into prior typing.
+        edit.coalescable = false;
         self.history.edit(&mut self.content, edit);
     }
 
@@ -1150,25 +1200,28 @@ mod tests {
 
     #[test]
     fn test_multiple_undo_redo() {
+        // Multi-char inserts are non-coalescable, so each is its own undo step — this
+        // exercises the undo/redo *stack* mechanics (single-char typing coalesces, which
+        // is covered separately by the editor coalescing tests).
         let mut buf: Buffer = "a".parse().unwrap();
-        buf.insert(1, "b", 1);
-        buf.insert(2, "c", 2);
-        buf.insert(3, "d", 3);
-        assert_eq!(buf.text(), "abcd");
+        buf.insert(1, "bb", 1);
+        buf.insert(3, "cc", 3);
+        buf.insert(5, "dd", 5);
+        assert_eq!(buf.text(), "abbccdd");
 
         buf.undo();
-        assert_eq!(buf.text(), "abc");
+        assert_eq!(buf.text(), "abbcc");
         buf.undo();
-        assert_eq!(buf.text(), "ab");
+        assert_eq!(buf.text(), "abb");
         buf.undo();
         assert_eq!(buf.text(), "a");
 
         buf.redo();
-        assert_eq!(buf.text(), "ab");
+        assert_eq!(buf.text(), "abb");
         buf.redo();
-        assert_eq!(buf.text(), "abc");
+        assert_eq!(buf.text(), "abbcc");
         buf.redo();
-        assert_eq!(buf.text(), "abcd");
+        assert_eq!(buf.text(), "abbccdd");
     }
 
     #[test]

@@ -2530,6 +2530,48 @@ mod tests {
         }
 
         #[test]
+        fn typing_coalesces_into_word_undo_steps() {
+            let mut state = EditorState::new("");
+            for c in "hi there".chars() {
+                state.insert_text(&c.to_string());
+            }
+            assert_eq!(state.text(), "hi there");
+            // Word-granular undo: "there", then the space, then "hi".
+            state.buffer.undo();
+            assert_eq!(state.text(), "hi ", "undo removes the whole last word");
+            state.buffer.undo();
+            assert_eq!(state.text(), "hi", "undo removes the space");
+            state.buffer.undo();
+            assert_eq!(state.text(), "", "undo removes the first word");
+        }
+
+        #[test]
+        fn backspace_coalesces_into_one_undo() {
+            let mut state = EditorState::new("word\n");
+            state.set_cursor(4); // end of "word"
+            for _ in 0..4 {
+                state.delete_backward();
+            }
+            assert_eq!(state.text(), "\n");
+            state.buffer.undo();
+            assert_eq!(state.text(), "word\n", "one undo restores the backspaced word");
+        }
+
+        #[test]
+        fn paste_is_its_own_undo_step() {
+            let mut state = EditorState::new("");
+            state.insert_text("ab"); // multi-char (paste-like) — not coalescable
+            for c in "cd".chars() {
+                state.insert_text(&c.to_string());
+            }
+            assert_eq!(state.text(), "abcd");
+            state.buffer.undo();
+            assert_eq!(state.text(), "ab", "typing after a paste undoes separately");
+            state.buffer.undo();
+            assert_eq!(state.text(), "", "the paste is its own step");
+        }
+
+        #[test]
         fn strikethrough_remove_is_single_undo() {
             let mut state = EditorState::new("~~hello world~~\n");
             state.toggle_line_strikethrough(0, false, 0);
