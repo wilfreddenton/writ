@@ -1299,7 +1299,6 @@ impl ApplicationHandler<WritEvent> for App {
             // In-progress composition: splice it into the caret line (render-only, no
             // buffer mutation) and move the OS candidate popup to the composition caret.
             WindowEvent::Ime(winit::event::Ime::Preedit(text, cursor)) => {
-                eprintln!("[writ][ime] preedit {text:?} cursor {cursor:?}");
                 self.doc_engine.preedit =
                     (!text.is_empty()).then_some(Preedit { text, cursor });
                 let w = state.surface.config.width as f32;
