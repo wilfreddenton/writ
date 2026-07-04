@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use parley::Layout;
+use parley::{Affinity, Cursor, Layout, Selection};
 use unicode_segmentation::UnicodeSegmentation;
 use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Brush, Fill};
@@ -55,7 +55,7 @@ use crate::github::{
 use crate::image_cache::{ImageCache, decode};
 use crate::inline::{GitHubContext, GitHubRef};
 use crate::marker::MarkerKind;
-use crate::text_engine::{StyleRun, TextEngine, peniko_color};
+use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
 
 /// Chrome layout in device px: y where editor content begins, and its height.
 fn chrome_metrics(scale: f32, height_dev: f32) -> (f32, f32) {
@@ -878,19 +878,25 @@ fn segments_to_line(
     font_size: f32,
     max_text: f32,
     theme: &EditorTheme,
-) -> Layout<Brush> {
+) -> (Layout<Brush>, Vec<Range<usize>>) {
     let mut text = String::new();
     let mut runs = Vec::new();
+    // Panel text is built directly (no segment map), so a mono segment's byte range in
+    // `text` is already its display range — usable as-is for the code-chip background.
+    let mut code_ranges = Vec::new();
     for seg in segments {
         let start = text.len();
         text.push_str(&seg.text);
+        if seg.mono {
+            code_ranges.push(start..text.len());
+        }
         let mut run = StyleRun::new(start..text.len(), peniko_color(seg.color));
         run.bold = seg.bold;
         run.italic = seg.italic;
         run.mono = seg.mono;
         runs.push(run);
     }
-    engine.build_line(
+    let layout = engine.build_line(
         &text,
         scale,
         font_size,
@@ -898,7 +904,45 @@ fn segments_to_line(
         peniko_color(theme.foreground),
         Some(max_text),
         &runs,
-    )
+    );
+    (layout, code_ranges)
+}
+
+/// The inline-code chip background color, matching the body's code spans.
+fn code_chip_color(theme: &EditorTheme) -> vello::peniko::Color {
+    peniko_color_alpha(theme.comment, 0.22)
+}
+
+/// Paint the inline-code background chip behind each display `range` of `layout`,
+/// with the layout drawn at `origin` (device px). Mirrors the body's code chips for
+/// hover/autocomplete titles.
+fn fill_code_chips(
+    scene: &mut Scene,
+    layout: &Layout<Brush>,
+    ranges: &[Range<usize>],
+    origin: (f32, f32),
+    color: vello::peniko::Color,
+) {
+    for r in ranges {
+        let sel = Selection::new(
+            Cursor::from_byte_index(layout, r.start, Affinity::Downstream),
+            Cursor::from_byte_index(layout, r.end, Affinity::Upstream),
+        );
+        for (bb, _) in sel.geometry(layout) {
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                color,
+                None,
+                &Rect::new(
+                    bb.x0 + origin.0 as f64,
+                    bb.y0 + origin.1 as f64,
+                    bb.x1 + origin.0 as f64,
+                    bb.y1 + origin.1 as f64,
+                ),
+            );
+        }
+    }
 }
 
 /// Position a `panel_w`×`panel_h` panel near `anchor`, preferring below it but
@@ -979,7 +1023,7 @@ fn draw_hover_popover(
     let font_size = 14.0;
     // Cap the panel width (long issue titles) so it doesn't run off-screen.
     let max_text = (viewport_w - 2.0 * PADDING * scale).min(480.0 * scale);
-    let layout = segments_to_line(engine, &segs, scale, font_size, max_text, theme);
+    let (layout, code_ranges) = segments_to_line(engine, &segs, scale, font_size, max_text, theme);
     let pad = 8.0 * scale;
     let panel_w = layout.width() + pad * 2.0;
     let panel_h = layout.height() + pad * 2.0;
@@ -1002,7 +1046,9 @@ fn draw_hover_popover(
         6.0 * scale as f64,
         scale as f64,
     );
-    engine.draw_line(scene, &layout, (x as f32 + pad, y as f32 + pad));
+    let origin = (x as f32 + pad, y as f32 + pad);
+    fill_code_chips(scene, &layout, &code_ranges, origin, code_chip_color(theme));
+    engine.draw_line(scene, &layout, origin);
 }
 
 /// The colored text segments for one autocomplete row.
@@ -1046,11 +1092,11 @@ fn draw_autocomplete(
     let mut rows = Vec::with_capacity(ac.suggestions.len());
     for s in &ac.suggestions {
         let segs = suggestion_segments(s, theme);
-        let layout = segments_to_line(engine, &segs, scale, font_size, max_text, theme);
+        let (layout, code) = segments_to_line(engine, &segs, scale, font_size, max_text, theme);
         let h = layout.height() + 2.0 * pad_y;
-        rows.push((layout, h));
+        rows.push((layout, h, code));
     }
-    let panel_h: f32 = rows.iter().map(|(_, h)| *h).sum();
+    let panel_h: f32 = rows.iter().map(|(_, h, _)| *h).sum();
 
     let gap = 4.0 * scale as f64;
     let (x, y) = place_panel(caret, panel_w, panel_h, (viewport_w, viewport_h), gap);
@@ -1068,7 +1114,7 @@ fn draw_autocomplete(
     let sel_color = peniko_color(theme.selection);
     let mut rects = Vec::with_capacity(rows.len());
     let mut row_top = y;
-    for (i, (layout, h)) in rows.iter().enumerate() {
+    for (i, (layout, h, code)) in rows.iter().enumerate() {
         let row_bottom = row_top + *h as f64;
         if i == ac.selected_index {
             scene.fill(
@@ -1079,7 +1125,9 @@ fn draw_autocomplete(
                 &Rect::new(x, row_top, x + panel_w as f64, row_bottom),
             );
         }
-        engine.draw_line(scene, layout, (x as f32 + pad_x, row_top as f32 + pad_y));
+        let origin = (x as f32 + pad_x, row_top as f32 + pad_y);
+        fill_code_chips(scene, layout, code, origin, code_chip_color(theme));
+        engine.draw_line(scene, layout, origin);
         rects.push((x, row_top, x + panel_w as f64, row_bottom));
         row_top = row_bottom;
     }
