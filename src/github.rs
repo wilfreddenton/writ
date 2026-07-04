@@ -249,6 +249,12 @@ impl GitHubValidationCache {
         self.cache.lock().unwrap().get(ref_).cloned()
     }
 
+    /// Presence check that doesn't clone the value — for the "already pending/validated?"
+    /// guard that spawns validation only for new refs.
+    pub fn contains(&self, ref_: &GitHubRef) -> bool {
+        self.cache.lock().unwrap().contains_key(ref_)
+    }
+
     pub fn mark_pending(&self, ref_: GitHubRef) {
         self.cache
             .lock()

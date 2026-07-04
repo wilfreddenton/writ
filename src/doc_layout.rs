@@ -693,14 +693,18 @@ impl DocLayout {
             let line_ghosts = build_ghosts_before(engine, diff, i, theme, params, max_advance);
             let gh: f32 = line_ghosts.iter().map(|g| g.height).sum();
 
+            // Line byte range + render key, computed once and shared by the render cache,
+            // the height cache, and the diff mapping below. (`line_markers(i).range` is
+            // byte-identical but far pricier — it runs full marker extraction per line.)
+            let range = snapshot.line_byte_range(i);
+            let rkey = render_key(version, i, cursor_key_for(&range, cursor_offset));
+
             let extra = github.map(|g| g.extra_regions(i)).unwrap_or_default();
             // Reuse the cached render when nothing about this line changed. Lines with
             // GitHub extra regions bypass the cache (validation can change them without
             // a version bump); all others key on (version, line, cursor-on-line).
             let lr = if extra.is_empty() {
-                let range = snapshot.line_byte_range(i);
-                let key = render_key(version, i, cursor_key_for(&range, cursor_offset));
-                render_cache.get_or_build(key, || {
+                render_cache.get_or_build(rkey, || {
                     build_line_render(
                         snapshot,
                         i,
@@ -819,7 +823,6 @@ impl DocLayout {
                 }
                 _ => layout,
             };
-            let range = snapshot.line_markers(i).range;
             // Inline diff: map added word ranges (line-relative buffer bytes) through
             // this line's segment map into display ranges.
             let line_diff = match diff {
@@ -856,14 +859,9 @@ impl DocLayout {
                 None => (None, layout.height()),
             };
             // Cache the exact real-line height (ghost excluded) so a later frame that
-            // only estimates this line reuses it instead of the char-count guess. Key by
-            // `line_byte_range` to match the estimate-branch lookup + render cache.
-            let hkey = render_key(
-                version,
-                i,
-                cursor_key_for(&snapshot.line_byte_range(i), cursor_offset),
-            );
-            height_cache.set(hkey, line_h);
+            // only estimates this line reuses it instead of the char-count guess. Same
+            // `rkey` as the render cache / estimate-branch lookup.
+            height_cache.set(rkey, line_h);
             let total_h = gh + line_h;
             // Count coverage only from the anchor down (lines above are fixed-count
             // overscan); stop once the viewport + overscan below is covered.
@@ -1303,8 +1301,8 @@ impl DocLayout {
 
     /// Distinct standalone-image URLs across the materialized lines. The shell diffs
     /// these against the shared cache to spawn loads.
-    pub fn image_urls(&self) -> Vec<String> {
-        self.image_urls.clone()
+    pub fn image_urls(&self) -> &[String] {
+        &self.image_urls
     }
 
     /// Paint standalone-image blocks: a loaded image at its fitted device rect, or a

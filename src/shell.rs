@@ -358,7 +358,7 @@ fn sync_image_loads(
         .editor
         .file_path()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    spawn_image_loads(dir, &urls, &doc_engine.images, runtime, proxy);
+    spawn_image_loads(dir, urls, &doc_engine.images, runtime, proxy);
 }
 
 /// Resolve a standalone-image URL to a filesystem path: absolute paths as-is, relative
@@ -437,7 +437,7 @@ fn spawn_image_loads(
     proxy: &EventLoopProxy<WritEvent>,
 ) {
     for url in urls {
-        if cache.get(url).is_some() {
+        if cache.contains(url) {
             continue; // already loading/loaded/failed
         }
         cache.mark_loading(url);
@@ -518,7 +518,7 @@ fn spawn_ref_validations(
         None => editor.detected_refs(),
     };
     for reference in refs {
-        if cache.get(&reference).is_some() {
+        if cache.contains(&reference) {
             continue; // already pending/valid/invalid
         }
         cache.mark_pending(reference.clone());
@@ -2290,7 +2290,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         .editor
         .file_path()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-    load_local_images_blocking(img_dir.as_deref(), &doc.image_urls(), &de.images);
+    load_local_images_blocking(img_dir.as_deref(), doc.image_urls(), &de.images);
     doc = de.rebuild(width as f32, 1.0, 0, f32::INFINITY);
     doc.scroll_by(scroll_y, editor_h);
     let mut scene = Scene::new();

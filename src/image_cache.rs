@@ -65,6 +65,11 @@ impl ImageCache {
         self.inner.lock().unwrap().get(url).cloned()
     }
 
+    /// Presence check without cloning the (image-bearing) state — for the load guard.
+    pub fn contains(&self, url: &str) -> bool {
+        self.inner.lock().unwrap().contains_key(url)
+    }
+
     pub fn mark_loading(&self, url: &str) {
         self.inner
             .lock()
@@ -127,7 +132,7 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
         return true;
     }
     let head = &trimmed[..trimmed.len().min(1024)];
-    head.windows(5).any(|w| w == b"<svg ") || head.windows(4).any(|w| w == b"<svg")
+    head.windows(4).any(|w| w == b"<svg")
 }
 
 /// Rasterize an SVG at `SVG_SUPERSAMPLE`× its logical size (capped) so it stays crisp
