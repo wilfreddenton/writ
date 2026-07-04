@@ -33,6 +33,9 @@ imara-diff = "0.2"
 gix = { version = "0.84", default-features = false, features = ["sha1"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# SVG rasterization (badges etc.); default features pull in text + system-fonts,
+# needed to render `<text>` labels in shields.io-style badges.
+resvg = "0.46"
 # --- Linebender rendering stack (see MIGRATION-PLAN.md). `wgpu` is NOT a direct
 # dep — we use `vello::wgpu` so there is a single wgpu in the tree. ---
 parley = "0.11"

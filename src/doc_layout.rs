@@ -343,9 +343,10 @@ fn build_image_block(
 ) -> (ImageBlock, f32) {
     match images.get(&img.url) {
         Some(ImageState::Loaded(loaded)) => {
-            // Intrinsic size in device px (treat intrinsic px as logical, so ×scale).
-            let iw = loaded.width as f32 * scale;
-            let ih = loaded.height as f32 * scale;
+            // Intrinsic (logical display) size in device px (×scale). For SVG this is
+            // the vector's logical size, decoupled from the supersampled raster dims.
+            let iw = loaded.display_w * scale;
+            let ih = loaded.display_h * scale;
             let dw = iw.min(content_w);
             let dh = if iw > 0.0 { ih * dw / iw } else { 0.0 };
             let block = ImageBlock {
