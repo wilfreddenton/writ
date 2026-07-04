@@ -60,6 +60,7 @@ tree-sitter-highlight = "0.26"
 tree-sitter-md = "0.5"
 tree-sitter-rust = "0.24"
 undo = "0.52"
+notify-debouncer-full = "0.5"
 
 [profile.release]
 lto = "thin"

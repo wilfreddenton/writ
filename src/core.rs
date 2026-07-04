@@ -15,6 +15,10 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::Duration;
+
+use notify::{EventKind, RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use std::time::SystemTime;
 
 use crate::buffer::{Buffer, RenderSnapshot};
@@ -99,7 +103,9 @@ pub struct Editor {
     diff_state: Option<DiffState>,
 
     // --- file watching ---
-    file_watcher: Option<notify::RecommendedWatcher>,
+    /// Debounced watcher: coalesces the burst of fs events a single save emits (and
+    /// handles atomic-save/rename) into one notification instead of several.
+    file_watcher: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
     file_watcher_rx: Option<mpsc::Receiver<()>>,
     /// mtime after our own last save, so the watcher can skip self-writes.
     last_save_mtime: Option<SystemTime>,
@@ -858,22 +864,27 @@ impl Editor {
 
     /// Start watching `file_path` for external modifications.
     pub fn watch_file(&mut self) -> notify::Result<()> {
-        use notify::{EventKind, RecursiveMode, Watcher};
-
         let Some(path) = self.file_path.clone() else {
             return Ok(());
         };
         let (tx, rx) = mpsc::channel();
-        let mut watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if let Ok(event) = res
-                    && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
+        // 150ms debounce collapses a save's event burst (and atomic-save temp→rename)
+        // into a single reload notification.
+        let mut debouncer = new_debouncer(
+            Duration::from_millis(150),
+            None,
+            move |result: DebounceEventResult| {
+                if let Ok(events) = result
+                    && events
+                        .iter()
+                        .any(|e| matches!(e.kind, EventKind::Modify(_) | EventKind::Create(_)))
                 {
                     let _ = tx.send(());
                 }
-            })?;
-        watcher.watch(&path, RecursiveMode::NonRecursive)?;
-        self.file_watcher = Some(watcher);
+            },
+        )?;
+        debouncer.watch(&path, RecursiveMode::NonRecursive)?;
+        self.file_watcher = Some(debouncer);
         self.file_watcher_rx = Some(rx);
         Ok(())
     }
