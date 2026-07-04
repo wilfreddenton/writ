@@ -62,10 +62,21 @@ fn same_column_offset(
 ) -> usize {
     let from_start = buffer.line_to_byte(from_line);
     let column = buffer.slice_cow(from_start..offset).graphemes(true).count();
+    offset_at_column(buffer, target_line, column)
+}
 
-    let target = buffer.line_byte_range(target_line);
-    let chunk = buffer.slice_cow(target.start..target.end);
-    let mut byte = target.start;
+/// Grapheme column of `offset` within its own line.
+pub(crate) fn grapheme_column(buffer: &Buffer, offset: usize) -> usize {
+    let line = buffer.byte_to_line(offset);
+    let start = buffer.line_to_byte(line);
+    buffer.slice_cow(start..offset).graphemes(true).count()
+}
+
+/// Byte offset `column` graphemes into `line`, clamped to the line's content end.
+pub(crate) fn offset_at_column(buffer: &Buffer, line: usize, column: usize) -> usize {
+    let range = buffer.line_byte_range(line);
+    let chunk = buffer.slice_cow(range.start..range.end);
+    let mut byte = range.start;
     for (i, g) in chunk.graphemes(true).enumerate() {
         if i == column {
             return byte;

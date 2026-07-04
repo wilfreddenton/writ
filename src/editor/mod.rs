@@ -5,7 +5,9 @@ pub use action::Direction;
 pub use theme::EditorTheme;
 
 use crate::buffer::Buffer;
-use crate::cursor::{Cursor, Selection, prev_grapheme_boundary};
+use crate::cursor::{
+    Cursor, Selection, grapheme_column, offset_at_column, prev_grapheme_boundary,
+};
 use crate::marker::{LineMarkers, MarkerKind, OrderedMarker, UnorderedMarker};
 
 /// Context about the line at the cursor, used by smart editing actions.
@@ -53,6 +55,10 @@ pub struct EditorState {
     pub selection: Selection,
     /// Cached tab cycle states to avoid recalculating mid-cycle.
     tab_cycle_cache: Option<TabCycleCache>,
+    /// Sticky vertical-movement goal: `(grapheme_column, offset_it_landed_at)`. Reused by
+    /// the next Up/Down only if the cursor is still at that offset, so passing through a
+    /// short line doesn't lose the original column; any other move invalidates it for free.
+    goal_column: Option<(usize, usize)>,
 }
 
 impl EditorState {
@@ -62,6 +68,7 @@ impl EditorState {
             buffer,
             selection: Selection::new(0, 0),
             tab_cycle_cache: None,
+            goal_column: None,
         }
     }
 
@@ -84,39 +91,64 @@ impl EditorState {
         self.selection = Selection::new(c.offset, c.offset);
     }
 
-    /// Compute the cursor after moving one step in `direction`.
-    pub fn cursor_in_direction(&self, direction: Direction) -> Cursor {
+    /// Compute the cursor after moving one step in `direction`. Vertical moves keep a
+    /// sticky goal column (`&mut self` to read/update it); other moves leave it stale,
+    /// and it self-invalidates because the cursor no longer sits at its landing offset.
+    pub fn cursor_in_direction(&mut self, direction: Direction) -> Cursor {
         let c = self.cursor();
+        if matches!(direction, Direction::Up | Direction::Down) {
+            let line = self.buffer.byte_to_line(c.offset);
+            let column = match self.goal_column {
+                Some((col, at)) if at == c.offset => col,
+                _ => grapheme_column(&self.buffer, c.offset),
+            };
+            let offset = if direction == Direction::Up {
+                if line == 0 {
+                    Cursor::start().offset
+                } else {
+                    offset_at_column(&self.buffer, line - 1, column)
+                }
+            } else if line >= self.buffer.line_count().saturating_sub(1) {
+                Cursor::end(&self.buffer).offset
+            } else {
+                offset_at_column(&self.buffer, line + 1, column)
+            };
+            self.goal_column = Some((column, offset));
+            return Cursor { offset };
+        }
         match direction {
             Direction::Left => c.move_left(&self.buffer),
             Direction::Right => c.move_right(&self.buffer),
-            Direction::Up => c.move_up(&self.buffer),
-            Direction::Down => c.move_down(&self.buffer),
             Direction::LineStart => c.move_to_line_start(&self.buffer),
             Direction::LineEnd => c.move_to_line_end(&self.buffer),
             Direction::DocStart => Cursor::start(),
             Direction::DocEnd => Cursor::end(&self.buffer),
+            Direction::Up | Direction::Down => unreachable!("handled above"),
         }
     }
 
     /// Move cursor left by one character.
     pub fn move_left(&mut self) {
-        self.set_cursor_to(self.cursor_in_direction(Direction::Left));
+        let c = self.cursor_in_direction(Direction::Left);
+        self.set_cursor_to(c);
     }
 
     /// Move cursor right by one character.
     pub fn move_right(&mut self) {
-        self.set_cursor_to(self.cursor_in_direction(Direction::Right));
+        let c = self.cursor_in_direction(Direction::Right);
+        self.set_cursor_to(c);
     }
 
     /// Move cursor up by one line.
     pub fn move_up(&mut self) {
-        self.set_cursor_to(self.cursor_in_direction(Direction::Up));
+        let c = self.cursor_in_direction(Direction::Up);
+        self.set_cursor_to(c);
     }
 
     /// Move cursor down by one line.
     pub fn move_down(&mut self) {
-        self.set_cursor_to(self.cursor_in_direction(Direction::Down));
+        let c = self.cursor_in_direction(Direction::Down);
+        self.set_cursor_to(c);
     }
 
     /// Move cursor to start of current line.
@@ -1631,6 +1663,26 @@ mod tests {
             let mut state = editor_with_cursor("line one\nline |two\nline three");
             state.move_up();
             assert_editor_eq(&state, "line |one\nline two\nline three");
+        }
+
+        #[test]
+        fn sticky_goal_column_survives_short_line() {
+            // Down through a 2-char line then Down again restores the original column 7,
+            // instead of clamping permanently to the short line's end.
+            let mut state = editor_with_cursor("0123456|789\nab\nXYZ0123456");
+            state.move_down(); // clamps to end of "ab"
+            state.move_down(); // restores column 7 on the long last line
+            assert_editor_eq(&state, "0123456789\nab\nXYZ0123|456");
+        }
+
+        #[test]
+        fn goal_column_reset_by_horizontal_move() {
+            // A horizontal move between vertical moves invalidates the goal column.
+            let mut state = editor_with_cursor("0123456|789\nab\nXYZ0123456");
+            state.move_down(); // end of "ab" (column 2)
+            state.move_left(); // column 1 — invalidates the goal
+            state.move_down(); // uses column 1, not 7
+            assert_editor_eq(&state, "0123456789\nab\nX|YZ0123456");
         }
 
         #[test]
