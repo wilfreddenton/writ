@@ -40,6 +40,7 @@ use winit::event_loop::ControlFlow;
 use crate::buffer::Buffer;
 use crate::chrome::{BarRect, StatusInfo, draw_panel, draw_status_bar};
 use crate::config::Config;
+use crate::consts::{CARET_WIDTH, FONT_SIZE, LINE_HEIGHT, PADDING, STATUS_BAR_H, WHEEL_LINE_STEP};
 use crate::core::{AutocompleteState, AutocompleteSuggestion, AutocompleteTrigger, Editor};
 use crate::doc_layout::{
     DocLayout, GithubRenderData, LayoutParams, LineCache, RenderCache, ScreenRect,
@@ -55,15 +56,6 @@ use crate::inline::{GitHubContext, GitHubRef};
 use crate::marker::MarkerKind;
 use crate::text_engine::{StyleRun, TextEngine, peniko_color};
 
-const PADDING: f32 = 24.0;
-const FONT_SIZE: f32 = 18.0;
-const LINE_HEIGHT: f32 = 1.5;
-/// Device px scrolled per mouse-wheel line notch.
-const WHEEL_LINE_STEP: f32 = 48.0;
-/// Caret width in logical px (scaled per display).
-const CARET_WIDTH: f32 = 2.0;
-/// Status bar height in logical px (the title bar is the native decoration).
-const STATUS_BAR_H: f32 = 24.0;
 
 /// Chrome layout in device px: y where editor content begins, and its height.
 fn chrome_metrics(scale: f32, height_dev: f32) -> (f32, f32) {

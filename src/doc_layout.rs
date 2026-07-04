@@ -1078,21 +1078,23 @@ impl DocLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consts::{FONT_SIZE, LINE_HEIGHT, PADDING};
     use crate::text_engine::peniko_color;
 
     /// Device-px content width shared by the image-sizing tests (scale 1.0).
     const TEST_CONTENT_W: f32 = 800.0;
 
-    /// Frame constants for the headless tests (scale 1.0, the shell's PADDING/FONT).
+    /// Frame constants for the headless tests — the same source of truth the shell uses,
+    /// so the tests track any change to the real frame rather than duplicating literals.
     fn test_params(theme: &EditorTheme, device_width: f32) -> LayoutParams {
         LayoutParams {
             device_width,
             scale: 1.0,
-            pad_x: 24.0,
-            pad_top: 24.0,
-            pad_bottom: 48.0,
-            base_font_size: 18.0,
-            line_height: 1.5,
+            pad_x: PADDING,
+            pad_top: PADDING,
+            pad_bottom: PADDING * 2.0,
+            base_font_size: FONT_SIZE,
+            line_height: LINE_HEIGHT,
             fg: peniko_color(theme.foreground),
         }
     }

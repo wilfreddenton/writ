@@ -22,6 +22,7 @@ pub use editor::{Direction, EditorTheme};
 pub mod buffer;
 pub mod chrome;
 pub mod config;
+pub mod consts;
 pub mod core;
 pub mod cursor;
 pub mod diff;
