@@ -157,6 +157,9 @@ land in the next phases. For now this proves the render + scroll skeleton.
 /// `(new file content, git HEAD blob text)` read off-thread for a file reload.
 type ReloadData = (String, Option<String>);
 
+/// Shared slot a debounced autocomplete fetch drops its results into for the main thread.
+type AcSlot = Arc<Mutex<Option<FetchedSuggestions>>>;
+
 #[derive(Debug, Clone)]
 pub(crate) enum WritEvent {
     GithubUpdated,
@@ -268,7 +271,7 @@ struct App {
     /// Monotonic generation for autocomplete-fetch debounce (latest wins).
     ac_gen: Arc<AtomicU64>,
     /// Slot a finished fetch task drops its results into for the main thread.
-    ac_slot: Arc<Mutex<Option<FetchedSuggestions>>>,
+    ac_slot: AcSlot,
     /// Wakeup channel into the winit loop for finished tokio work.
     proxy: EventLoopProxy<WritEvent>,
     /// Handle to the process tokio runtime for spawning GitHub work.
@@ -393,6 +396,31 @@ fn after_edit(
     });
     spawn_ref_validations(&doc_engine.editor, visible, runtime, proxy);
     sync_image_loads(doc_engine, runtime, proxy);
+}
+
+/// The full flow every edit site must run: drop the stale hover target, apply the async
+/// side effects ([`after_edit`]), optionally refresh the autocomplete popup (pass `ac`
+/// for keyboard edits, `None` for mouse/reload), then request a redraw. Defined once so a
+/// new edit site can't silently skip a step. Takes the doc-engine's sibling fields
+/// individually so it composes while `state` is borrowed at the call site.
+#[allow(clippy::too_many_arguments)]
+fn apply_edit_effects(
+    doc_engine: &mut DocEngine,
+    hovered: &mut Option<HoverTarget>,
+    runtime: &tokio::runtime::Handle,
+    proxy: &EventLoopProxy<WritEvent>,
+    ac: Option<(&Arc<AtomicU64>, &AcSlot)>,
+    window: &Window,
+    w: f32,
+    scale: f32,
+    editor_h: f32,
+) {
+    *hovered = None;
+    after_edit(doc_engine, runtime, proxy, w, scale, editor_h);
+    if let Some((ac_gen, ac_slot)) = ac {
+        sync_autocomplete(&mut doc_engine.editor, runtime, proxy, ac_gen, ac_slot);
+    }
+    window.request_redraw();
 }
 
 /// For each detected GitHub ref (from refs + naked URLs) with no cache entry yet,
@@ -780,7 +808,7 @@ fn sync_autocomplete(
     runtime: &tokio::runtime::Handle,
     proxy: &EventLoopProxy<WritEvent>,
     fetch_gen: &Arc<AtomicU64>,
-    slot: &Arc<Mutex<Option<FetchedSuggestions>>>,
+    slot: &AcSlot,
 ) {
     if !editor.update_autocomplete_from_cursor() {
         return;
@@ -993,9 +1021,17 @@ impl ApplicationHandler<WritEvent> for App {
                 let (w, vh, scale) = state.viewport();
                 let window = state.window.clone();
                 self.doc_engine.editor.apply_reload(content, base_text);
-                self.hovered = None;
-                after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, scale, vh);
-                window.request_redraw();
+                apply_edit_effects(
+                    &mut self.doc_engine,
+                    &mut self.hovered,
+                    &self.runtime,
+                    &self.proxy,
+                    None,
+                    &window,
+                    w,
+                    scale,
+                    vh,
+                );
             }
             return;
         }
@@ -1164,9 +1200,17 @@ impl ApplicationHandler<WritEvent> for App {
                 let (w, vh, _) = state.viewport();
                 if !text.is_empty() {
                     self.doc_engine.editor.insert_str(&text);
-                    self.hovered = None;
-                    after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
-                    state.window.request_redraw();
+                    apply_edit_effects(
+                        &mut self.doc_engine,
+                        &mut self.hovered,
+                        &self.runtime,
+                        &self.proxy,
+                        None,
+                        &state.window,
+                        w,
+                        state.scale,
+                        vh,
+                    );
                 } else if had_preedit {
                     // Composition cancelled (empty commit): drop the spliced preedit.
                     self.doc_engine.rebuild_preserving_scroll(w, state.scale, vh);
@@ -1228,9 +1272,17 @@ impl ApplicationHandler<WritEvent> for App {
                 {
                     self.doc_engine.editor.autocomplete_select(row);
                     if self.doc_engine.editor.accept_autocomplete_suggestion() {
-                        self.hovered = None;
-                        after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
-                        state.window.request_redraw();
+                        apply_edit_effects(
+                            &mut self.doc_engine,
+                            &mut self.hovered,
+                            &self.runtime,
+                            &self.proxy,
+                            None,
+                            &state.window,
+                            w,
+                            state.scale,
+                            vh,
+                        );
                     }
                     return;
                 }
@@ -1336,8 +1388,17 @@ impl ApplicationHandler<WritEvent> for App {
                             }
                             if c.as_str().eq_ignore_ascii_case("x") {
                                 self.doc_engine.editor.backspace(); // delete the selection
-                                after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
-                                state.window.request_redraw();
+                                apply_edit_effects(
+                                    &mut self.doc_engine,
+                                    &mut self.hovered,
+                                    &self.runtime,
+                                    &self.proxy,
+                                    None,
+                                    &state.window,
+                                    w,
+                                    state.scale,
+                                    vh,
+                                );
                             }
                             return;
                         }
@@ -1347,15 +1408,17 @@ impl ApplicationHandler<WritEvent> for App {
                                 && !text.is_empty()
                             {
                                 self.doc_engine.editor.paste(&text);
-                                after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
-                                sync_autocomplete(
-                                    &mut self.doc_engine.editor,
+                                apply_edit_effects(
+                                    &mut self.doc_engine,
+                                    &mut self.hovered,
                                     &self.runtime,
                                     &self.proxy,
-                                    &self.ac_gen,
-                                    &self.ac_slot,
+                                    Some((&self.ac_gen, &self.ac_slot)),
+                                    &state.window,
+                                    w,
+                                    state.scale,
+                                    vh,
                                 );
-                                state.window.request_redraw();
                             }
                             return;
                         }
@@ -1392,9 +1455,17 @@ impl ApplicationHandler<WritEvent> for App {
                         Key::Named(NamedKey::Enter | NamedKey::Tab)
                             if has && self.doc_engine.editor.accept_autocomplete_suggestion() =>
                         {
-                            self.hovered = None;
-                            after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
-                            state.window.request_redraw();
+                            apply_edit_effects(
+                                &mut self.doc_engine,
+                                &mut self.hovered,
+                                &self.runtime,
+                                &self.proxy,
+                                None,
+                                &state.window,
+                                w,
+                                state.scale,
+                                vh,
+                            );
                             return;
                         }
                         _ => {}
@@ -1402,16 +1473,17 @@ impl ApplicationHandler<WritEvent> for App {
                 }
 
                 if apply_key(&mut self.doc_engine.editor, self.modifiers, &event) {
-                    self.hovered = None;
-                    after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
-                    sync_autocomplete(
-                        &mut self.doc_engine.editor,
+                    apply_edit_effects(
+                        &mut self.doc_engine,
+                        &mut self.hovered,
                         &self.runtime,
                         &self.proxy,
-                        &self.ac_gen,
-                        &self.ac_slot,
+                        Some((&self.ac_gen, &self.ac_slot)),
+                        &state.window,
+                        w,
+                        state.scale,
+                        vh,
                     );
-                    state.window.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
