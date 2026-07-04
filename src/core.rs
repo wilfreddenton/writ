@@ -775,19 +775,15 @@ impl Editor {
 
     /// Poll the file watcher; if the file changed on disk (and it wasn't our own
     /// save), reload it and refresh the diff base. Returns true if reloaded.
-    pub fn poll_file_changes(&mut self) -> bool {
-        let Some(rx) = &self.file_watcher_rx else {
-            return false;
-        };
-        // Drain all pending events; only reload once.
-        let mut changed = false;
-        while rx.try_recv().is_ok() {
-            changed = true;
-        }
-        if changed { self.reload_file() } else { false }
+    /// Hand the file-watch receiver to the shell so it can forward change
+    /// notifications into the event loop (waking it) instead of polling on a timer.
+    pub fn take_file_watch_rx(&mut self) -> Option<mpsc::Receiver<()>> {
+        self.file_watcher_rx.take()
     }
 
-    fn reload_file(&mut self) -> bool {
+    /// Reload the buffer from disk if the on-disk content differs (skipping our own
+    /// saves via `last_save_mtime`). Returns true if the buffer changed.
+    pub fn reload_from_disk(&mut self) -> bool {
         let Some(path) = self.file_path.clone() else {
             return false;
         };

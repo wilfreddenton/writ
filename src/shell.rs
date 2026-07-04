@@ -17,6 +17,7 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -50,10 +51,10 @@ use crate::doc_layout::{
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
 use crate::github::{
-    GitHubClient, IssueOrPr, IssueStatus, MentionableUser, ValidatedRefData, ValidationResult,
-    ValidationState,
+    GitHubClient, GitHubValidationCache, IssueOrPr, IssueStatus, MentionableUser, ValidatedRefData,
+    ValidationResult, ValidationState,
 };
-use crate::image_cache::{ImageCache, decode};
+use crate::image_cache::{ImageCache, LoadedImage, decode};
 use crate::inline::{GitHubContext, GitHubRef};
 use crate::marker::MarkerKind;
 use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
@@ -157,6 +158,9 @@ enum WritEvent {
     /// A standalone image finished loading (local or remote). A load changes a line's
     /// height, so the loop rebuilds (not just redraws) to reflow around it.
     ImageLoaded,
+    /// The watched file changed on disk (forwarded from the file-watcher thread), so
+    /// the loop reloads the buffer. Lets the loop park on `Wait` instead of polling.
+    FileChanged,
 }
 
 /// Autocomplete results a tokio task fetched, handed back to the main thread (via a
@@ -245,11 +249,24 @@ struct App {
 
 impl App {
     fn new(
-        editor: Editor,
+        mut editor: Editor,
         proxy: EventLoopProxy<WritEvent>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
         let title = window_title(&editor);
+        // Forward file-watch notifications into the loop so it can park on `Wait`
+        // rather than polling on a timer. The thread ends when the watcher (and its
+        // sender) drop at app exit, making `recv()` return `Err`.
+        if let Some(rx) = editor.take_file_watch_rx() {
+            let proxy = proxy.clone();
+            std::thread::spawn(move || {
+                while rx.recv().is_ok() {
+                    if proxy.send_event(WritEvent::FileChanged).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         Self {
             context: RenderContext::new(),
             renderer: None,
@@ -334,11 +351,22 @@ fn resolve_local_image(doc_dir: Option<&Path>, url: &str) -> Option<PathBuf> {
     }
 }
 
+/// One process-wide client so image fetches share a connection pool + TLS session
+/// cache instead of paying a cold handshake per image (`Client` is `Arc`-backed).
+static IMAGE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+
+/// Read + decode a local image URL (relative paths resolved against the doc's dir).
+fn load_local_image(doc_dir: Option<&Path>, url: &str) -> Option<LoadedImage> {
+    resolve_local_image(doc_dir, url)
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|bytes| decode(&bytes))
+}
+
 /// GET + decode a remote image. Mirrors the reqwest/rustls client pattern in github.rs.
 /// Logs (rather than silently drops) the failure reason — a non-2xx status, a transport
 /// error, or an undecodable body (e.g. SVG, which the `image` crate can't rasterize).
 async fn load_remote_image(url: &str) -> Option<crate::image_cache::LoadedImage> {
-    let resp = match reqwest::Client::new()
+    let resp = match IMAGE_CLIENT
         .get(url)
         .header("User-Agent", "writ")
         .send()
@@ -392,12 +420,9 @@ fn spawn_image_loads(
                 let _ = proxy.send_event(WritEvent::ImageLoaded);
             });
         } else {
-            let path = resolve_local_image(doc_dir.as_deref(), &url);
+            let doc_dir = doc_dir.clone();
             runtime.spawn_blocking(move || {
-                let loaded = path
-                    .and_then(|p| std::fs::read(p).ok())
-                    .and_then(|bytes| decode(&bytes));
-                match loaded {
+                match load_local_image(doc_dir.as_deref(), &url) {
                     Some(img) => cache.set_loaded(&url, img),
                     None => cache.set_failed(&url),
                 }
@@ -456,13 +481,23 @@ fn spawn_ref_validations(
         let cache = cache.clone();
         let proxy = proxy.clone();
         runtime.spawn(async move {
-            match client.validate_ref(&reference).await {
-                ValidationResult::ValidWithData(d) => cache.set_valid(reference, Some(d)),
-                ValidationResult::ValidNoData => cache.set_valid(reference, None),
-                ValidationResult::Invalid => cache.set_invalid(reference),
-            }
+            validate_ref_into_cache(&client, &cache, reference).await;
             let _ = proxy.send_event(WritEvent::GithubUpdated);
         });
+    }
+}
+
+/// Validate one ref and record the outcome in the shared cache. Shared by the async
+/// GUI path and the blocking snapshot path so the mapping lives in one place.
+async fn validate_ref_into_cache(
+    client: &GitHubClient,
+    cache: &GitHubValidationCache,
+    reference: GitHubRef,
+) {
+    match client.validate_ref(&reference).await {
+        ValidationResult::ValidWithData(d) => cache.set_valid(reference, Some(d)),
+        ValidationResult::ValidNoData => cache.set_valid(reference, None),
+        ValidationResult::Invalid => cache.set_invalid(reference),
     }
 }
 
@@ -741,23 +776,34 @@ fn sync_autocomplete(
         if fetch_gen.load(Ordering::SeqCst) != my_gen {
             return; // a newer keystroke superseded this fetch
         }
-        let fetched = match trigger {
-            AutocompleteTrigger::Issue => {
-                let issues = client
-                    .issues_matching_prefix(&context.owner, &context.repo, &prefix, 8)
-                    .await;
-                FetchedSuggestions::Issues { prefix, issues }
-            }
-            AutocompleteTrigger::User => {
-                let users = client
-                    .users_matching_prefix(&context.owner, &context.repo, &prefix, 8)
-                    .await;
-                FetchedSuggestions::Users { prefix, users }
-            }
-        };
+        let fetched = fetch_suggestions(&client, &context, trigger, prefix).await;
         *slot.lock().unwrap() = Some(fetched);
         let _ = proxy.send_event(WritEvent::GithubUpdated);
     });
+}
+
+/// Fetch issue/user autocomplete suggestions for `trigger`. Shared by the async GUI
+/// path (debounced) and the blocking snapshot path.
+async fn fetch_suggestions(
+    client: &GitHubClient,
+    context: &GitHubContext,
+    trigger: AutocompleteTrigger,
+    prefix: String,
+) -> FetchedSuggestions {
+    match trigger {
+        AutocompleteTrigger::Issue => {
+            let issues = client
+                .issues_matching_prefix(&context.owner, &context.repo, &prefix, 8)
+                .await;
+            FetchedSuggestions::Issues { prefix, issues }
+        }
+        AutocompleteTrigger::User => {
+            let users = client
+                .users_matching_prefix(&context.owner, &context.repo, &prefix, 8)
+                .await;
+            FetchedSuggestions::Users { prefix, users }
+        }
+    }
 }
 
 /// Turn fetched GitHub data into suggestion rows (and prime the validation cache with
@@ -1244,6 +1290,21 @@ impl ApplicationHandler<WritEvent> for App {
     /// A tokio task finished (validation/suggestion). Results are already in the
     /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WritEvent) {
+        // The watched file changed on disk: reload the buffer and treat it like an edit
+        // (refresh detection / revalidate refs / reload images) rather than just reflow.
+        if matches!(event, WritEvent::FileChanged) {
+            if self.doc_engine.editor.reload_from_disk()
+                && let Some(state) = self.state.as_ref()
+            {
+                let w = state.surface.config.width as f32;
+                let (_, vh) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                let window = state.window.clone();
+                self.hovered = None;
+                after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, state.scale, vh);
+                window.request_redraw();
+            }
+            return;
+        }
         // GithubUpdated may carry fetched autocomplete suggestions built on the worker;
         // install them before rebuilding. ImageLoaded only changed the shared image
         // cache. Both then rebuild-preserving-scroll (validated refs recolor / a loaded
@@ -1819,22 +1880,11 @@ impl ApplicationHandler<WritEvent> for App {
         }
     }
 
-    /// Poll for external file edits (e.g. an agent writing the file) between events,
-    /// reloading + recomputing the diff live, and keep a slow poll timer running.
+    /// Park the loop until the next real event. External file edits arrive as
+    /// `WritEvent::FileChanged` (forwarded from the watcher thread), so there's no
+    /// need to wake on a timer.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.doc_engine.editor.poll_file_changes()
-            && let Some(state) = self.state.as_ref()
-        {
-            let w = state.surface.config.width as f32;
-            let (_, editor_h) = chrome_metrics(state.scale, state.surface.config.height as f32);
-            let window = state.window.clone();
-            let scale = state.scale;
-            after_edit(&mut self.doc_engine, &self.runtime, &self.proxy, w, scale, editor_h);
-            window.request_redraw();
-        }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            std::time::Instant::now() + std::time::Duration::from_millis(200),
-        ));
+        event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
 
@@ -1925,9 +1975,7 @@ fn load_local_images_blocking(doc_dir: Option<&Path>, urls: &[String], cache: &I
         let loaded = if url.starts_with("http://") || url.starts_with("https://") {
             tokio::runtime::Handle::current().block_on(load_remote_image(url))
         } else {
-            resolve_local_image(doc_dir, url)
-                .and_then(|p| std::fs::read(p).ok())
-                .and_then(|bytes| decode(&bytes))
+            load_local_image(doc_dir, url)
         };
         match loaded {
             Some(img) => cache.set_loaded(url, img),
@@ -1946,11 +1994,7 @@ fn validate_all_blocking(editor: &mut Editor) {
     let refs = editor.detected_refs();
     tokio::runtime::Handle::current().block_on(async {
         for r in refs {
-            match client.validate_ref(&r).await {
-                ValidationResult::ValidWithData(d) => cache.set_valid(r, Some(d)),
-                ValidationResult::ValidNoData => cache.set_valid(r, None),
-                ValidationResult::Invalid => cache.set_invalid(r),
-            }
+            validate_ref_into_cache(&client, &cache, r).await;
         }
     });
 }
@@ -1967,22 +2011,8 @@ fn fetch_autocomplete_blocking(editor: &mut Editor) {
     let Some(context) = editor.github_context().cloned() else {
         return;
     };
-    let fetched = tokio::runtime::Handle::current().block_on(async {
-        match trigger {
-            AutocompleteTrigger::Issue => {
-                let issues = client
-                    .issues_matching_prefix(&context.owner, &context.repo, &prefix, 8)
-                    .await;
-                FetchedSuggestions::Issues { prefix, issues }
-            }
-            AutocompleteTrigger::User => {
-                let users = client
-                    .users_matching_prefix(&context.owner, &context.repo, &prefix, 8)
-                    .await;
-                FetchedSuggestions::Users { prefix, users }
-            }
-        }
-    });
+    let fetched = tokio::runtime::Handle::current()
+        .block_on(fetch_suggestions(&client, &context, trigger, prefix));
     apply_fetched(editor, fetched);
 }
 
