@@ -1222,6 +1222,9 @@ impl ApplicationHandler<WritEvent> for App {
                     {
                         self.doc_engine.editor.set_cursor(off2);
                     }
+                    // Moving the caret off an image line materializes it as an image
+                    // block, whose URL now needs loading — so kick off fetches here too.
+                    sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                     // Clicking into/out of a ref opens/closes the popup.
                     sync_autocomplete(
                         &mut self.doc_engine.editor,
