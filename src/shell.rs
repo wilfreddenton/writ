@@ -729,30 +729,130 @@ fn status_color(status: IssueStatus, theme: &EditorTheme) -> vello::peniko::Colo
     }
 }
 
-/// Colored segments for an issue/PR: `<symbol> #<number> <title>`.
+/// A styled span in a hover/autocomplete panel line: text plus color and inline
+/// markdown attributes. Titles carry `bold`/`italic`/`mono`; all other segments
+/// are `PanelSeg::plain`.
+struct PanelSeg {
+    text: String,
+    color: vello::peniko::Color,
+    bold: bool,
+    italic: bool,
+    mono: bool,
+}
+
+impl PanelSeg {
+    fn plain(text: String, color: vello::peniko::Color) -> Self {
+        Self {
+            text,
+            color,
+            bold: false,
+            italic: false,
+            mono: false,
+        }
+    }
+}
+
+/// Scan an issue/PR `title` and emit styled spans, translating a small subset of
+/// inline markdown (`` `code` ``, `**bold**`, `*italic*`/`_italic_`) into
+/// attributes with the delimiters stripped. Non-nested, left-to-right; an
+/// unterminated delimiter is emitted as literal text. All spans use `color`.
+fn parse_title_markdown(title: &str, color: vello::peniko::Color) -> Vec<PanelSeg> {
+    let mut out: Vec<PanelSeg> = Vec::new();
+    let mut plain = String::new();
+    let chars: Vec<char> = title.chars().collect();
+    let mut i = 0;
+
+    let flush_plain = |plain: &mut String, out: &mut Vec<PanelSeg>| {
+        if !plain.is_empty() {
+            out.push(PanelSeg::plain(std::mem::take(plain), color));
+        }
+    };
+
+    while i < chars.len() {
+        let c = chars[i];
+        // `**bold**` — must check the double marker before the single `*`.
+        if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            if let Some(end) = find_close_double(&chars, i + 2, '*') {
+                flush_plain(&mut plain, &mut out);
+                out.push(PanelSeg {
+                    text: chars[i + 2..end].iter().collect(),
+                    color,
+                    bold: true,
+                    italic: false,
+                    mono: false,
+                });
+                i = end + 2;
+                continue;
+            }
+        } else if c == '*' || c == '_' {
+            if let Some(end) = find_close_single(&chars, i + 1, c) {
+                flush_plain(&mut plain, &mut out);
+                out.push(PanelSeg {
+                    text: chars[i + 1..end].iter().collect(),
+                    color,
+                    bold: false,
+                    italic: true,
+                    mono: false,
+                });
+                i = end + 1;
+                continue;
+            }
+        } else if c == '`'
+            && let Some(end) = find_close_single(&chars, i + 1, '`')
+        {
+            flush_plain(&mut plain, &mut out);
+            out.push(PanelSeg {
+                text: chars[i + 1..end].iter().collect(),
+                color,
+                bold: false,
+                italic: false,
+                mono: true,
+            });
+            i = end + 1;
+            continue;
+        }
+        plain.push(c);
+        i += 1;
+    }
+    flush_plain(&mut plain, &mut out);
+    if out.is_empty() {
+        out.push(PanelSeg::plain(String::new(), color));
+    }
+    out
+}
+
+/// Index of the next `marker` char at or after `from`, or None if unterminated.
+fn find_close_single(chars: &[char], from: usize, marker: char) -> Option<usize> {
+    (from..chars.len()).find(|&j| chars[j] == marker)
+}
+
+/// Index of the first char of a `marker`×2 run at or after `from`, or None.
+fn find_close_double(chars: &[char], from: usize, marker: char) -> Option<usize> {
+    (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == marker && chars[j + 1] == marker)
+}
+
+/// Colored segments for an issue/PR: `<symbol> #<number> <title>`, with the
+/// title's inline markdown rendered.
 fn issue_segments(
     symbol: &str,
     number: u64,
     title: &str,
     status: IssueStatus,
     theme: &EditorTheme,
-) -> Vec<(String, vello::peniko::Color)> {
-    vec![
-        (format!("{symbol} "), status_color(status, theme)),
-        (format!("#{number} "), theme.cyan),
-        (title.to_string(), theme.foreground),
-    ]
+) -> Vec<PanelSeg> {
+    let mut v = vec![
+        PanelSeg::plain(format!("{symbol} "), status_color(status, theme)),
+        PanelSeg::plain(format!("#{number} "), theme.cyan),
+    ];
+    v.extend(parse_title_markdown(title, theme.foreground));
+    v
 }
 
 /// Colored segments for a user: `@login` and, if present, its display name.
-fn user_segments(
-    login: &str,
-    name: Option<&str>,
-    theme: &EditorTheme,
-) -> Vec<(String, vello::peniko::Color)> {
-    let mut v = vec![(format!("@{login}"), theme.cyan)];
+fn user_segments(login: &str, name: Option<&str>, theme: &EditorTheme) -> Vec<PanelSeg> {
+    let mut v = vec![PanelSeg::plain(format!("@{login}"), theme.cyan)];
     if let Some(name) = name {
-        v.push((format!("  {name}"), theme.comment));
+        v.push(PanelSeg::plain(format!("  {name}"), theme.comment));
     }
     v
 }
@@ -760,7 +860,7 @@ fn user_segments(
 /// Lay out colored `segments` into a single styled line.
 fn segments_to_line(
     engine: &mut TextEngine,
-    segments: &[(String, vello::peniko::Color)],
+    segments: &[PanelSeg],
     scale: f32,
     font_size: f32,
     max_text: f32,
@@ -768,10 +868,14 @@ fn segments_to_line(
 ) -> Layout<Brush> {
     let mut text = String::new();
     let mut runs = Vec::new();
-    for (s, color) in segments {
+    for seg in segments {
         let start = text.len();
-        text.push_str(s);
-        runs.push(StyleRun::new(start..text.len(), peniko_color(*color)));
+        text.push_str(&seg.text);
+        let mut run = StyleRun::new(start..text.len(), peniko_color(seg.color));
+        run.bold = seg.bold;
+        run.italic = seg.italic;
+        run.mono = seg.mono;
+        runs.push(run);
     }
     engine.build_line(
         &text,
@@ -816,7 +920,7 @@ fn hover_segments(
     state: &Option<ValidationState>,
     context: Option<&GitHubContext>,
     theme: &EditorTheme,
-) -> Vec<(String, vello::peniko::Color)> {
+) -> Vec<PanelSeg> {
     match state {
         Some(ValidationState::Valid(Some(ValidatedRefData::Issue(issue)))) => issue_segments(
             issue.symbol(),
@@ -829,16 +933,16 @@ fn hover_segments(
             user_segments(&user.login, user.name.as_deref(), theme)
         }
         Some(ValidationState::Valid(None)) => vec![
-            ("✓ ".to_string(), theme.green),
-            (reference.short_display(context), theme.cyan),
+            PanelSeg::plain("✓ ".to_string(), theme.green),
+            PanelSeg::plain(reference.short_display(context), theme.cyan),
         ],
         Some(ValidationState::Invalid) => vec![
-            ("✗ ".to_string(), theme.red),
-            (reference.short_display(context), theme.cyan),
+            PanelSeg::plain("✗ ".to_string(), theme.red),
+            PanelSeg::plain(reference.short_display(context), theme.cyan),
         ],
         Some(ValidationState::Pending) | None => vec![
-            ("… ".to_string(), theme.comment),
-            (reference.short_display(context), theme.cyan),
+            PanelSeg::plain("… ".to_string(), theme.comment),
+            PanelSeg::plain(reference.short_display(context), theme.cyan),
         ],
     }
 }
@@ -889,10 +993,7 @@ fn draw_hover_popover(
 }
 
 /// The colored text segments for one autocomplete row.
-fn suggestion_segments(
-    s: &AutocompleteSuggestion,
-    theme: &EditorTheme,
-) -> Vec<(String, vello::peniko::Color)> {
+fn suggestion_segments(s: &AutocompleteSuggestion, theme: &EditorTheme) -> Vec<PanelSeg> {
     match s {
         AutocompleteSuggestion::IssueOrPr {
             number,
@@ -1947,4 +2048,106 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     std::fs::write(path, &ppm)?;
     eprintln!("[writ] wrote snapshot: {path} ({width}x{height})");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vello::peniko::Color;
+
+    const C: Color = Color::new([0.1, 0.2, 0.3, 1.0]);
+
+    fn texts(segs: &[PanelSeg]) -> Vec<&str> {
+        segs.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn plain_title_is_one_plain_span() {
+        let segs = parse_title_markdown("just a title", C);
+        assert_eq!(texts(&segs), vec!["just a title"]);
+        assert!(!segs[0].bold && !segs[0].italic && !segs[0].mono);
+    }
+
+    #[test]
+    fn empty_title_yields_one_empty_span() {
+        let segs = parse_title_markdown("", C);
+        assert_eq!(texts(&segs), vec![""]);
+    }
+
+    #[test]
+    fn code_span_strips_backticks_and_sets_mono() {
+        let segs = parse_title_markdown("Fix `foo()` crash", C);
+        assert_eq!(texts(&segs), vec!["Fix ", "foo()", " crash"]);
+        assert!(segs[1].mono && !segs[1].bold && !segs[1].italic);
+        assert!(!segs[0].mono && !segs[2].mono);
+        for s in &segs {
+            assert!(!s.text.contains('`'));
+        }
+    }
+
+    #[test]
+    fn bold_span_strips_delimiters_and_sets_bold() {
+        let segs = parse_title_markdown("**bold**", C);
+        assert_eq!(texts(&segs), vec!["bold"]);
+        assert!(segs[0].bold && !segs[0].italic && !segs[0].mono);
+        assert!(!segs[0].text.contains('*'));
+    }
+
+    #[test]
+    fn star_and_underscore_italics() {
+        let star = parse_title_markdown("*it*", C);
+        assert_eq!(texts(&star), vec!["it"]);
+        assert!(star[0].italic && !star[0].bold && !star[0].mono);
+
+        let under = parse_title_markdown("_it_", C);
+        assert_eq!(texts(&under), vec!["it"]);
+        assert!(under[0].italic && !under[0].bold && !under[0].mono);
+
+        for segs in [&star, &under] {
+            assert!(!segs[0].text.contains('*') && !segs[0].text.contains('_'));
+        }
+    }
+
+    #[test]
+    fn unterminated_backtick_stays_literal() {
+        let segs = parse_title_markdown("a ` b", C);
+        assert_eq!(texts(&segs), vec!["a ` b"]);
+        assert!(!segs[0].mono);
+    }
+
+    #[test]
+    fn mixed_markdown_in_title() {
+        let segs = parse_title_markdown("**b** and `c` and *i*", C);
+        assert_eq!(texts(&segs), vec!["b", " and ", "c", " and ", "i"]);
+        assert!(segs[0].bold);
+        assert!(segs[2].mono);
+        assert!(segs[4].italic);
+    }
+
+    #[test]
+    fn issue_segments_prefixes_plain_then_title_spans() {
+        let theme = EditorTheme::default();
+        let segs = issue_segments("●", 42, "Fix `foo`", IssueStatus::Open, &theme);
+        assert_eq!(texts(&segs), vec!["● ", "#42 ", "Fix ", "foo"]);
+        assert!(!segs[0].mono && !segs[1].mono);
+        assert!(segs[3].mono);
+    }
+
+    #[test]
+    fn segments_to_line_mono_run_sets_mono_flag() {
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::default();
+        let segs = vec![
+            PanelSeg::plain("x ".to_string(), C),
+            PanelSeg {
+                text: "code".to_string(),
+                color: C,
+                bold: false,
+                italic: false,
+                mono: true,
+            },
+        ];
+        // Exercises the draw path's run construction without panicking.
+        let _ = segments_to_line(&mut engine, &segs, 1.0, 14.0, 400.0, &theme);
+    }
 }
