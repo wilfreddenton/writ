@@ -273,8 +273,10 @@ pub fn build_line_render(
             // Inline image: collapse the whole `![alt](url)` span to a zero-width point
             // and record it. The draw path reserves an inline box there and paints the
             // image; unlike the delimiter-hiding fallback, no alt/link text shows.
+            // Reveal is per-image, not per-line (the `cursor_inside[i]` skip above
+            // already reveals the one the caret is in), so editing one badge in a row
+            // leaves the others rendered.
             if region.is_image
-                && !cursor_on_line
                 && region.content_range.start >= line_start
                 && region.content_range.end <= line_end
                 && let Some(url) = &region.link_url
@@ -587,11 +589,13 @@ mod tests {
     }
 
     /// Two images on one line (a badge row) become inline-image refs off-cursor: their
-    /// `![...](...)` markdown is hidden and their display offsets ascend. With the cursor
-    /// on the line the refs vanish and the raw markdown is revealed for editing.
+    /// `![...](...)` markdown is hidden and their display offsets ascend. Reveal is
+    /// per-image: the caret inside one reveals only that one (the other stays a box); a
+    /// caret elsewhere on the line keeps both rendered.
     #[test]
-    fn inline_images_collapsed_off_line_revealed_on_line() {
+    fn inline_images_reveal_per_image() {
         let theme = EditorTheme::dracula();
+        // "![a](x.png) and ![b](y.png)": image 1 spans 0..11, " and " 11..16, image 2 16..27.
         let mut buffer: Buffer = "![a](x.png) and ![b](y.png)\n".parse().unwrap();
         let snap = buffer.render_snapshot();
         let styles = snap.inline_styles_by_line();
@@ -602,17 +606,17 @@ mod tests {
             off.inline_images[0].display_offset <= off.inline_images[1].display_offset,
             "display offsets ascend left-to-right"
         );
-        assert!(
-            !off.text.contains("!["),
-            "the `![...](...)` markdown is hidden, got {:?}",
-            off.text
-        );
+        assert!(!off.text.contains("!["), "markdown hidden, got {:?}", off.text);
         assert!(off.image.is_none(), "not a standalone image");
 
-        // Cursor on the line: raw markdown revealed, no inline boxes.
-        let on = build_line_render(&snap, 0, &theme, 18.0, 0, &styles[0], &[]);
-        assert!(on.inline_images.is_empty(), "cursor on the line reveals markdown");
-        assert!(on.text.contains("!["), "raw markdown shown, got {:?}", on.text);
+        // Caret inside the first image: it reveals, the second stays a box.
+        let in_first = build_line_render(&snap, 0, &theme, 18.0, 2, &styles[0], &[]);
+        assert_eq!(in_first.inline_images.len(), 1, "only the other image stays a box");
+        assert!(in_first.text.contains("![a]"), "caret's image shown raw");
+
+        // Caret on the line but between the images: both stay boxes.
+        let between = build_line_render(&snap, 0, &theme, 18.0, 13, &styles[0], &[]);
+        assert_eq!(between.inline_images.len(), 2, "off-caret images stay boxes");
     }
 
     /// The blockquote bar is no longer a `▎` glyph in the text — the marker collapses
