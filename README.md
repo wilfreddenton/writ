@@ -121,10 +121,40 @@ Full selection support with click, drag (with edge auto-scroll), shift+arrow key
 
 ## Library Usage
 
-The editing engine is a headless, renderer-free `core::Editor`: a rope buffer,
-cursor/selection, tree-sitter markdown parsing, and an inline git-diff model, with
-no window or GPU dependency. It's the core the Vello shell drives, and it can be
-used directly.
+writ is also a library: its rendering and editing layers work independently of the
+desktop app, and the network/GUI dependencies are feature-gated so a render-only
+consumer stays lean.
+
+### Headless markdown renderer
+
+`MarkdownView` renders markdown into a [Vello](https://github.com/linebender/vello)
+`Scene` with no window, GPU device, or editor. Feed it content up front or stream it
+in with `push_str`, then paint — useful for embedding writ's renderer elsewhere, or
+for rendering LLM output as it arrives.
+
+```rust
+use vello::Scene;
+use writ::MarkdownView;
+
+let mut view = MarkdownView::new();
+view.push_str("# Streaming\n\n");           // append incrementally (e.g. LLM tokens)
+view.push_str("More text arrives later.\n");
+
+let mut scene = Scene::new();
+view.render(&mut scene, 800.0, 600.0, 1.0);  // draw into the Scene
+// …then hand `scene` to a vello::Renderer to rasterize onto your own surface.
+```
+
+`writ::rasterize_scene_to_png` renders a `Scene` to a PNG headlessly — see
+`examples/streaming_markdown.rs` for an end-to-end streaming → PNG demo. The layout
+and draw internals live in the `markdown_view`, `render`, `doc_layout`, and
+`text_engine` modules.
+
+### Editing engine
+
+`core::Editor` (behind the `editor` feature) is a headless, renderer-free editor: a
+rope buffer, cursor/selection, tree-sitter markdown parsing, and an inline git-diff
+model, with no window or GPU dependency.
 
 ```rust
 use std::path::Path;
@@ -151,9 +181,25 @@ editor.diff_state();          // inline diff vs HEAD, if any
 editor.save().unwrap();
 ```
 
-Rendering that model to a window — Parley layout with browser-grade line breaking,
-cursor-aware marker hiding, and the inline diff — lives in the `render`,
-`doc_layout`, `text_engine`, and `shell` modules.
+### Feature flags
+
+`default = ["app"]` builds the full desktop editor. For library use, disable defaults
+and opt into only what you need:
+
+```toml
+# render-only: pulls in none of tokio/reqwest/gix/github/winit
+writ = { version = "0.12", default-features = false }
+```
+
+| Feature | Adds |
+|---------|------|
+| *(base)* | `MarkdownView`, `rasterize_scene_to_png`, and all markdown parse / layout / diff rendering |
+| `git` | inline-diff base sourced from git `HEAD` (gix) |
+| `github` | GitHub ref validation + `#`/`@` autocomplete |
+| `watch` | live file-reload on external edits |
+| `editor` | the full `core::Editor` orchestration (implies `git`, `github`, `watch`) |
+| `app` *(default)* | the winit + Vello desktop application |
+| `ghosttext` | the `writd` GhostText daemon |
 
 ## Architecture
 
