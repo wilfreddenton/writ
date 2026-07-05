@@ -36,7 +36,9 @@ fn main() -> anyhow::Result<()> {
     view.render(&mut scene, width as f32, height as f32, scale);
 
     let bg = view.theme().background;
-    let path = std::env::args().nth(1).unwrap_or_else(|| "./streaming_markdown.png".to_string());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "./streaming_markdown.png".to_string());
     rasterize_scene_to_png(&scene, width, height, bg, &path)?;
     eprintln!("wrote {path} ({width}x{height})");
     Ok(())

@@ -21,7 +21,6 @@ use crate::buffer::RenderSnapshot;
 use crate::consts::{MAX_CONTENT_WIDTH, UI_LINE_HEIGHT};
 use crate::diff::{DiffState, InlineChange};
 use crate::editor::EditorTheme;
-use crate::validation::GitHubValidationCache;
 use crate::image_cache::{ImageCache, ImageState};
 use crate::inline::{
     GitHubContext, NakedUrl, RawGitHubMatch, StyledRegion, github_refs_to_styled_regions,
@@ -30,6 +29,7 @@ use crate::inline::{
 use crate::render::{ImageRef, InlineImageRef, LineRender, build_line_render};
 use crate::segment_map::SegmentMap;
 use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
+use crate::validation::GitHubValidationCache;
 
 /// A screen-space rectangle (device px), already offset by padding + scroll.
 pub type ScreenRect = (f64, f64, f64, f64);
@@ -311,7 +311,9 @@ fn build_ghosts_before(
         fg,
         ..
     } = *params;
-    let Some(d) = diff else { return (Vec::new(), 0.0) };
+    let Some(d) = diff else {
+        return (Vec::new(), 0.0);
+    };
     let Some(old_range) = d.ghost_lines_before(new_line) else {
         return (Vec::new(), 0.0);
     };
@@ -329,7 +331,15 @@ fn build_ghosts_before(
         // Only the few visible ghost lines need styling, so compute per line instead
         // of bucketing the entire HEAD snapshot on every rebuild.
         let styles = old.tree_styles_for_line(old_line);
-        let lr = build_line_render(old, old_line, theme, base_font_size, usize::MAX, &styles, &[]);
+        let lr = build_line_render(
+            old,
+            old_line,
+            theme,
+            base_font_size,
+            usize::MAX,
+            &styles,
+            &[],
+        );
         let layout = engine.build_line_hanging(
             &lr.text,
             scale,
@@ -448,8 +458,11 @@ fn resolve_inline_images(
                         h *= max_advance / w;
                         w = max_advance;
                     }
-                    let brush =
-                        Some((loaded.brush.clone(), loaded.width as f32, loaded.height as f32));
+                    let brush = Some((
+                        loaded.brush.clone(),
+                        loaded.width as f32,
+                        loaded.height as f32,
+                    ));
                     (w, h, InlineImageDraw { brush })
                 }
                 _ => (
@@ -759,8 +772,13 @@ impl DocLayout {
                     &extra,
                 ))
             };
-            let (inline_boxes, line_inline_draws) =
-                resolve_inline_images(&lr.inline_images, images, &mut image_urls, max_advance, scale);
+            let (inline_boxes, line_inline_draws) = resolve_inline_images(
+                &lr.inline_images,
+                images,
+                &mut image_urls,
+                max_advance,
+                scale,
+            );
             let key = line_key(
                 &lr.text,
                 scale,
@@ -808,8 +826,7 @@ impl DocLayout {
                     let caret_disp = lr.map.buffer_to_display(cursor_offset);
                     let (sp_text, sp_runs) =
                         splice_preedit(&lr.text, &lr.runs, caret_disp, pv.text, fg);
-                    let caret_off =
-                        caret_disp + pv.cursor.map(|(s, _)| s).unwrap_or(pv.text.len());
+                    let caret_off = caret_disp + pv.cursor.map(|(s, _)| s).unwrap_or(pv.text.len());
                     preedit_caret = Some((i, caret_off));
                     Rc::new(engine.build_line_hanging(
                         &sp_text,
@@ -845,7 +862,9 @@ impl DocLayout {
             let bars: Vec<f32> = lr
                 .quote_bar_bytes
                 .iter()
-                .filter_map(|&b| Cluster::from_byte_index(&layout, b).and_then(|c| c.visual_offset()))
+                .filter_map(|&b| {
+                    Cluster::from_byte_index(&layout, b).and_then(|c| c.visual_offset())
+                })
                 .collect();
             // Standalone image: the block (image or placeholder) sets the line height in
             // place of the (empty) text layout, and the URL is collected for loading.
@@ -961,9 +980,7 @@ impl DocLayout {
     /// is hidden). Used before a click so the caret can be re-placed once the click
     /// reveals the raw text (whose short row no longer sits under the click's y).
     pub fn is_image_line(&self, line: usize) -> bool {
-        self.renders
-            .get(line)
-            .is_some_and(|r| r.image.is_some())
+        self.renders.get(line).is_some_and(|r| r.image.is_some())
     }
 
     /// Buffer offset for horizontal position `x` (device px) within `line`, at its first
@@ -979,7 +996,12 @@ impl DocLayout {
     /// Screen-space caret rectangle at a *display* byte offset within `line`'s layout.
     /// Shared by the buffer caret and the IME preedit caret (which live in different
     /// coordinate spaces: the latter indexes the spliced layout directly).
-    fn caret_rect_at(&self, line: usize, display_off: usize, caret_width: f32) -> Option<ScreenRect> {
+    fn caret_rect_at(
+        &self,
+        line: usize,
+        display_off: usize,
+        caret_width: f32,
+    ) -> Option<ScreenRect> {
         let layout = self.layouts.get(line)?;
         let cursor = Cursor::from_byte_index(layout, display_off, Affinity::Downstream);
         let bb = cursor.geometry(layout, caret_width);
@@ -1101,7 +1123,9 @@ impl DocLayout {
         if n == 0 {
             return (0, 0.0);
         }
-        let line = self.tops[1..].partition_point(|&b| b <= self.scroll_y).min(n - 1);
+        let line = self.tops[1..]
+            .partition_point(|&b| b <= self.scroll_y)
+            .min(n - 1);
         (line, self.scroll_y - self.tops[line])
     }
 
@@ -1276,7 +1300,12 @@ impl DocLayout {
             Affine::IDENTITY,
             self.diff_colors.deleted_bg,
             None,
-            &Rect::new(self.pad_x as f64, top, (self.width - self.pad_x) as f64, bottom),
+            &Rect::new(
+                self.pad_x as f64,
+                top,
+                (self.width - self.pad_x) as f64,
+                bottom,
+            ),
         );
         self.fill_word_ranges(
             scene,
@@ -1384,7 +1413,12 @@ impl DocLayout {
                     );
                     let failed = matches!(block.kind, ImageBlockKind::Failed);
                     let label = if block.alt.is_empty() {
-                        if failed { "broken image" } else { "loading image…" }.to_string()
+                        if failed {
+                            "broken image"
+                        } else {
+                            "loading image…"
+                        }
+                        .to_string()
                     } else if failed {
                         format!("⚠ {}", block.alt)
                     } else {
@@ -1423,7 +1457,12 @@ impl DocLayout {
                 Affine::IDENTITY,
                 self.diff_colors.added_bg,
                 None,
-                &Rect::new(self.pad_x as f64, top, (self.width - self.pad_x) as f64, bottom),
+                &Rect::new(
+                    self.pad_x as f64,
+                    top,
+                    (self.width - self.pad_x) as f64,
+                    bottom,
+                ),
             );
             self.fill_word_ranges(
                 scene,
@@ -1491,8 +1530,14 @@ mod tests {
         let ImageBlockKind::Loaded { dest_w, dest_h, .. } = block.kind else {
             panic!("expected loaded");
         };
-        assert!((dest_w - content_w).abs() < 0.5, "wide image fills content width");
-        assert!((dest_h - content_w * 100.0 / 2000.0).abs() < 0.5, "aspect preserved");
+        assert!(
+            (dest_w - content_w).abs() < 0.5,
+            "wide image fills content width"
+        );
+        assert!(
+            (dest_h - content_w * 100.0 / 2000.0).abs() < 0.5,
+            "aspect preserved"
+        );
 
         // Tall but wide enough: 1000x2000 → still fills the width (no cap), height
         // follows aspect (1600), rather than being shrunk to fit a height limit.
@@ -1501,8 +1546,14 @@ mod tests {
         let ImageBlockKind::Loaded { dest_w, dest_h, .. } = block.kind else {
             panic!("expected loaded");
         };
-        assert!((dest_w - content_w).abs() < 0.5, "fills width even when tall");
-        assert!((dest_h - content_w * 2000.0 / 1000.0).abs() < 0.5, "height uncapped");
+        assert!(
+            (dest_w - content_w).abs() < 0.5,
+            "fills width even when tall"
+        );
+        assert!(
+            (dest_h - content_w * 2000.0 / 1000.0).abs() < 0.5,
+            "height uncapped"
+        );
 
         // Small: 40x30, under the width → shown at intrinsic size (no upscale).
         let small = cache_image(&cache, "small", 40, 30);
@@ -1510,8 +1561,15 @@ mod tests {
         let ImageBlockKind::Loaded { dest_w, dest_h, .. } = block.kind else {
             panic!("expected loaded");
         };
-        assert_eq!((dest_w, dest_h), (40.0, 30.0), "small image is not upscaled");
-        assert!((block_h - (30.0 + 2.0 * vpad)).abs() < 0.5, "block adds vertical padding");
+        assert_eq!(
+            (dest_w, dest_h),
+            (40.0, 30.0),
+            "small image is not upscaled"
+        );
+        assert!(
+            (block_h - (30.0 + 2.0 * vpad)).abs() < 0.5,
+            "block adds vertical padding"
+        );
     }
 
     /// An uncached (still-loading) URL gets a fixed placeholder block height.
@@ -1542,7 +1600,11 @@ mod tests {
         let (out_text, out_runs) = splice_preedit(text, &runs, caret, preedit, fg);
         assert_eq!(out_text, "abcXYdef");
         assert_eq!(out_runs[0].range, 0..2, "run before caret is unchanged");
-        assert_eq!(out_runs[1].range, 6..8, "run at/after caret shifts by preedit.len()");
+        assert_eq!(
+            out_runs[1].range,
+            6..8,
+            "run at/after caret shifts by preedit.len()"
+        );
         let unders: Vec<_> = out_runs.iter().filter(|r| r.underline).collect();
         assert_eq!(unders.len(), 1, "exactly one underline run");
         assert_eq!(unders[0].range, 3..5, "underline covers the preedit span");
@@ -1566,7 +1628,10 @@ mod tests {
     /// without a GPU/font stack.
     fn fixture(heights: &[f32], pad_top: f32, pad_bottom: f32) -> DocLayout {
         DocLayout {
-            layouts: heights.iter().map(|_| Rc::new(parley::Layout::new())).collect(),
+            layouts: heights
+                .iter()
+                .map(|_| Rc::new(parley::Layout::new()))
+                .collect(),
             renders: heights
                 .iter()
                 .map(|_| {
@@ -1794,8 +1859,21 @@ mod tests {
         let params = test_params(&theme, 1000.0);
         let build = |engine: &mut TextEngine, cache: &mut LineCache| {
             DocLayout::build(
-                engine, cache, &mut RenderCache::new(), &mut HeightCache::new(), 0, &snapshot,
-                &theme, None, None, &ImageCache::new(), 0, &params, None, 0, f32::INFINITY,
+                engine,
+                cache,
+                &mut RenderCache::new(),
+                &mut HeightCache::new(),
+                0,
+                &snapshot,
+                &theme,
+                None,
+                None,
+                &ImageCache::new(),
+                0,
+                &params,
+                None,
+                0,
+                f32::INFINITY,
             )
         };
         let t0 = Instant::now();
@@ -1834,8 +1912,21 @@ mod tests {
         let build =
             |engine: &mut TextEngine, lc: &mut LineCache, rc: &mut RenderCache, cursor: usize| {
                 DocLayout::build(
-                    engine, lc, rc, &mut HeightCache::new(), 7, &snapshot, &theme, None, None,
-                    &ImageCache::new(), cursor, &params, None, 0, f32::INFINITY,
+                    engine,
+                    lc,
+                    rc,
+                    &mut HeightCache::new(),
+                    7,
+                    &snapshot,
+                    &theme,
+                    None,
+                    None,
+                    &ImageCache::new(),
+                    cursor,
+                    &params,
+                    None,
+                    0,
+                    f32::INFINITY,
                 )
             };
 
@@ -1969,7 +2060,10 @@ mod tests {
         // while the band's lines have real, non-zero layouts.
         assert_eq!(doc.layouts[0].height(), 0.0, "head line placeholder");
         assert_eq!(doc.layouts[n - 1].height(), 0.0, "tail line placeholder");
-        assert!(doc.layouts[anchor].height() > 0.0, "anchor line materialized");
+        assert!(
+            doc.layouts[anchor].height() > 0.0,
+            "anchor line materialized"
+        );
         // The band is far smaller than the document (true O(visible)).
         assert!(
             doc.measured_count - doc.measured_start < 400,

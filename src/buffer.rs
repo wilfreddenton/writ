@@ -1056,7 +1056,10 @@ mod tests {
                 .into_iter()
                 .cloned()
                 .collect();
-            assert_eq!(*bucket, expected, "line {i} bucket mismatch (range {range:?})");
+            assert_eq!(
+                *bucket, expected,
+                "line {i} bucket mismatch (range {range:?})"
+            );
         }
         // The multi-line emphasis must appear in both spanned lines' buckets.
         let spans_line2 = buckets[2].iter().any(|s| s.style.bold);

@@ -174,7 +174,11 @@ pub fn draw_status_bar(
             None,
             &runs,
         );
-        engine.draw_line(scene, &layout, (bar.x0 as f32 + pad, center_top(bar, layout.height())));
+        engine.draw_line(
+            scene,
+            &layout,
+            (bar.x0 as f32 + pad, center_top(bar, layout.height())),
+        );
     }
 
     // --- right: H-level · Ln,Col · lines · scroll ---

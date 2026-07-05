@@ -282,8 +282,8 @@ pub fn build_line_render(
                 && let Some(url) = &region.link_url
             {
                 specials.push(Special::Hidden(region.full_range.clone()));
-                let alt = line_text
-                    [region.content_range.start - line_start..region.content_range.end - line_start]
+                let alt = line_text[region.content_range.start - line_start
+                    ..region.content_range.end - line_start]
                     .to_string();
                 inline_image_specs.push((region.full_range.start, url.clone(), alt));
                 continue;
@@ -382,11 +382,7 @@ pub fn build_line_render(
         // A completed task's content reads as "done": dimmed (its checkbox stays green).
         // A base run under everything catches plain text between styled spans.
         let dim = markers.checkbox() == Some(true);
-        let content_color = if dim {
-            peniko_color(theme.comment)
-        } else {
-            fg
-        };
+        let content_color = if dim { peniko_color(theme.comment) } else { fg };
         if dim && !text.is_empty() {
             runs.push(StyleRun::new(0..text.len(), content_color));
         }
@@ -516,7 +512,9 @@ mod tests {
             "completed task content is dimmed across the line"
         );
         assert!(
-            done.runs.iter().any(|r| r.color == peniko_color(theme.green)),
+            done.runs
+                .iter()
+                .any(|r| r.color == peniko_color(theme.green)),
             "the checkbox itself stays green"
         );
 
@@ -582,14 +580,20 @@ mod tests {
         let styles = snap.inline_styles_by_line();
 
         let off = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &styles[0], &[]);
-        let img = off.image.as_ref().expect("standalone image detected off-line");
+        let img = off
+            .image
+            .as_ref()
+            .expect("standalone image detected off-line");
         assert_eq!(img.url, "img/badge.png");
         assert_eq!(img.alt, "a badge");
         assert!(off.text.is_empty(), "the `![alt](url)` markdown is hidden");
 
         // Cursor on the line: reveal the raw markdown, no image block.
         let on = build_line_render(&snap, 0, &theme, 18.0, 0, &styles[0], &[]);
-        assert!(on.image.is_none(), "cursor on the line reveals raw markdown");
+        assert!(
+            on.image.is_none(),
+            "cursor on the line reveals raw markdown"
+        );
         assert_eq!(on.text, "![a badge](img/badge.png)");
     }
 
@@ -602,7 +606,10 @@ mod tests {
         let snap = buffer.render_snapshot();
         let styles = snap.inline_styles_by_line();
         let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &styles[0], &[]);
-        assert!(lr.image.is_none(), "image amid other text is not standalone");
+        assert!(
+            lr.image.is_none(),
+            "image amid other text is not standalone"
+        );
     }
 
     /// Two images on one line (a badge row) become inline-image refs off-cursor: their
@@ -623,17 +630,29 @@ mod tests {
             off.inline_images[0].display_offset <= off.inline_images[1].display_offset,
             "display offsets ascend left-to-right"
         );
-        assert!(!off.text.contains("!["), "markdown hidden, got {:?}", off.text);
+        assert!(
+            !off.text.contains("!["),
+            "markdown hidden, got {:?}",
+            off.text
+        );
         assert!(off.image.is_none(), "not a standalone image");
 
         // Caret inside the first image: it reveals, the second stays a box.
         let in_first = build_line_render(&snap, 0, &theme, 18.0, 2, &styles[0], &[]);
-        assert_eq!(in_first.inline_images.len(), 1, "only the other image stays a box");
+        assert_eq!(
+            in_first.inline_images.len(),
+            1,
+            "only the other image stays a box"
+        );
         assert!(in_first.text.contains("![a]"), "caret's image shown raw");
 
         // Caret on the line but between the images: both stay boxes.
         let between = build_line_render(&snap, 0, &theme, 18.0, 13, &styles[0], &[]);
-        assert_eq!(between.inline_images.len(), 2, "off-caret images stay boxes");
+        assert_eq!(
+            between.inline_images.len(),
+            2,
+            "off-caret images stay boxes"
+        );
     }
 
     /// The blockquote bar is no longer a `▎` glyph in the text — the marker collapses

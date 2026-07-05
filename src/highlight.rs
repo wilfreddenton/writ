@@ -170,8 +170,7 @@ impl Highlighter {
                         // token-by-token, so a run of one color arrives as many adjacent spans.
                         match spans.last_mut() {
                             Some(last)
-                                if last.highlight_id == highlight_id
-                                    && last.range.end == start =>
+                                if last.highlight_id == highlight_id && last.range.end == start =>
                             {
                                 last.range.end = end;
                             }

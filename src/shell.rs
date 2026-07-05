@@ -579,11 +579,17 @@ fn drag_extend_step(
     scale: f32,
     editor_h: f32,
 ) {
-    if dy != 0.0 && let Some(doc) = doc_engine.doc.as_mut() {
+    if dy != 0.0
+        && let Some(doc) = doc_engine.doc.as_mut()
+    {
         doc.scroll_by(dy, editor_h);
     }
     let hy = mouse.1.clamp(0.0, editor_h);
-    if let Some(off) = doc_engine.doc.as_ref().and_then(|d| d.hit_test(mouse.0, hy)) {
+    if let Some(off) = doc_engine
+        .doc
+        .as_ref()
+        .and_then(|d| d.hit_test(mouse.0, hy))
+    {
         doc_engine.editor.drag(off);
     }
     doc_engine.refresh(w, scale, editor_h);
@@ -651,12 +657,20 @@ fn apply_key(
         }
         // Home/End: line boundary, or document boundary with Ctrl/Super; Shift extends.
         Key::Named(NamedKey::Home) => {
-            let dir = if ctrl { Direction::DocStart } else { Direction::LineStart };
+            let dir = if ctrl {
+                Direction::DocStart
+            } else {
+                Direction::LineStart
+            };
             editor.move_in_direction(dir, shift);
             true
         }
         Key::Named(NamedKey::End) => {
-            let dir = if ctrl { Direction::DocEnd } else { Direction::LineEnd };
+            let dir = if ctrl {
+                Direction::DocEnd
+            } else {
+                Direction::LineEnd
+            };
             editor.move_in_direction(dir, shift);
             true
         }
@@ -760,8 +774,11 @@ impl DocEngine {
     /// (clamped). The shared core of `refresh` and `rebuild_preserving_scroll`; callers
     /// run detection and any cursor reveal around it.
     fn relayout_at_anchor(&mut self, device_width: f32, scale: f32, editor_h: f32) -> DocLayout {
-        let (anchor_line, anchor_off) =
-            self.doc.as_ref().map(|d| d.scroll_anchor()).unwrap_or((0, 0.0));
+        let (anchor_line, anchor_off) = self
+            .doc
+            .as_ref()
+            .map(|d| d.scroll_anchor())
+            .unwrap_or((0, 0.0));
         let mut new_doc = self.rebuild(device_width, scale, anchor_line, editor_h);
         new_doc.scroll_y = new_doc.anchor_scroll_y(anchor_line, anchor_off);
         new_doc.clamp_scroll(editor_h);
@@ -769,13 +786,18 @@ impl DocEngine {
     }
 
     fn refresh(&mut self, device_width: f32, scale: f32, editor_h: f32) {
-        self.editor.refresh_detection(self.detection_range(editor_h));
+        self.editor
+            .refresh_detection(self.detection_range(editor_h));
         let mut new_doc = self.relayout_at_anchor(device_width, scale, editor_h);
         new_doc.scroll_to(self.editor.cursor_position(), editor_h);
         self.doc = Some(new_doc);
         // A cursor jump (Ctrl+End / PageDown) can reveal lines outside the band built
         // around the old anchor; rebuild once around the new position so it's laid out.
-        if self.doc.as_ref().is_some_and(|d| d.needs_remeasure(editor_h)) {
+        if self
+            .doc
+            .as_ref()
+            .is_some_and(|d| d.needs_remeasure(editor_h))
+        {
             self.doc = Some(self.relayout_at_anchor(device_width, scale, editor_h));
         }
     }
@@ -785,7 +807,8 @@ impl DocEngine {
     /// detection over the (possibly scrolled) viewport — gated, so a same-window recolor
     /// wakeup doesn't rescan, but scrolling into new lines detects their refs.
     fn rebuild_preserving_scroll(&mut self, device_width: f32, scale: f32, editor_h: f32) {
-        self.editor.refresh_detection(self.detection_range(editor_h));
+        self.editor
+            .refresh_detection(self.detection_range(editor_h));
         self.doc = Some(self.relayout_at_anchor(device_width, scale, editor_h));
     }
 
@@ -1142,7 +1165,9 @@ impl ApplicationHandler<WritEvent> for App {
 
         let scale = window.scale_factor() as f32;
         let (_, editor_h) = chrome_metrics(scale, size.height as f32);
-        let doc = self.doc_engine.rebuild(size.width as f32, scale, 0, editor_h);
+        let doc = self
+            .doc_engine
+            .rebuild(size.width as f32, scale, 0, editor_h);
         self.doc_engine.doc = Some(doc);
         self.state = Some(ActiveSurface {
             surface,
@@ -1223,15 +1248,15 @@ impl ApplicationHandler<WritEvent> for App {
             // In-progress composition: splice it into the caret line (render-only, no
             // buffer mutation) and move the OS candidate popup to the composition caret.
             WindowEvent::Ime(winit::event::Ime::Preedit(text, cursor)) => {
-                self.doc_engine.preedit =
-                    (!text.is_empty()).then_some(Preedit { text, cursor });
+                self.doc_engine.preedit = (!text.is_empty()).then_some(Preedit { text, cursor });
                 let (w, vh, _) = state.viewport();
-                self.doc_engine.rebuild_preserving_scroll(w, state.scale, vh);
+                self.doc_engine
+                    .rebuild_preserving_scroll(w, state.scale, vh);
                 if let Some(doc) = self.doc_engine.doc.as_ref() {
                     let cw = CARET_WIDTH * state.scale;
-                    let rect = doc.preedit_caret_rect(cw).or_else(|| {
-                        doc.caret_rect(self.doc_engine.editor.cursor_position(), cw)
-                    });
+                    let rect = doc
+                        .preedit_caret_rect(cw)
+                        .or_else(|| doc.caret_rect(self.doc_engine.editor.cursor_position(), cw));
                     if let Some((x0, y0, x1, y1)) = rect {
                         state.window.set_ime_cursor_area(
                             PhysicalPosition::new(x0, y0),
@@ -1260,14 +1285,16 @@ impl ApplicationHandler<WritEvent> for App {
                     );
                 } else if had_preedit {
                     // Composition cancelled (empty commit): drop the spliced preedit.
-                    self.doc_engine.rebuild_preserving_scroll(w, state.scale, vh);
+                    self.doc_engine
+                        .rebuild_preserving_scroll(w, state.scale, vh);
                     state.window.request_redraw();
                 }
             }
             WindowEvent::Ime(winit::event::Ime::Disabled) => {
                 if self.doc_engine.preedit.take().is_some() {
                     let (w, vh, _) = state.viewport();
-                    self.doc_engine.rebuild_preserving_scroll(w, state.scale, vh);
+                    self.doc_engine
+                        .rebuild_preserving_scroll(w, state.scale, vh);
                     state.window.request_redraw();
                 }
             }
@@ -1279,7 +1306,14 @@ impl ApplicationHandler<WritEvent> for App {
                     // itself only extends the selection (dy=0), so scroll speed stays
                     // fixed to the tick cadence rather than the mouse-move rate.
                     self.drag_scroll_dy = drag_edge_velocity(self.mouse_pos.1, vh, state.scale);
-                    drag_extend_step(&mut self.doc_engine, self.mouse_pos, 0.0, w, state.scale, vh);
+                    drag_extend_step(
+                        &mut self.doc_engine,
+                        self.mouse_pos,
+                        0.0,
+                        w,
+                        state.scale,
+                        vh,
+                    );
                     state.window.request_redraw();
                 } else if self.doc_engine.editor.autocomplete().is_some() {
                     // Autocomplete popup open: the highlighted row follows the pointer.
@@ -1376,7 +1410,11 @@ impl ApplicationHandler<WritEvent> for App {
                             && (p.0 - self.mouse_pos.0).hypot(p.1 - self.mouse_pos.1)
                                 <= MULTI_CLICK_DIST
                     });
-                    self.click_count = if repeat { (self.click_count % 3) + 1 } else { 1 };
+                    self.click_count = if repeat {
+                        (self.click_count % 3) + 1
+                    } else {
+                        1
+                    };
                     self.last_click = Some((now, self.mouse_pos));
                     self.doc_engine
                         .editor
@@ -1933,7 +1971,13 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         );
     }
 
-    rasterize_scene_to_png(&scene, width, height, peniko_color(de.theme.background), path)?;
+    rasterize_scene_to_png(
+        &scene,
+        width,
+        height,
+        peniko_color(de.theme.background),
+        path,
+    )?;
     eprintln!("[writ] wrote snapshot: {path} ({width}x{height})");
     Ok(())
 }

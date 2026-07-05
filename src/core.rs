@@ -839,7 +839,10 @@ impl Editor {
         };
         // Stream the rope's chunks straight to the file — no whole-document String alloc.
         let file = std::fs::File::create(&path)?;
-        self.state.buffer.rope().write_to(std::io::BufWriter::new(file))?;
+        self.state
+            .buffer
+            .rope()
+            .write_to(std::io::BufWriter::new(file))?;
         if let Ok(metadata) = std::fs::metadata(&path) {
             self.last_save_mtime = metadata.modified().ok();
         }
@@ -996,7 +999,11 @@ mod tests {
             "relative image path resolves against the doc dir"
         );
         let web = e.text().find("x.com").unwrap();
-        assert_eq!(e.link_at(web).as_deref(), Some("https://x.com"), "web URL as-is");
+        assert_eq!(
+            e.link_at(web).as_deref(),
+            Some("https://x.com"),
+            "web URL as-is"
+        );
     }
 
     /// The input behaviors restored from the gpui `on_key_down` (Home/End/doc-boundary
@@ -1015,7 +1022,11 @@ mod tests {
         e.move_in_direction(Direction::DocEnd, false);
         assert_eq!(e.cursor_position(), e.len(), "Ctrl+End → doc end");
         e.move_in_direction(Direction::DocStart, true);
-        assert_eq!(e.selection_range(), Some(0..e.len()), "Shift+Ctrl+Home extends");
+        assert_eq!(
+            e.selection_range(),
+            Some(0..e.len()),
+            "Shift+Ctrl+Home extends"
+        );
 
         e.select_all();
         assert_eq!(e.selection_range(), Some(0..e.len()), "Ctrl+A selects all");
@@ -1041,14 +1052,25 @@ mod tests {
             e.insert_str("`");
             e.maybe_complete_code_fence();
         }
-        assert_eq!(e.text(), "```\n```", "triple backtick auto-closes the fence");
-        assert!(e.cursor_in_code_block(), "cursor sits inside the new code block");
+        assert_eq!(
+            e.text(),
+            "```\n```",
+            "triple backtick auto-closes the fence"
+        );
+        assert!(
+            e.cursor_in_code_block(),
+            "cursor sits inside the new code block"
+        );
         // Tab inside a code block indents with spaces (mirrors the shell's Tab arm),
         // never a stray fence character.
         if e.cursor_in_code_block() {
             e.insert_str("    ");
         }
-        assert_eq!(e.text(), "```    \n```", "Tab in code block inserts 4 spaces");
+        assert_eq!(
+            e.text(),
+            "```    \n```",
+            "Tab in code block inserts 4 spaces"
+        );
 
         // Paste routes through transform_paste: CRLF→LF, curly quotes→straight,
         // blockquote continuation. (Regression: shell was inserting raw text.)

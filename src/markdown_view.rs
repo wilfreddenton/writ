@@ -268,7 +268,10 @@ mod tests {
         view.set_markdown("");
         view.layout(800.0, 1.0);
         let empty = view.content_height();
-        assert!(empty < full, "empty doc should be shorter: {empty} vs {full}");
+        assert!(
+            empty < full,
+            "empty doc should be shorter: {empty} vs {full}"
+        );
 
         view.set_markdown("# A\n");
         view.layout(800.0, 1.0);

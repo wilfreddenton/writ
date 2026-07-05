@@ -382,10 +382,22 @@ mod tests {
         // `\n` is its own grapheme: stepping over a line boundary moves exactly one byte.
         let buf: Buffer = "aé\nb".parse().unwrap();
         let nl = "aé".len(); // byte offset of '\n'
-        assert_eq!(next_grapheme_boundary(&buf, nl), nl + 1, "step over newline");
-        assert_eq!(prev_grapheme_boundary(&buf, nl + 1), nl, "step back over newline");
+        assert_eq!(
+            next_grapheme_boundary(&buf, nl),
+            nl + 1,
+            "step over newline"
+        );
+        assert_eq!(
+            prev_grapheme_boundary(&buf, nl + 1),
+            nl,
+            "step back over newline"
+        );
         // 'é' here is a single 2-byte codepoint; stepping still lands on its boundary.
-        assert_eq!(next_grapheme_boundary(&buf, 1), nl, "cross é to end of line");
+        assert_eq!(
+            next_grapheme_boundary(&buf, 1),
+            nl,
+            "cross é to end of line"
+        );
         assert_eq!(prev_grapheme_boundary(&buf, nl), 1, "back over é");
     }
 

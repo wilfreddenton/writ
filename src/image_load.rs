@@ -135,11 +135,7 @@ pub fn spawn_image_loads(
 /// Synchronously decode standalone images into the cache for the headless snapshot
 /// frame: local reads (relative to the doc's directory) plus remote `http(s)` fetched
 /// by blocking on the current runtime, so the golden frame reflects the real result.
-pub fn load_local_images_blocking(
-    doc_dir: Option<&Path>,
-    urls: &[String],
-    cache: &ImageCache,
-) {
+pub fn load_local_images_blocking(doc_dir: Option<&Path>, urls: &[String], cache: &ImageCache) {
     for url in urls {
         let loaded = if url.starts_with("http://") || url.starts_with("https://") {
             tokio::runtime::Handle::current().block_on(load_remote_image(url))

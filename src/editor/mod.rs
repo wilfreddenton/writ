@@ -5,9 +5,7 @@ pub use action::Direction;
 pub use theme::EditorTheme;
 
 use crate::buffer::Buffer;
-use crate::cursor::{
-    Cursor, Selection, grapheme_column, offset_at_column, prev_grapheme_boundary,
-};
+use crate::cursor::{Cursor, Selection, grapheme_column, offset_at_column, prev_grapheme_boundary};
 use crate::marker::{LineMarkers, MarkerKind, OrderedMarker, UnorderedMarker};
 
 /// Context about the line at the cursor, used by smart editing actions.
@@ -420,7 +418,11 @@ impl EditorState {
 
         // Reuse the cache only when it's for this line; otherwise (wrong line or no
         // cache) rebuild and store.
-        let states = if self.tab_cycle_cache.as_ref().is_some_and(|c| c.line_idx == line_idx) {
+        let states = if self
+            .tab_cycle_cache
+            .as_ref()
+            .is_some_and(|c| c.line_idx == line_idx)
+        {
             self.tab_cycle_cache.as_ref().unwrap().states.clone()
         } else {
             let states = self.build_cycle_states_from_tree(cursor_offset, current_checkbox);
@@ -1259,8 +1261,13 @@ impl EditorState {
         self.propagate_checkbox_up(checkbox_byte_start, new_checked, &mut cursor_pos);
 
         let text_after = self.buffer.text();
-        self.buffer
-            .coalesce_since(head_before, &text_before, &text_after, cursor_before, cursor_pos);
+        self.buffer.coalesce_since(
+            head_before,
+            &text_before,
+            &text_after,
+            cursor_before,
+            cursor_pos,
+        );
 
         self.selection = Selection::new(cursor_pos, cursor_pos);
     }
@@ -1431,7 +1438,8 @@ impl EditorState {
             // Single replace wrapping the text in `~~` — one undo entry, byte-identical
             // to inserting `~~` at both ends.
             let wrapped = format!("~~{trimmed}~~");
-            self.buffer.replace(text_start..text_end, &wrapped, cursor_pos);
+            self.buffer
+                .replace(text_start..text_end, &wrapped, cursor_pos);
 
             let mut adjustment: isize = 0;
             if cursor_pos > text_start {
@@ -1452,7 +1460,8 @@ impl EditorState {
                 // Single replace stripping the wrapping `~~` — one undo entry, byte-identical
                 // to deleting the trailing and leading `~~` separately.
                 let inner = trimmed[2..trimmed.len() - 2].to_string();
-                self.buffer.replace(text_start..text_end, &inner, cursor_pos);
+                self.buffer
+                    .replace(text_start..text_end, &inner, cursor_pos);
 
                 let mut adjustment: isize = 0;
                 if cursor_pos > text_start + 2 {
@@ -2460,8 +2469,7 @@ mod tests {
         fn checkbox_cascade_caches_match_fresh_parse() {
             // The suspend_caches batching must leave the derived inline styles identical
             // to a from-scratch parse of the resulting text (rebuilt once at the end).
-            let mut state =
-                editor_with_cursor("- [ ] |parent\n  - [ ] child1\n  - [ ] child2\n");
+            let mut state = editor_with_cursor("- [ ] |parent\n  - [ ] child1\n  - [ ] child2\n");
             state.toggle_checkbox(0); // cascades to children
             let mut fresh: Buffer = state.text().parse().unwrap();
             assert_eq!(
@@ -2532,9 +2540,13 @@ mod tests {
             // Checking child2 checks child2 AND auto-checks the parent — a cascade
             // spanning multiple lines. One undo must revert the entire toggle.
             let before = trim_raw("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] child2\n");
-            let mut state = editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
+            let mut state =
+                editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
             state.toggle_checkbox(2);
-            assert!(state.text().contains("[x] ~~parent~~"), "parent auto-checked");
+            assert!(
+                state.text().contains("[x] ~~parent~~"),
+                "parent auto-checked"
+            );
             assert!(state.text().contains("[x] ~~child2~~"), "child2 checked");
 
             state.buffer.undo();
@@ -2544,7 +2556,8 @@ mod tests {
 
         #[test]
         fn redo_reapplies_full_cascade() {
-            let mut state = editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
+            let mut state =
+                editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
             state.toggle_checkbox(2);
             let after = state.text();
 
@@ -2575,9 +2588,8 @@ mod tests {
 
         #[test]
         fn uncheck_cascades_to_parent_text() {
-            let mut state = editor_with_cursor(
-                "- [x] ~~parent~~\n  - [x] ~~|child1~~\n  - [x] ~~child2~~\n",
-            );
+            let mut state =
+                editor_with_cursor("- [x] ~~parent~~\n  - [x] ~~|child1~~\n  - [x] ~~child2~~\n");
             state.toggle_checkbox(1);
             assert_eq!(
                 state.text(),
@@ -2595,7 +2607,11 @@ mod tests {
             state.toggle_line_strikethrough(0, true, 0);
             assert_eq!(state.text(), "~~hello world~~\n");
             state.toggle_line_strikethrough(0, false, 0);
-            assert_eq!(state.text(), "hello world\n", "round-trip is byte-identical");
+            assert_eq!(
+                state.text(),
+                "hello world\n",
+                "round-trip is byte-identical"
+            );
         }
 
         #[test]
@@ -2637,7 +2653,11 @@ mod tests {
             }
             assert_eq!(state.text(), "\n");
             state.buffer.undo();
-            assert_eq!(state.text(), "word\n", "one undo restores the backspaced word");
+            assert_eq!(
+                state.text(),
+                "word\n",
+                "one undo restores the backspaced word"
+            );
         }
 
         #[test]
