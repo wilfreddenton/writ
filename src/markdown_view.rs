@@ -30,7 +30,7 @@ use crate::buffer::Buffer;
 use crate::consts::{FONT_SIZE, LINE_HEIGHT, PADDING};
 use crate::doc_layout::{DocLayout, HeightCache, LayoutParams, LineCache, RenderCache};
 use crate::editor::EditorTheme;
-use crate::image_cache::ImageCache;
+use crate::image_cache::{ImageCache, decode};
 use crate::text_engine::{TextEngine, peniko_color};
 
 /// A headless markdown renderer. Holds the render-only subset of writ's document
@@ -129,6 +129,48 @@ impl MarkdownView {
         );
         self.doc = Some(doc);
         self.laid_out = Some((width, scale));
+    }
+
+    /// The standalone-image URLs referenced by the currently-built layout (empty if not
+    /// laid out yet). A consumer fetches these bytes however it likes — its own
+    /// tokio/reqwest, a Xilem `worker` view, a sync fs read — and pushes them back in via
+    /// [`set_image_bytes`]/[`set_image_failed`]; the component never does IO itself.
+    ///
+    /// [`set_image_bytes`]: MarkdownView::set_image_bytes
+    /// [`set_image_failed`]: MarkdownView::set_image_failed
+    pub fn image_urls(&self) -> Vec<String> {
+        self.doc
+            .as_ref()
+            .map(|d| d.image_urls().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Hand decoded image bytes for `url` to the view (the consumer fetched them). On a
+    /// successful decode the image is cached, the built layout is invalidated so the next
+    /// `render` reflows around the now-known image height (scroll is preserved), and this
+    /// returns `true`; on decode failure the URL is marked failed and this returns `false`.
+    /// The component does no IO — the consumer supplies the bytes.
+    pub fn set_image_bytes(&mut self, url: &str, bytes: &[u8]) -> bool {
+        match decode(bytes) {
+            Some(img) => {
+                self.images.set_loaded(url, img);
+                self.doc = None;
+                self.laid_out = None;
+                true
+            }
+            None => {
+                self.images.set_failed(url);
+                false
+            }
+        }
+    }
+
+    /// Mark `url` as failed (the consumer's fetch errored), invalidating the built layout
+    /// so the next `render` reflows around the placeholder. Scroll is preserved.
+    pub fn set_image_failed(&mut self, url: &str) {
+        self.images.set_failed(url);
+        self.doc = None;
+        self.laid_out = None;
     }
 
     /// The full content height of the built document (0 if nothing is laid out yet).
@@ -243,6 +285,45 @@ mod tests {
 
         let mut scene = Scene::new();
         view.render(&mut scene, 800.0, 600.0, 1.0);
+    }
+
+    #[test]
+    fn image_urls_lists_standalone_images() {
+        let mut view = MarkdownView::new();
+        // A paragraph that is only `![alt](url)` is a standalone image, collected into
+        // the layout's `image_urls` (see render.rs `standalone_image_detected...`).
+        view.set_markdown("![alt](pic.png)\n");
+        view.layout(800.0, 1.0);
+        assert!(
+            view.image_urls().iter().any(|u| u == "pic.png"),
+            "standalone image url should be listed: {:?}",
+            view.image_urls()
+        );
+    }
+
+    #[test]
+    fn set_image_bytes_rejects_garbage() {
+        let mut view = MarkdownView::new();
+        assert!(!view.set_image_bytes("x.png", b"not an image"));
+    }
+
+    #[test]
+    fn set_image_bytes_accepts_valid_png() {
+        use image::{ImageFormat, RgbaImage};
+        use std::io::Cursor;
+
+        let mut png = Vec::new();
+        RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+
+        let mut view = MarkdownView::new();
+        view.set_markdown("![alt](pic.png)\n");
+        view.layout(800.0, 1.0);
+        assert!(view.set_image_bytes("pic.png", &png));
+        // Layout was invalidated; re-layout succeeds around the now-known image height.
+        view.layout(800.0, 1.0);
+        assert!(view.content_height() > 0.0);
     }
 
     #[test]

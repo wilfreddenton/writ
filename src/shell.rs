@@ -53,7 +53,7 @@ use crate::github::{
     ValidationResult,
 };
 use crate::image_cache::ImageCache;
-use crate::image_load::{load_local_images_blocking, spawn_image_loads};
+use crate::image_load::{RepaintSignal, load_local_images_blocking, spawn_image_loads};
 use crate::inline::{GitHubContext, GitHubRef};
 use crate::marker::MarkerKind;
 use crate::overlay::{
@@ -204,6 +204,17 @@ pub(crate) enum WritEvent {
     /// The off-thread file read finished; its `(content, base_text)` is in `reload_slot`,
     /// ready for the cheap main-thread apply (buffer swap + diff).
     FileReloaded,
+}
+
+/// Concrete `RepaintSignal` for the winit shell: wakes the loop with `ImageLoaded` so a
+/// finished background image load reflows the doc around its now-known height.
+#[derive(Clone)]
+struct RedrawOnImageLoad(EventLoopProxy<WritEvent>);
+
+impl RepaintSignal for RedrawOnImageLoad {
+    fn notify(&self) {
+        let _ = self.0.send_event(WritEvent::ImageLoaded);
+    }
 }
 
 /// Autocomplete results a tokio task fetched, handed back to the main thread (via a
@@ -406,7 +417,13 @@ fn sync_image_loads(
         .editor
         .file_path()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    spawn_image_loads(dir, urls, &doc_engine.images, runtime, proxy);
+    spawn_image_loads(
+        dir,
+        urls,
+        &doc_engine.images,
+        runtime,
+        RedrawOnImageLoad(proxy.clone()),
+    );
 }
 
 /// The async side effects every buffer edit needs, in one place so an edit entry point

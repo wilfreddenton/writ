@@ -18,6 +18,7 @@
 
 pub use core::Editor;
 pub use editor::{Direction, EditorTheme};
+pub use image_load::RepaintSignal;
 pub use markdown_view::MarkdownView;
 pub use raster::rasterize_scene_to_png;
 

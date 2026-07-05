@@ -6,10 +6,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use winit::event_loop::EventLoopProxy;
-
 use crate::image_cache::{ImageCache, LoadedImage, decode};
-use crate::shell::WritEvent;
+
+/// Called when a background image load finishes, so an event-driven consumer can
+/// schedule a repaint (an async result sits invisibly in the cache until the UI
+/// redraws). Mirrors the Linebender stack's proxy convention; the concrete impl
+/// wraps winit's `EventLoopProxy` (see the shell).
+pub trait RepaintSignal: Clone + Send + 'static {
+    fn notify(&self);
+}
 
 /// Resolve a standalone-image URL to a filesystem path: absolute paths as-is, relative
 /// paths against the document's directory. Returns None when relative but the doc has
@@ -78,13 +83,13 @@ async fn load_remote_image(url: &str) -> Option<LoadedImage> {
 /// For each standalone-image URL with no cache entry, mark it loading and spawn a
 /// worker: remote `http(s)` via reqwest on the async runtime, else a local file read +
 /// decode on a blocking task (so IO/decoding doesn't stall the runtime). Each finish
-/// wakes the loop with `ImageLoaded` so the doc rebuilds around the now-known height.
+/// calls `signal.notify()` so an event-driven consumer rebuilds around the now-known height.
 pub(crate) fn spawn_image_loads(
     doc_dir: Option<PathBuf>,
     urls: &[String],
     cache: &ImageCache,
     runtime: &tokio::runtime::Handle,
-    proxy: &EventLoopProxy<WritEvent>,
+    signal: impl RepaintSignal,
 ) {
     for url in urls {
         if cache.contains(url) {
@@ -92,7 +97,7 @@ pub(crate) fn spawn_image_loads(
         }
         cache.mark_loading(url);
         let cache = cache.clone();
-        let proxy = proxy.clone();
+        let signal = signal.clone();
         let url = url.clone();
         if url.starts_with("http://") || url.starts_with("https://") {
             runtime.spawn(async move {
@@ -112,7 +117,7 @@ pub(crate) fn spawn_image_loads(
                     Some(img) => cache.set_loaded(&url, img),
                     None => cache.set_failed(&url),
                 }
-                let _ = proxy.send_event(WritEvent::ImageLoaded);
+                signal.notify();
             });
         } else {
             let doc_dir = doc_dir.clone();
@@ -121,7 +126,7 @@ pub(crate) fn spawn_image_loads(
                     Some(img) => cache.set_loaded(&url, img),
                     None => cache.set_failed(&url),
                 }
-                let _ = proxy.send_event(WritEvent::ImageLoaded);
+                signal.notify();
             });
         }
     }
