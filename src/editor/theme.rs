@@ -1,22 +1,6 @@
-use gpui::{Global, Rgba, rgb};
+use vello::peniko::Color;
 
 use crate::highlight::Highlighter;
-
-// Platform-specific default fonts
-#[cfg(target_os = "windows")]
-pub const DEFAULT_TEXT_FONT: &str = "Segoe UI";
-#[cfg(target_os = "windows")]
-pub const DEFAULT_CODE_FONT: &str = "Consolas";
-
-#[cfg(target_os = "macos")]
-pub const DEFAULT_TEXT_FONT: &str = ".AppleSystemUIFont";
-#[cfg(target_os = "macos")]
-pub const DEFAULT_CODE_FONT: &str = "Menlo";
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-pub const DEFAULT_TEXT_FONT: &str = "Liberation Sans";
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-pub const DEFAULT_CODE_FONT: &str = "Liberation Mono";
 
 /// Color theme for the editor.
 ///
@@ -24,38 +8,42 @@ pub const DEFAULT_CODE_FONT: &str = "Liberation Mono";
 /// highlighting. Use [`EditorTheme::dracula()`] for the built-in Dracula theme.
 #[derive(Clone)]
 pub struct EditorTheme {
-    pub background: Rgba,
-    pub foreground: Rgba,
-    pub selection: Rgba,
-    pub comment: Rgba,
-    pub red: Rgba,
-    pub orange: Rgba,
-    pub yellow: Rgba,
-    pub green: Rgba,
-    pub cyan: Rgba,
-    pub purple: Rgba,
-    pub pink: Rgba,
+    pub background: Color,
+    /// Slightly-darker fill for chrome (the status bar) so it reads as a distinct
+    /// surface rather than blending into the document background.
+    pub surface: Color,
+    pub foreground: Color,
+    pub selection: Color,
+    pub comment: Color,
+    pub red: Color,
+    pub orange: Color,
+    pub yellow: Color,
+    pub green: Color,
+    pub cyan: Color,
+    pub purple: Color,
+    pub pink: Color,
 }
 
 impl EditorTheme {
     /// The Dracula color theme.
     pub fn dracula() -> Self {
         Self {
-            background: rgb(0x282A36),
-            foreground: rgb(0xF8F8F2),
-            selection: rgb(0x44475A),
-            comment: rgb(0x6272A4),
-            red: rgb(0xFF5555),
-            orange: rgb(0xFFB86C),
-            yellow: rgb(0xF1FA8C),
-            green: rgb(0x50FA7B),
-            cyan: rgb(0x8BE9FD),
-            purple: rgb(0xBD93F9),
-            pink: rgb(0xFF79C6),
+            background: Color::from_rgba8(0x28, 0x2A, 0x36, 0xFF),
+            surface: Color::from_rgba8(0x21, 0x22, 0x2C, 0xFF),
+            foreground: Color::from_rgba8(0xF8, 0xF8, 0xF2, 0xFF),
+            selection: Color::from_rgba8(0x44, 0x47, 0x5A, 0xFF),
+            comment: Color::from_rgba8(0x62, 0x72, 0xA4, 0xFF),
+            red: Color::from_rgba8(0xFF, 0x55, 0x55, 0xFF),
+            orange: Color::from_rgba8(0xFF, 0xB8, 0x6C, 0xFF),
+            yellow: Color::from_rgba8(0xF1, 0xFA, 0x8C, 0xFF),
+            green: Color::from_rgba8(0x50, 0xFA, 0x7B, 0xFF),
+            cyan: Color::from_rgba8(0x8B, 0xE9, 0xFD, 0xFF),
+            purple: Color::from_rgba8(0xBD, 0x93, 0xF9, 0xFF),
+            pink: Color::from_rgba8(0xFF, 0x79, 0xC6, 0xFF),
         }
     }
 
-    pub fn color_for_capture(&self, capture: &str) -> Rgba {
+    pub fn color_for_capture(&self, capture: &str) -> Color {
         // Handle specific sub-captures first
         match capture {
             "variable.special" => return self.purple,
@@ -85,7 +73,7 @@ impl EditorTheme {
         }
     }
 
-    pub fn color_for_highlight(&self, highlight_id: usize) -> Rgba {
+    pub fn color_for_highlight(&self, highlight_id: usize) -> Color {
         self.color_for_capture(Highlighter::capture_name(highlight_id))
     }
 }
@@ -95,5 +83,3 @@ impl Default for EditorTheme {
         Self::dracula()
     }
 }
-
-impl Global for EditorTheme {}

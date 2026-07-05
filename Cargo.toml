@@ -1,6 +1,6 @@
 [package]
 name = "writ"
-version = "0.12.0"
+version = "0.13.0"
 description = "A hybrid markdown editor combining raw text editing with live inline rendering"
 authors = ["Wilfred Denton <wilfred@hey.com>"]
 license = "MIT"
@@ -16,43 +16,73 @@ too_many_arguments = "allow"
 name = "writ"
 path = "src/lib.rs"
 
+# The editor: winit + wgpu + Vello + Parley shell (formerly the gpui app).
 [[bin]]
 name = "writ"
-path = "src/main.rs"
+path = "src/bin/writ_next.rs"
+required-features = ["app"]
 
 [[bin]]
 name = "writd"
 path = "src/writd.rs"
+required-features = ["ghosttext"]
+
+[features]
+default = ["app"]
+
+# internal: shared async + HTTP substrate (underscore = not meant for à-la-carte use)
+_net = ["dep:tokio", "dep:reqwest", "dep:rustls", "dep:serde_json"]
+
+git = ["dep:gix"]
+github = ["_net"]
+watch = ["dep:notify", "dep:notify-debouncer-full"]
+remote-images = ["_net"]
+
+# the full core::Editor orchestration hub (diff-from-HEAD + GitHub + file watch)
+editor = ["git", "github", "watch"]
+
+# the desktop editor application (winit shell). implies editor.
+app = ["editor", "remote-images", "dep:winit", "dep:arboard", "dep:open", "dep:clap"]
+
+# the GhostText daemon (writd binary)
+ghosttext = ["app", "dep:tokio-tungstenite", "dep:futures"]
 
 [dependencies]
 anyhow = "1"
-async-compat = "0.2"
-clap = { version = "4.5", features = ["derive", "env"] }
-futures = "0.3"
+clap = { version = "4.5", features = ["derive", "env"], optional = true }
+futures = { version = "0.3", optional = true }
 imara-diff = "0.2"
-gix = { version = "0.84", default-features = false, features = ["sha1"] }
-gpui = "0.2"
-# Provides `application()` = `Application::with_platform(current_platform(..))`,
-# which gpui core no longer exposes directly. Pinned to the same rev as the patch.
-# The wayland/x11 features gate the Linux windowing backends (gpui_linux); without
-# them the platform match falls through to unreachable!() at runtime.
-gpui_platform = { git = "https://github.com/wilfreddenton/zed", rev = "52726eee52e9cde291351464a6234eb088b4ce49", features = ["wayland", "x11"] }
-notify = "8.2"
-open = "5"
+gix = { version = "0.84", default-features = false, features = ["sha1"], optional = true }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# SVG rasterization (badges etc.); default features pull in text + system-fonts,
+# needed to render `<text>` labels in shields.io-style badges.
+resvg = "0.46"
+# --- Linebender rendering stack (see MIGRATION-PLAN.md). `wgpu` is NOT a direct
+# dep — we use `vello::wgpu` so there is a single wgpu in the tree. ---
+parley = "0.11"
+vello = "0.9"
+winit = { version = "0.30", optional = true }
+fontique = { version = "0.11", features = ["fontconfig-dlopen"] }
+pollster = "0.4"
+notify = { version = "8.2", optional = true }
+open = { version = "5", optional = true }
 regex = "1.12.2"
-reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls", "json"], optional = true }
 ropey = "1.6"
-rustls = { version = "0.23.36", features = ["ring"] }
+rustls = { version = "0.23.36", features = ["ring"], optional = true }
+unicode-segmentation = "1.13"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.29"
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+tokio-tungstenite = { version = "0.29", optional = true }
 tree-sitter = "0.26"
 tree-sitter-bash = "0.25"
 tree-sitter-highlight = "0.26"
 tree-sitter-md = "0.5"
 tree-sitter-rust = "0.24"
 undo = "0.52"
+notify-debouncer-full = { version = "0.5", optional = true }
 
 [profile.release]
 lto = "thin"
@@ -65,11 +95,4 @@ lto = false
 codegen-units = 16
 
 [dev-dependencies]
-rustls = { version = "0.23.36", features = ["ring"] }
-
-# Track the last stable Zed release (v1.8.2) for gpui, plus our orphaned-
-# punctuation line-wrapping fix. gpui's version is frozen at 0.2.2 both on
-# crates.io and in-tree, so this override satisfies the `gpui = "0.2"` requirement.
-# Branch writ-gpui-v1.8.2 = v1.8.2 + the fix; rev pinned for reproducibility.
-[patch.crates-io]
-gpui = { git = "https://github.com/wilfreddenton/zed", rev = "52726eee52e9cde291351464a6234eb088b4ce49" }
+vello = "0.9"

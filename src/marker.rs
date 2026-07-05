@@ -3,7 +3,10 @@
 //! This module provides types for representing markers (blockquotes, lists,
 //! headings, etc.) and functions for extracting them from the parse tree.
 
+use crate::parser::MarkdownParser;
 use ropey::Rope;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
 use tree_sitter::Node;
 
@@ -105,51 +108,35 @@ pub struct LineMarkers {
 }
 
 impl LineMarkers {
+    /// Combined byte span of the markers matching `pred`, in one pass. Markers are
+    /// stored outermost-first, so the first match carries the widest right edge and
+    /// the last match the leftmost start — mirroring the old filter-to-Vec then
+    /// `last().start .. first().end`, without the intermediate allocation.
+    fn span_of(&self, pred: impl Fn(&Marker) -> bool) -> Option<Range<usize>> {
+        let mut iter = self.markers.iter().filter(|m| pred(m));
+        let first = iter.next()?;
+        let end = first.range.end;
+        let start = iter.last().map_or(first.range.start, |m| m.range.start);
+        Some(start..end)
+    }
+
     /// Returns the combined byte range of spacer markers (excluding Checkbox).
     /// Checkbox markers are rendered inline, not as spacers, so they don't
     /// contribute to wrap indent.
     pub fn marker_range(&self) -> Option<Range<usize>> {
-        // Filter out Checkbox markers - they're rendered inline, not as spacers
-        let spacer_markers: Vec<_> = self
-            .markers
-            .iter()
-            .filter(|m| !matches!(m.kind, MarkerKind::Checkbox { .. }))
-            .collect();
-
-        if spacer_markers.is_empty() {
-            return None;
-        }
-        let start = spacer_markers.last()?.range.start;
-        let end = spacer_markers.first()?.range.end;
-        Some(start..end)
+        self.span_of(|m| !matches!(m.kind, MarkerKind::Checkbox { .. }))
     }
 
     /// Returns the combined byte range of ALL markers (including Checkbox).
     /// Used for determining where content actually starts.
     pub fn full_marker_range(&self) -> Option<Range<usize>> {
-        if self.markers.is_empty() {
-            return None;
-        }
-        let start = self.markers.last()?.range.start;
-        let end = self.markers.first()?.range.end;
-        Some(start..end)
+        self.span_of(|_| true)
     }
 
     /// Returns the range of prefix markers (Indent, BlockQuote) that are rendered as spacers.
     /// Excludes CodeBlockFence markers. Used by fence lines to know where fence content starts.
     pub fn prefix_marker_range(&self) -> Option<Range<usize>> {
-        let prefix_markers: Vec<_> = self
-            .markers
-            .iter()
-            .filter(|m| matches!(m.kind, MarkerKind::Indent | MarkerKind::BlockQuote))
-            .collect();
-
-        if prefix_markers.is_empty() {
-            return None;
-        }
-        let start = prefix_markers.last()?.range.start;
-        let end = prefix_markers.first()?.range.end;
-        Some(start..end)
+        self.span_of(|m| matches!(m.kind, MarkerKind::Indent | MarkerKind::BlockQuote))
     }
 
     /// Returns the byte offset where content starts (after all markers).
@@ -487,6 +474,15 @@ fn find_node_info_index(nodes: &[NodeInfo], target_byte: usize) -> usize {
         .unwrap_or_else(|idx| idx)
 }
 
+/// Extend a marker's end byte to include a single trailing space, if present.
+fn extend_over_space(rope: &Rope, end: usize) -> usize {
+    if rope.get_byte(end) == Some(b' ') {
+        end + 1
+    } else {
+        end
+    }
+}
+
 /// Get a byte slice from a Rope, borrowing if possible.
 /// Returns a Cow that borrows if the slice fits in one chunk, allocates otherwise.
 fn rope_slice_cow(rope: &Rope, start: usize, end: usize) -> std::borrow::Cow<'_, str> {
@@ -607,12 +603,44 @@ fn marker_from_node(
     (marker, indent_marker)
 }
 
+/// Shift every marker range by `to - from` (all ranges are ≥ `from`). Used to move
+/// cached markers between the canonical prefix-relative frame (base 0) and the live
+/// `start` offset.
+fn rebase_markers(markers: &[Marker], from: usize, to: usize) -> Vec<Marker> {
+    markers
+        .iter()
+        .map(|m| Marker {
+            kind: m.kind.clone(),
+            range: (m.range.start - from + to)..(m.range.end - from + to),
+        })
+        .collect()
+}
+
 /// Parse a continuation string into markers using tree-sitter.
 /// Returns markers innermost-to-outermost (reverse document order) for use by markers_at.
+///
+/// The marker set for a prefix depends only on its text, not on where it sits in the
+/// document, so results are memoized per prefix string (ranges stored relative to the
+/// prefix, then re-offset to `start`). Continuation prefixes are short and highly
+/// repetitive (`> `, `- `, `  `, …), so this turns almost every call into a lookup.
 pub fn parse_continuation(rope: &Rope, start: usize, end: usize) -> Vec<Marker> {
-    use crate::parser::MarkdownParser;
-    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Vec<Marker>>> = RefCell::new(HashMap::new());
+    }
 
+    let content = rope_slice_cow(rope, start, end);
+    if let Some(rel) = CACHE.with(|c| c.borrow().get(content.as_ref()).cloned()) {
+        return rebase_markers(&rel, 0, start);
+    }
+
+    let markers = parse_continuation_uncached(rope, start, end);
+    let rel = rebase_markers(&markers, start, 0);
+    CACHE.with(|c| c.borrow_mut().insert(content.into_owned(), rel));
+    markers
+}
+
+/// Uncached tree-sitter parse of the continuation prefix at `[start, end)`.
+fn parse_continuation_uncached(rope: &Rope, start: usize, end: usize) -> Vec<Marker> {
     thread_local! {
         static PARSER: RefCell<MarkdownParser> = RefCell::new(MarkdownParser::default());
     }
@@ -711,6 +739,13 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
     let mut code_blocks = Vec::new();
     let mut checked_task_stack: Vec<(usize, bool)> = Vec::new();
     let mut code_block_end: Option<usize> = None;
+    // Ancestor kinds, pushed on descent and popped on ascent, so the current node's
+    // parent kind is `kind_stack.last()` in O(1) (avoids re-descending from root).
+    let mut kind_stack: Vec<&'static str> = Vec::new();
+    // Whether the current fenced_code_block's first delimiter has been emitted yet.
+    // Reset on entering each fence (fences don't nest), so the first delimiter child is
+    // flagged without re-walking the parent's children.
+    let mut fence_first_delim_seen = false;
 
     loop {
         let node = cursor.node();
@@ -736,6 +771,7 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
 
         if node.kind() == "fenced_code_block" {
             code_block_end = Some(node.end_byte());
+            fence_first_delim_seen = false;
 
             let block_range = node.start_byte()..node.end_byte();
             let mut content_start: Option<usize> = None;
@@ -781,21 +817,16 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
 
         let in_checked_task = checked_task_stack.iter().any(|(_, checked)| *checked);
         let in_code_block = code_block_end.is_some();
+        let parent_kind = kind_stack.last().copied();
 
         let is_first_fence_delimiter = if node.kind() == "fenced_code_block_delimiter" {
-            node.parent()
-                .map(|parent| {
-                    if parent.kind() == "fenced_code_block" {
-                        let mut child_cursor = parent.walk();
-                        for child in parent.children(&mut child_cursor) {
-                            if child.kind() == "fenced_code_block_delimiter" {
-                                return child.start_byte() == node.start_byte();
-                            }
-                        }
-                    }
-                    true
-                })
-                .unwrap_or(true)
+            if parent_kind == Some("fenced_code_block") {
+                let first = !fence_first_delim_seen;
+                fence_first_delim_seen = true;
+                first
+            } else {
+                true
+            }
         } else {
             false
         };
@@ -804,13 +835,14 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
             kind: node.kind(),
-            parent_kind: node.parent().map(|p| p.kind()),
+            parent_kind,
             is_first_fence_delimiter,
             in_checked_task,
             in_code_block,
         });
 
         if cursor.goto_first_child() {
+            kind_stack.push(node.kind());
             continue;
         }
         if cursor.goto_next_sibling() {
@@ -820,6 +852,7 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
             if !cursor.goto_parent() {
                 return ParsedNodes { nodes, code_blocks };
             }
+            kind_stack.pop();
             if cursor.goto_next_sibling() {
                 break;
             }
@@ -896,23 +929,11 @@ pub fn markers_at_from_infos(
                     markers.push(m);
                 }
             }
-            "task_list_marker_unchecked" => {
+            "task_list_marker_unchecked" | "task_list_marker_checked" => {
+                let checked = kind == "task_list_marker_checked";
                 let checkbox_start = start;
-                let range_end = if rope.get_byte(end) == Some(b' ') {
-                    end + 1
-                } else {
-                    end
-                };
-                pending_task = Some((false, checkbox_start..range_end));
-            }
-            "task_list_marker_checked" => {
-                let checkbox_start = start;
-                let range_end = if rope.get_byte(end) == Some(b' ') {
-                    end + 1
-                } else {
-                    end
-                };
-                pending_task = Some((true, checkbox_start..range_end));
+                let range_end = extend_over_space(rope, end);
+                pending_task = Some((checked, checkbox_start..range_end));
             }
             "atx_h1_marker" | "atx_h2_marker" | "atx_h3_marker" | "atx_h4_marker"
             | "atx_h5_marker" | "atx_h6_marker" => {
@@ -924,11 +945,7 @@ pub fn markers_at_from_infos(
                     "atx_h5_marker" => 5,
                     _ => 6,
                 };
-                let range_end = if rope.get_byte(end) == Some(b' ') {
-                    end + 1
-                } else {
-                    end
-                };
+                let range_end = extend_over_space(rope, end);
                 markers.push(Marker {
                     kind: MarkerKind::Heading(level),
                     range: start..range_end,

@@ -18,23 +18,34 @@ cargo install writ --locked
 writ --file path/to/document.md
 ```
 
-To try writ without a file, use demo mode which opens and "plays" scripted input:
+Run `writ --demo` (or with no arguments) to open a built-in showcase document with a synthetic git-`HEAD` diff, so you can see the inline diff, rendering, and code-fence highlighting without setting anything up.
 
-```bash
-writ --demo
-```
+Flags:
 
-Fonts can be configured via command line arguments or environment variables:
+| Flag | Description |
+|------|-------------|
+| `--file <path>` | Open a markdown file (watched for live external edits) |
+| `--demo` | Open the showcase document with a synthetic HEAD diff |
+| `--autosave` | Save on every edit (used by the GhostText daemon) |
+| `--github-repo <owner/repo>` | GitHub context for ref validation (else auto-detected from the git remote) |
+| `--github-token <token>` | GitHub API token (or the `GITHUB_TOKEN` env var) for ref validation, hover cards, and autocomplete |
 
-```bash
-writ --file doc.md --text-font "Iosevka Aile" --code-font "Iosevka"
-```
+writ is rendered on [winit](https://github.com/rust-windowing/winit) + [wgpu](https://wgpu.rs) + [Vello](https://github.com/linebender/vello) + [Parley](https://github.com/linebender/parley) (GPU 2D rendering and text layout). On Linux/Mesa (including Asahi) select the Vulkan backend with `WGPU_BACKEND=vulkan`. Fonts are resolved via [Fontique](https://github.com/linebender/parley) with fontconfig loaded at runtime — no `-dev` headers needed.
 
-```bash
-WRIT_TEXT_FONT="Iosevka Aile" WRIT_CODE_FONT="Iosevka" writ --file doc.md
-```
+### Inline git diff
 
-The default fonts are platform-specific: Segoe UI and Consolas on Windows, the system font and Menlo on macOS, and Liberation Sans and Liberation Mono on Linux.
+When the open file lives in a git repository, writ renders a live inline diff against `HEAD`: added lines and words are tinted green, deleted lines appear as red "ghost" rows above their position, all with the same markdown rendering as the rest of the document. writ watches the file, so edits made by an external tool (e.g. an AI agent) reload and re-diff live.
+
+### GitHub integration
+
+When the open file is inside a GitHub repository (auto-detected from the `origin` remote, or set with `--github-repo owner/repo`) and a token is available (`--github-token` or the `GITHUB_TOKEN` env var), writ makes GitHub references live:
+
+- **Ref detection + validation.** `#123` (issues/PRs), `@user` mentions, and cross-repo `owner/repo#456` refs are detected and validated against the GitHub API — valid refs are colored, invalid ones stay plain.
+- **Hover cards.** Hover a validated ref for a popover with the issue/PR title and open/closed/merged status.
+- **Autocomplete.** Type `#` to search issues and PRs, or `@` to search users, in a dropdown scoped to the repo.
+- **Ctrl+R** force-revalidates all refs (busts a stale cache).
+
+Validation is scoped to the visible viewport and cached, so scrolling a large document doesn't re-hit the API.
 
 ### GhostText Integration
 
@@ -102,90 +113,93 @@ Tab cycles through nesting states based on tree-sitter context. On a blank line 
 
 ### Code Blocks
 
-Fenced code blocks render with syntax highlighting (currently Rust). The fence lines are hidden when the cursor is outside the block, showing only the highlighted code. Move your cursor into the block to reveal the fences for editing.
+Fenced code blocks render with syntax highlighting (currently Rust and Bash). The fence line's delimiter and language name are colored distinctly, and the code is highlighted per-grammar. Move your cursor into the block to edit.
 
 ### Selection and Editing
 
-Full selection support with click, drag, shift+arrow keys, double-click to select word, and triple-click to select line. Copy, cut, and paste work as expected. Undo and redo are supported with full cursor position restoration.
+Full selection support with click, drag (with edge auto-scroll), shift+arrow keys, double-click to select word, and triple-click to select line. Vertical movement keeps a sticky goal column through short lines. Copy, cut, and paste (with normalization) work as expected, and paste is context-aware inside blockquotes and code blocks. Undo/redo coalesce runs of typing into word-granular steps, with full cursor restoration. Cursor movement, selection, and deletion operate on whole grapheme clusters (so emoji and combining marks never split).
 
 ## Library Usage
 
-writ can be embedded as a GPUI component in your own application. Add it as a dependency:
+writ is also a library: its rendering and editing layers work independently of the
+desktop app, and the network/GUI dependencies are feature-gated so a render-only
+consumer stays lean.
 
-```bash
-cargo add writ
-```
+### Headless markdown renderer
 
-### Basic Usage
-
-```rust
-use gpui::{prelude::*, Rems};
-use writ::{Editor, EditorConfig, EditorTheme};
-
-// Create with default configuration
-let editor = cx.new(|cx| Editor::new("# Hello, world!", cx));
-
-// Or with custom configuration
-let config = EditorConfig {
-    theme: EditorTheme::dracula(),
-    text_font: "Inter".to_string(),
-    code_font: "JetBrains Mono".to_string(),
-    base_path: Some("/path/to/markdown/file".into()),
-    padding_x: Rems(2.0),  // Horizontal padding
-    padding_y: Rems(1.5),  // Vertical padding (scrolls with content)
-};
-let editor = cx.new(|cx| Editor::with_config("# Hello", config, cx));
-
-// Access content
-let text = editor.read(cx).text();
-let is_dirty = editor.read(cx).is_dirty();
-
-// Modify content
-editor.update(cx, |e, cx| e.insert("new text", cx));
-editor.update(cx, |e, cx| e.set_text("replacement", cx));
-```
-
-### Streaming Support
-
-For AI chat applications that stream markdown responses token by token:
+`MarkdownView` renders markdown into a [Vello](https://github.com/linebender/vello)
+`Scene` with no window, GPU device, or editor. Feed it content up front or stream it
+in with `push_str`, then paint — useful for embedding writ's renderer elsewhere, or
+for rendering LLM output as it arrives.
 
 ```rust
-// Start streaming (blocks user input, pins cursor to end)
-editor.update(cx, |e, cx| e.begin_streaming(cx));
+use vello::Scene;
+use writ::MarkdownView;
 
-// Append tokens as they arrive
-for token in ai_response_stream {
-    editor.update(cx, |e, cx| e.append(&token, cx));
-}
+let mut view = MarkdownView::new();
+view.push_str("# Streaming\n\n");           // append incrementally (e.g. LLM tokens)
+view.push_str("More text arrives later.\n");
 
-// End streaming (restores normal editing)
-editor.update(cx, |e, cx| e.end_streaming(cx));
+let mut scene = Scene::new();
+view.render(&mut scene, 800.0, 600.0, 1.0);  // draw into the Scene
+// …then hand `scene` to a vello::Renderer to rasterize onto your own surface.
 ```
 
-### Programmatic Actions
+`writ::rasterize_scene_to_png` renders a `Scene` to a PNG headlessly — see
+`examples/streaming_markdown.rs` for an end-to-end streaming → PNG demo. The layout
+and draw internals live in the `markdown_view`, `render`, `doc_layout`, and
+`text_engine` modules.
 
-Execute editor actions programmatically:
+### Editing engine
+
+`core::Editor` (behind the `editor` feature) is a headless, renderer-free editor: a
+rope buffer, cursor/selection, tree-sitter markdown parsing, and an inline git-diff
+model, with no window or GPU dependency.
 
 ```rust
-use writ::{EditorAction, Direction};
+use std::path::Path;
+use writ::core::Editor;
 
-editor.update(cx, |e, cx| {
-    e.execute(EditorAction::Type('x'), window, cx);
-    e.execute(EditorAction::Move(Direction::Left), window, cx);
-    e.execute(EditorAction::Backspace, window, cx);
-    e.execute(EditorAction::Enter, window, cx);
-});
+// Open a file (loads content and the git-HEAD diff base)…
+let mut editor = Editor::open(Path::new("notes.md"));
+// …or start from a string.
+let mut editor = Editor::new("# Hello, world!");
+
+// Edit.
+editor.type_char('x');
+editor.enter();
+editor.backspace();
+
+// Query.
+editor.text();
+editor.cursor_position();     // cursor byte offset
+editor.selection_range();     // None if collapsed
+editor.is_dirty();
+editor.diff_state();          // inline diff vs HEAD, if any
+
+// Persist.
+editor.save().unwrap();
 ```
 
-### State Queries
+### Feature flags
 
-```rust
-editor.read(cx).cursor_position();    // Current cursor byte offset
-editor.read(cx).selection_range();    // None if collapsed, Some(Range) if selecting
-editor.read(cx).is_dirty();           // Modified since last mark_clean()
-editor.read(cx).can_undo();
-editor.read(cx).can_redo();
+`default = ["app"]` builds the full desktop editor. For library use, disable defaults
+and opt into only what you need:
+
+```toml
+# render-only: pulls in none of tokio/reqwest/gix/github/winit
+writ = { version = "0.13", default-features = false }
 ```
+
+| Feature | Adds |
+|---------|------|
+| *(base)* | `MarkdownView`, `rasterize_scene_to_png`, and all markdown parse / layout / diff rendering |
+| `git` | inline-diff base sourced from git `HEAD` (gix) |
+| `github` | GitHub ref validation + `#`/`@` autocomplete |
+| `watch` | live file-reload on external edits |
+| `editor` | the full `core::Editor` orchestration (implies `git`, `github`, `watch`) |
+| `app` *(default)* | the winit + Vello desktop application |
+| `ghosttext` | the `writd` GhostText daemon |
 
 ## Architecture
 
@@ -193,7 +207,11 @@ The buffer stores raw markdown text using ropey, a rope data structure that prov
 
 Line information is derived from the parse tree. A preorder traversal collects all nodes in document order, then for each line, binary search finds the relevant nodes and extracts markers. Each line has a list of markers representing block-level syntax elements—a task item inside a blockquote has two markers: `[Checkbox, BlockQuote]` (innermost to outermost). Each marker knows its byte range (the bytes to hide when the cursor is away), its visual substitution (e.g., `-` becomes `•`), and its continuation text for smart enter.
 
-The line component renders each line independently. It determines whether to show or hide markers based on cursor position: if the cursor is on the line, raw markdown syntax is visible for editing; otherwise, markers are hidden and substitutions are shown. For inline styles like bold or italic, the same logic applies per-span. Click handling maps visual positions back to buffer offsets by accounting for hidden characters.
+The renderer lays out each line independently with Parley. It determines whether to show or hide markers based on cursor position: if the cursor is on the line, raw markdown syntax is visible for editing; otherwise, markers are hidden and substitutions are shown. For inline styles like bold or italic, the same logic applies per-span. A per-line display↔buffer segment map translates between the laid-out *display* string (markers hidden) and *buffer* byte offsets, so cursor placement, click hit-testing, and diff highlights all stay aligned.
+
+### Viewport Virtualization
+
+Layout is virtualized: only the lines in (and just around) the viewport are fully laid out with Parley; the rest are height-estimated from a persistent per-line height cache, so building the layout is O(visible) regardless of document size or scroll depth. Scroll position is pinned to a `(line, offset)` anchor and re-pinned after every rebuild, so off-screen height corrections never shift what's on screen — first-open and deep-scroll of a large file stay fast and jitter-free.
 
 ### Incremental Parsing
 
@@ -205,7 +223,7 @@ Code blocks are highlighted using tree-sitter-highlight with language-specific g
 
 This manual extraction approach was chosen over tree-sitter's built-in injection support, which proved unreliable for our use case. Editors like Zed and Helix build their own injection handling for similar reasons. The manual approach is simpler: we find code blocks, highlight them independently, and merge the results back with buffer-relative offsets.
 
-Currently only Rust is supported, but adding new languages requires just the grammar crate and a highlights.scm query file. Highlights are cached and only recomputed after edits.
+Currently Rust and Bash are supported; adding a language requires just the grammar crate and a highlights.scm query file. Highlights are cached and only recomputed after edits.
 
 ## Known Issues
 
