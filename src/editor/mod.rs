@@ -7,6 +7,7 @@ pub use theme::EditorTheme;
 use crate::buffer::Buffer;
 use crate::cursor::{Cursor, Selection, grapheme_column, offset_at_column, prev_grapheme_boundary};
 use crate::marker::{LineMarkers, MarkerKind, OrderedMarker, UnorderedMarker};
+use crate::table::{RowKind, TableCell, TableInfo};
 
 /// Context about the line at the cursor, used by smart editing actions.
 struct LineContext {
@@ -34,6 +35,57 @@ fn ancestor_of_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_
         current = n.parent();
     }
     None
+}
+
+/// Byte indices of unescaped `|` characters in `s` (a `|` is escaped when preceded
+/// by an odd number of backslashes).
+fn unescaped_pipe_indices(s: &str) -> Vec<usize> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'|' {
+            let mut backslashes = 0;
+            let mut j = i;
+            while j > 0 && bytes[j - 1] == b'\\' {
+                backslashes += 1;
+                j -= 1;
+            }
+            if backslashes % 2 == 0 {
+                out.push(i);
+            }
+        }
+    }
+    out
+}
+
+/// Column count of a candidate pipe-header row: split the trimmed line on its
+/// unescaped pipes and drop the empty leading/trailing segments the surrounding
+/// pipes produce. `pipes` are byte indices into `trimmed`.
+fn pipe_row_ncols(trimmed: &str, pipes: &[usize]) -> usize {
+    let mut segs: Vec<&str> = Vec::with_capacity(pipes.len() + 1);
+    let mut start = 0;
+    for &p in pipes {
+        segs.push(&trimmed[start..p]);
+        start = p + 1;
+    }
+    segs.push(&trimmed[start..]);
+    if segs.first().is_some_and(|s| s.is_empty()) {
+        segs.remove(0);
+    }
+    if segs.last().is_some_and(|s| s.is_empty()) {
+        segs.pop();
+    }
+    segs.len()
+}
+
+/// Whether a trimmed line is a GFM table delimiter row (only `| - : ` chars, with
+/// at least one `-`).
+fn looks_like_delimiter_row(trimmed: &str) -> bool {
+    !trimmed.is_empty()
+        && trimmed.contains('-')
+        && trimmed
+            .chars()
+            .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
 }
 
 /// Core editing state that can be used without GPUI context.
@@ -327,6 +379,9 @@ impl EditorState {
 
     /// Tab: cycle forward through nesting states based on tree-sitter context.
     pub fn tab(&mut self) {
+        if self.table_cell_nav(true) {
+            return;
+        }
         let Some((states, current_idx, prefix_end)) = self.get_tab_cycle_state() else {
             return;
         };
@@ -922,6 +977,234 @@ impl EditorState {
         self.selection = Selection::new(new_cursor, new_cursor);
     }
 
+    /// Resolve the table (if any) whose row occupies `line_idx`, plus that line's
+    /// role in it. Mirrors `RenderSnapshot::table_row_at_line` but works off the
+    /// buffer directly so editor input can query it.
+    fn table_context_at_line(&self, line_idx: usize) -> Option<(&TableInfo, RowKind)> {
+        if line_idx >= self.buffer.line_count() {
+            return None;
+        }
+        let line_start = self.buffer.line_to_byte(line_idx);
+        let table = self
+            .buffer
+            .parsed()
+            .tables
+            .iter()
+            .find(|t| line_start >= t.block.start && line_start < t.block.end)?;
+
+        let kind = if table.header.line.contains(&line_start) {
+            RowKind::Header
+        } else if table.delimiter_line.contains(&line_start) {
+            RowKind::Delimiter
+        } else {
+            RowKind::Body(
+                table
+                    .body
+                    .iter()
+                    .position(|r| r.line.contains(&line_start))?,
+            )
+        };
+        Some((table, kind))
+    }
+
+    /// The table context at the cursor's line, cloned so callers can mutate the
+    /// buffer afterward without holding a borrow.
+    fn table_context_at_cursor(&self) -> Option<(TableInfo, RowKind)> {
+        let line_idx = self.buffer.byte_to_line(self.cursor().offset);
+        self.table_context_at_line(line_idx)
+            .map(|(t, k)| (t.clone(), k))
+    }
+
+    /// Insert a new empty body row (`|  |  |…`, `ncols` cells) after `line_idx`,
+    /// keeping any trailing newline. Returns the offset of the new row's first
+    /// cell's typing position (just after its `| `).
+    fn insert_table_row_after_line(&mut self, line_idx: usize, ncols: usize) -> usize {
+        let content_end = if line_idx + 1 < self.buffer.line_count() {
+            self.buffer.line_to_byte(line_idx + 1).saturating_sub(1)
+        } else {
+            self.buffer.len_bytes()
+        };
+        let row = format!("|{}", "  |".repeat(ncols));
+        self.set_cursor(content_end);
+        self.insert_text(&format!("\n{row}"));
+
+        // First cell typing position = new_row_start (content_end + 1) + "| " (2).
+        // Computed directly, not from a reparse: an all-empty trailing row + newline
+        // momentarily parses with an ERROR node, so the model may not see it yet.
+        content_end + 3
+    }
+
+    /// Smart-Enter table creation: on a "lone pipe-header row" (a bounded pipe row
+    /// not yet part of a table), complete it into a real GFM table by inserting a
+    /// delimiter row and one empty body row, landing the cursor in the first body
+    /// cell. Returns true if it fired.
+    pub fn maybe_create_table(&mut self) -> bool {
+        if self.cursor_in_code_block() {
+            return false;
+        }
+        let cursor = self.cursor().offset;
+        let line_idx = self.buffer.byte_to_line(cursor);
+        if line_idx >= self.buffer.line_count() {
+            return false;
+        }
+
+        // Only when the cursor sits at the end of the line.
+        if cursor != self.cursor().move_to_line_end(&self.buffer).offset {
+            return false;
+        }
+        // Not already inside a table.
+        if self.table_context_at_cursor().is_some() {
+            return false;
+        }
+
+        let line_start = self.buffer.line_to_byte(line_idx);
+        let ncols = {
+            let line_text = self.buffer.slice_cow(line_start..cursor);
+            let trimmed = line_text.trim();
+            let pipes = unescaped_pipe_indices(trimmed);
+            if pipes.is_empty() {
+                return false;
+            }
+            let ncols = pipe_row_ncols(trimmed, &pipes);
+            // Only a properly-bounded header row `| … |` triggers creation, so prose or
+            // list lines that merely contain a pipe never become tables.
+            let bounded = trimmed.starts_with('|') && trimmed.ends_with('|');
+            if ncols == 0 || !bounded {
+                return false;
+            }
+            ncols
+        };
+
+        // Don't fire if the next line is already a delimiter row.
+        if line_idx + 1 < self.buffer.line_count() {
+            let next_start = self.buffer.line_to_byte(line_idx + 1);
+            let next_end = if line_idx + 2 < self.buffer.line_count() {
+                self.buffer.line_to_byte(line_idx + 2).saturating_sub(1)
+            } else {
+                self.buffer.len_bytes()
+            };
+            let next_text = self.buffer.slice_cow(next_start..next_end);
+            if looks_like_delimiter_row(next_text.trim()) {
+                return false;
+            }
+        }
+
+        let delim = format!("|{}", " --- |".repeat(ncols));
+        let body = format!("|{}", "  |".repeat(ncols));
+        self.insert_text(&format!("\n{delim}\n{body}"));
+
+        // Land in the first body cell (just after its "| "). Computed directly from
+        // the inserted layout: header end + "\n" + delimiter + "\n" + "| ".
+        let body_start = cursor + 1 + delim.len() + 1;
+        self.set_cursor(body_start + 2);
+        true
+    }
+
+    /// Cell navigation for Tab/Shift+Tab when the cursor is inside a table.
+    /// Returns false (letting the caller fall back to list cycling) when not in a
+    /// table. Forward: next cell → next row's first cell → append a new row at the
+    /// last cell of the last row. Backward: previous cell → previous row's last
+    /// cell; the header's first cell is a no-op.
+    fn table_cell_nav(&mut self, forward: bool) -> bool {
+        let cursor = self.cursor().offset;
+        let Some((table, kind)) = self.table_context_at_cursor() else {
+            return false;
+        };
+
+        let nrows = 1 + table.body.len();
+        let cells_of = |row_pos: usize| -> &Vec<TableCell> {
+            if row_pos == 0 {
+                &table.header.cells
+            } else {
+                &table.body[row_pos - 1].cells
+            }
+        };
+
+        let row_pos = match kind {
+            RowKind::Header => Some(0),
+            RowKind::Body(i) => Some(i + 1),
+            RowKind::Delimiter => None,
+        };
+
+        // Some(offset) → move there; None → append a new row.
+        let target: Option<usize> = match row_pos {
+            None => {
+                if forward {
+                    // Delimiter row: forward goes to the first body cell (None → append).
+                    table
+                        .body
+                        .first()
+                        .and_then(|r| r.cells.first())
+                        .map(|c| c.content.start)
+                } else {
+                    Some(
+                        table
+                            .header
+                            .cells
+                            .last()
+                            .map_or(cursor, |c| c.content.start),
+                    )
+                }
+            }
+            Some(row_pos) => {
+                let cells = cells_of(row_pos);
+                let cell_idx = cells
+                    .iter()
+                    .position(|c| c.content.end >= cursor)
+                    .unwrap_or(cells.len().saturating_sub(1));
+                if forward {
+                    if cell_idx + 1 < cells.len() {
+                        Some(cells[cell_idx + 1].content.start)
+                    } else if row_pos + 1 < nrows {
+                        cells_of(row_pos + 1).first().map(|c| c.content.start)
+                    } else {
+                        None
+                    }
+                } else if cell_idx > 0 {
+                    Some(cells[cell_idx - 1].content.start)
+                } else if row_pos > 0 {
+                    cells_of(row_pos - 1).last().map(|c| c.content.start)
+                } else {
+                    Some(cursor)
+                }
+            }
+        };
+
+        match target {
+            Some(off) => self.set_cursor(off),
+            None => {
+                let anchor = table
+                    .body
+                    .last()
+                    .map(|r| r.line.start)
+                    .unwrap_or(table.delimiter_line.start);
+                let anchor_line = self.buffer.byte_to_line(anchor);
+                let off = self.insert_table_row_after_line(anchor_line, table.ncols);
+                self.set_cursor(off);
+            }
+        }
+        true
+    }
+
+    /// Shift+Enter inside a table: add an empty body row below the current one
+    /// (header/delimiter rows insert as the first body row) and land in its first
+    /// cell. Returns true if it fired.
+    fn maybe_add_table_row(&mut self) -> bool {
+        let line_idx = self.buffer.byte_to_line(self.cursor().offset);
+        let Some((table, kind)) = self.table_context_at_cursor() else {
+            return false;
+        };
+        let anchor_line = match kind {
+            RowKind::Body(_) => line_idx,
+            RowKind::Header | RowKind::Delimiter => {
+                self.buffer.byte_to_line(table.delimiter_line.start)
+            }
+        };
+        let off = self.insert_table_row_after_line(anchor_line, table.ncols);
+        self.set_cursor(off);
+        true
+    }
+
     /// Smart enter: creates paragraph break or exits container on empty line.
     /// Enter: just insert a raw newline. No magic.
     pub fn enter(&mut self) {
@@ -931,6 +1214,12 @@ impl EditorState {
     /// Shift+Enter: continue container (add markers from current line).
     /// In code blocks, copies leading whitespace for indentation.
     pub fn shift_enter(&mut self) {
+        if self.maybe_create_table() {
+            return;
+        }
+        if self.maybe_add_table_row() {
+            return;
+        }
         // In code blocks, copy leading whitespace from current line
         if self.cursor_in_code_block() {
             let indent = self.current_line_leading_whitespace();
@@ -1003,6 +1292,9 @@ impl EditorState {
 
     /// Shift+Tab: cycle backward through nesting states.
     pub fn shift_tab(&mut self) {
+        if self.table_cell_nav(false) {
+            return;
+        }
         self.shift_tab_cycle();
     }
 
@@ -2306,6 +2598,159 @@ mod tests {
 
             state.tab();
             assert_editor_eq(&state, "- [ ] hey\n\n|");
+        }
+    }
+
+    mod table_editing_tests {
+        use super::*;
+
+        /// 2-col table with cell content offsets:
+        /// header cells "a"@2, "b"@6; body[0] "1"@26, "2"@30.
+        const TABLE_2X1: &str = "| a | b |\n| --- | --- |\n| 1 | 2 |\n";
+
+        // --- Stage 5: creation via smart Enter ---
+
+        #[test]
+        fn enter_inserts_raw_newline_never_creates_table() {
+            // Plain Enter is "no magic" — table creation is Shift+Enter only.
+            let mut state = EditorState::new("| a | b |");
+            state.set_cursor(9); // end of line
+            state.enter();
+            assert_eq!(state.text(), "| a | b |\n");
+        }
+
+        #[test]
+        fn shift_enter_completes_lone_pipe_header_into_table() {
+            let mut state = EditorState::new("| a | b |");
+            state.set_cursor(9);
+            state.shift_enter();
+            assert_eq!(state.text(), "| a | b |\n| --- | --- |\n|  |  |");
+            assert_eq!(state.cursor().offset, 26);
+        }
+
+        #[test]
+        fn create_rejects_unbounded_pipe_row() {
+            // Not bounded by leading + trailing pipes → not treated as a table header.
+            let mut state = EditorState::new("a | b");
+            state.set_cursor(5);
+            assert!(!state.maybe_create_table());
+            assert_eq!(state.text(), "a | b");
+        }
+
+        #[test]
+        fn create_does_nothing_on_existing_table_row() {
+            // Header row already followed by a delimiter (a real table).
+            let mut state = EditorState::new("| a | b |\n| --- | --- |\n");
+            state.set_cursor(9);
+            assert!(!state.maybe_create_table());
+            assert_eq!(state.text(), "| a | b |\n| --- | --- |\n");
+        }
+
+        #[test]
+        fn create_does_nothing_inside_code_block() {
+            let mut state = EditorState::new("```\n| a | b |\n```\n");
+            state.set_cursor(13); // end of "| a | b |"
+            assert!(!state.maybe_create_table());
+            assert_eq!(state.text(), "```\n| a | b |\n```\n");
+        }
+
+        #[test]
+        fn create_does_nothing_on_plain_paragraph() {
+            let mut state = EditorState::new("hello world");
+            state.set_cursor(11);
+            assert!(!state.maybe_create_table());
+            assert_eq!(state.text(), "hello world");
+        }
+
+        #[test]
+        fn create_does_nothing_when_cursor_not_at_line_end() {
+            let mut state = EditorState::new("| a | b |");
+            state.set_cursor(4); // middle of the line
+            assert!(!state.maybe_create_table());
+            assert_eq!(state.text(), "| a | b |");
+        }
+
+        // --- Stage 6: cell navigation via Tab / Shift+Tab ---
+
+        #[test]
+        fn tab_moves_to_next_cell_in_row() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(2); // header cell (0,0), before "a"
+            state.tab();
+            assert_eq!(state.cursor().offset, 6); // header cell (0,1), before "b"
+        }
+
+        #[test]
+        fn tab_at_row_end_moves_to_next_row_first_cell() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(6); // header last cell
+            state.tab();
+            assert_eq!(state.cursor().offset, 26); // body[0] first cell, before "1"
+        }
+
+        #[test]
+        fn tab_on_last_cell_of_last_row_creates_new_row() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(30); // body[0] last cell, before "2"
+            state.tab();
+            assert_eq!(
+                state.text(),
+                "| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |\n"
+            );
+            assert_eq!(state.cursor().offset, 36); // new row first empty cell
+        }
+
+        #[test]
+        fn shift_tab_moves_to_previous_cell() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(6); // header cell (0,1)
+            state.shift_tab();
+            assert_eq!(state.cursor().offset, 2); // header cell (0,0)
+        }
+
+        #[test]
+        fn shift_tab_at_row_start_moves_to_previous_row_last_cell() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(26); // body[0] first cell
+            state.shift_tab();
+            assert_eq!(state.cursor().offset, 6); // header last cell
+        }
+
+        #[test]
+        fn shift_tab_on_header_first_cell_is_noop() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(2);
+            state.shift_tab();
+            assert_eq!(state.cursor().offset, 2);
+            assert_eq!(state.text(), TABLE_2X1);
+        }
+
+        #[test]
+        fn shift_enter_in_table_adds_matched_row() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(26); // inside body[0]
+            state.shift_enter();
+            assert_eq!(
+                state.text(),
+                "| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |\n"
+            );
+            assert_eq!(state.cursor().offset, 36);
+        }
+
+        // --- Regressions: not in a table ---
+
+        #[test]
+        fn tab_outside_table_still_cycles_list() {
+            let mut state = editor_with_cursor("- item\n|");
+            state.tab();
+            assert_editor_eq(&state, "- item\n- |");
+        }
+
+        #[test]
+        fn shift_enter_outside_table_still_continues_list() {
+            let mut state = editor_with_cursor("- item one|");
+            state.shift_enter();
+            assert_editor_eq(&state, "- item one\n- |");
         }
     }
 
