@@ -44,7 +44,7 @@ use crate::consts::{CARET_WIDTH, FONT_SIZE, LINE_HEIGHT, PADDING, STATUS_BAR_H, 
 use crate::core::{AutocompleteSuggestion, AutocompleteTrigger, Editor};
 use crate::doc_layout::{
     DocLayout, GithubRenderData, HeightCache, LayoutParams, LineCache, PreeditView, RenderCache,
-    ScreenRect,
+    ScreenRect, TableCache,
 };
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
@@ -262,6 +262,7 @@ struct DocEngine {
     line_cache: LineCache,
     render_cache: RenderCache,
     height_cache: HeightCache,
+    table_cache: TableCache,
     theme: EditorTheme,
     editor: Editor,
     doc: Option<DocLayout>,
@@ -349,6 +350,7 @@ impl App {
                 line_cache: LineCache::new(),
                 render_cache: RenderCache::new(),
                 height_cache: HeightCache::new(),
+                table_cache: TableCache::new(),
                 theme: EditorTheme::dracula(),
                 editor,
                 doc: None,
@@ -856,6 +858,7 @@ impl DocEngine {
             &mut self.line_cache,
             &mut self.render_cache,
             &mut self.height_cache,
+            &mut self.table_cache,
             version,
             &snapshot,
             &self.theme,
@@ -1015,6 +1018,7 @@ fn paint_document(
     doc.draw_blockquote_gutters(scene, editor_h);
     doc.draw_horizontal_rules(scene, editor_h);
     doc.draw_images(engine, scene, editor_h);
+    doc.draw_tables(engine, scene, editor_h);
     if let Some(sel) = editor.selection_range() {
         let color = peniko_color(theme.selection);
         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
@@ -1901,6 +1905,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         line_cache: LineCache::new(),
         render_cache: RenderCache::new(),
         height_cache: HeightCache::new(),
+        table_cache: TableCache::new(),
         theme: EditorTheme::dracula(),
         editor,
         doc: None,
