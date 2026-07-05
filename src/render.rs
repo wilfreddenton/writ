@@ -168,8 +168,15 @@ pub fn build_line_render(
     // Grid table row: the cursor is off the whole table block, so this line hides its
     // raw pipe text and the draw path paints the cell grid. While the cursor is inside
     // the block, `table_ref` stays `None` and the line renders as ordinary text (reveal).
+    // Membership is line-based (the cursor's line start), matching the editor's
+    // `table_context_at_line`, so a caret at a row's left edge or at the last row's end —
+    // where `offset == block.end` for a table ending at EOF with no trailing newline —
+    // still counts as inside the block and reveals.
+    let cursor_line_start = snapshot
+        .line_byte_range(rope.byte_to_line(cursor_offset.min(rope.len_bytes())))
+        .start;
     let table_ref = table_ctx.as_ref().and_then(|tc| {
-        (!tc.block.contains(&cursor_offset)).then_some(TableLineRef {
+        (!tc.block.contains(&cursor_line_start)).then_some(TableLineRef {
             table_start: tc.block.start,
             kind: tc.kind,
         })
@@ -830,6 +837,40 @@ mod tests {
         let on = build_line_render(&snap, 0, &theme, 18.0, 2, &styles[0], &[], Some(ctx));
         assert!(on.table.is_none(), "cursor in block reveals raw text");
         assert_eq!(on.text, "| a | b |");
+    }
+
+    /// A caret at the end of the last row of a table that ends at EOF with no trailing
+    /// newline (`offset == block.end`) still counts as inside the block, so the last row
+    /// reveals its raw text rather than staying a hidden grid row. Line-based membership.
+    #[test]
+    fn table_reveals_at_last_row_end_without_trailing_newline() {
+        let theme = EditorTheme::dracula();
+        let mut buf: Buffer = "| a | b |\n|---|---|\n| 1 | 2 |".parse().unwrap();
+        let snap = buf.render_snapshot();
+        let styles = snap.inline_styles_by_line();
+        let last = snap.line_count() - 1;
+        let (table, kind) = snap.table_row_at_line(last).unwrap();
+        let eof = snap.rope.len_bytes();
+        assert_eq!(eof, table.block.end, "table block ends at EOF");
+        let ctx = TableCtx {
+            block: table.block.clone(),
+            kind,
+        };
+        let lr = build_line_render(
+            &snap,
+            last,
+            &theme,
+            18.0,
+            eof,
+            &styles[last],
+            &[],
+            Some(ctx),
+        );
+        assert!(
+            lr.table.is_none(),
+            "caret at block.end reveals the last row"
+        );
+        assert_eq!(lr.text, "| 1 | 2 |");
     }
 
     /// `build_cell_render` styles a cell's inline content off-cursor: `**bold**` hides

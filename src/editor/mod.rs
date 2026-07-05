@@ -1100,6 +1100,25 @@ impl EditorState {
         true
     }
 
+    /// Caret landing offset for entering `cell` via Tab/Shift+Tab: the first content
+    /// char for a non-empty cell, or a spot one space in past the opening `|` for an
+    /// empty cell. An empty cell's trimmed content range collapses onto the closing-pipe
+    /// boundary, so landing at `content.start` would sit the caret on that pipe; instead
+    /// walk back to the opening `|` and land strictly between the two pipes.
+    fn table_cell_landing(&self, cell: &TableCell) -> usize {
+        if cell.content.start < cell.content.end {
+            return cell.content.start;
+        }
+        let closing = cell.content.start;
+        let mut open = closing;
+        while open > 0 && self.buffer.byte_at(open - 1) != Some(b'|') {
+            open -= 1;
+        }
+        // `open` is now just past the opening `|` (or 0 if none found); keep the caret
+        // inside the cell (below the closing pipe, at or past the opening one).
+        (open + 1).min(closing.saturating_sub(1)).max(open)
+    }
+
     /// Cell navigation for Tab/Shift+Tab when the cursor is inside a table.
     /// Returns false (letting the caller fall back to list cycling) when not in a
     /// table. Forward: next cell → next row's first cell → append a new row at the
@@ -1135,14 +1154,14 @@ impl EditorState {
                         .body
                         .first()
                         .and_then(|r| r.cells.first())
-                        .map(|c| c.content.start)
+                        .map(|c| self.table_cell_landing(c))
                 } else {
                     Some(
                         table
                             .header
                             .cells
                             .last()
-                            .map_or(cursor, |c| c.content.start),
+                            .map_or(cursor, |c| self.table_cell_landing(c)),
                     )
                 }
             }
@@ -1154,16 +1173,20 @@ impl EditorState {
                     .unwrap_or(cells.len().saturating_sub(1));
                 if forward {
                     if cell_idx + 1 < cells.len() {
-                        Some(cells[cell_idx + 1].content.start)
+                        Some(self.table_cell_landing(&cells[cell_idx + 1]))
                     } else if row_pos + 1 < nrows {
-                        cells_of(row_pos + 1).first().map(|c| c.content.start)
+                        cells_of(row_pos + 1)
+                            .first()
+                            .map(|c| self.table_cell_landing(c))
                     } else {
                         None
                     }
                 } else if cell_idx > 0 {
-                    Some(cells[cell_idx - 1].content.start)
+                    Some(self.table_cell_landing(&cells[cell_idx - 1]))
                 } else if row_pos > 0 {
-                    cells_of(row_pos - 1).last().map(|c| c.content.start)
+                    cells_of(row_pos - 1)
+                        .last()
+                        .map(|c| self.table_cell_landing(c))
                 } else {
                     Some(cursor)
                 }
@@ -2735,6 +2758,91 @@ mod tests {
                 "| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |\n"
             );
             assert_eq!(state.cursor().offset, 36);
+        }
+
+        // --- Issue 2: Tab lands on cell content, never on a pipe ---
+
+        #[test]
+        fn tab_lands_on_content_char_in_nonempty_cell() {
+            // "| ab | cd |": cell (0,1) content "cd" starts at byte 7 ('c').
+            let mut state = EditorState::new("| ab | cd |\n| --- | --- |\n");
+            state.set_cursor(2); // cell (0,0), before "ab"
+            state.tab();
+            assert_eq!(state.cursor().offset, 7);
+            assert_eq!(state.buffer.byte_at(7), Some(b'c'));
+        }
+
+        #[test]
+        fn tab_into_empty_cell_lands_between_pipes() {
+            // Body row "|  |  |" starts at byte 24: pipes at 24, 27, 30.
+            let mut state = EditorState::new("| a | b |\n| --- | --- |\n|  |  |\n");
+            state.set_cursor(6); // header cell (0,1) → Tab → empty body[0] cell 0
+            state.tab();
+            let off = state.cursor().offset;
+            assert!(off > 24 && off < 27, "strictly between the cell's pipes");
+            assert_ne!(state.buffer.byte_at(off), Some(b'|'), "not on a pipe");
+        }
+
+        #[test]
+        fn tab_through_freshly_created_empty_row_never_on_pipe() {
+            // Every empty cell reached by tabbing must sit the caret off a pipe.
+            let mut state = EditorState::new("| a | b |");
+            state.set_cursor(9);
+            state.shift_enter(); // create table, land in body cell 0
+            for _ in 0..2 {
+                let off = state.cursor().offset;
+                assert_ne!(
+                    state.buffer.byte_at(off),
+                    Some(b'|'),
+                    "caret never on a pipe"
+                );
+                state.tab();
+            }
+        }
+
+        // --- Issue 3: vertical movement into/through a table; left edge counts ---
+
+        #[test]
+        fn move_down_from_paragraph_enters_table_block() {
+            let mut state =
+                EditorState::new("para\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nafter\n");
+            state.set_cursor(0); // paragraph above the table
+            state.move_down();
+            let (table, _) = state
+                .table_context_at_cursor()
+                .expect("cursor is in the table after move_down");
+            assert!(
+                table.block.contains(&state.cursor().offset),
+                "cursor offset is within the table block"
+            );
+        }
+
+        #[test]
+        fn move_down_passes_through_every_table_row() {
+            let mut state =
+                EditorState::new("para\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nafter\n");
+            state.set_cursor(0);
+            let mut in_table_lines = 0;
+            for _ in 0..5 {
+                state.move_down();
+                if state.table_context_at_cursor().is_some() {
+                    in_table_lines += 1;
+                }
+            }
+            // header + delimiter + one body row are all passed through, in-block.
+            assert_eq!(in_table_lines, 3, "caret lands on each table row in turn");
+        }
+
+        #[test]
+        fn cursor_at_first_table_line_start_is_in_table() {
+            let mut state =
+                EditorState::new("para\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nafter\n");
+            let start = state.buffer.line_to_byte(1); // first table line (header), column 0
+            state.set_cursor(start);
+            assert!(
+                state.table_context_at_cursor().is_some(),
+                "the left edge / line start of a table row counts as in-table"
+            );
         }
 
         // --- Regressions: not in a table ---

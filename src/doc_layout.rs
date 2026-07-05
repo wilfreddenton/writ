@@ -13,6 +13,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use parley::{Affinity, Cluster, Cursor, PositionedLayoutItem};
+use ropey::Rope;
 use vello::Scene;
 use vello::kurbo::{Affine, Rect, Stroke};
 use vello::peniko::{Brush, Color, Fill, ImageBrush};
@@ -207,14 +208,44 @@ pub type RenderCache = SweptCache<Rc<LineRender>>;
 /// scroll positions of already-seen regions drifting.
 pub type HeightCache = SweptCache<f32>;
 
-/// One shaped, wrapped table cell (`None` for a ragged/missing cell), and a full grid
-/// of them (rows × columns).
-type CellLayout = Option<Rc<parley::Layout<Brush>>>;
+/// One shaped, wrapped table cell: its layout (drawing) plus the display↔buffer
+/// `SegmentMap` and empty-cell caret landing, both used to hit-test a click inside the
+/// cell. `None` for a ragged/missing cell.
+struct CellSlot {
+    layout: Rc<parley::Layout<Brush>>,
+    map: SegmentMap,
+    /// For an empty cell, the caret offset just inside the opening pipe (so a click lands
+    /// off the pipe); `None` for a non-empty cell, which hit-tests via `layout`/`map`.
+    empty_landing: Option<usize>,
+}
+type CellLayout = Option<CellSlot>;
 type GridLayouts = Vec<Vec<CellLayout>>;
-/// One measured table cell's display text + style runs (`None` for a missing cell), and
-/// a full grid of them, built by the column pre-pass before shaping to width.
-type CellData = Option<(String, Vec<StyleRun>)>;
+/// One measured table cell (`None` for a missing cell): display text + style runs, the
+/// cell's `SegmentMap`, and its empty-cell landing — carried from the column pre-pass to
+/// the shaping pass. A full grid of them.
+struct MeasuredCell {
+    text: String,
+    runs: Vec<StyleRun>,
+    map: SegmentMap,
+    empty_landing: Option<usize>,
+}
+type CellData = Option<MeasuredCell>;
 type GridCells = Vec<Vec<CellData>>;
+
+/// Caret landing for a click on a table cell: its content start for a non-empty cell,
+/// else a spot one space in past the opening `|` (a trimmed-empty cell's content range
+/// collapses onto the closing-pipe boundary, so `content.start` would sit on that pipe).
+fn cell_caret_landing(rope: &Rope, content: &Range<usize>) -> usize {
+    if content.start < content.end {
+        return content.start;
+    }
+    let closing = content.start;
+    let mut open = closing;
+    while open > 0 && rope.get_byte(open - 1) != Some(b'|') {
+        open -= 1;
+    }
+    (open + 1).min(closing.saturating_sub(1)).max(open)
+}
 
 /// A grid-rendered table's geometry + shaped cells, cached once per edit and shared
 /// (via `Rc`) by every row of the table. `col_x`/`col_w` are device px from the line
@@ -229,10 +260,10 @@ pub struct TableLayout {
     aligns: Vec<Align>,
     /// Header then body row heights (device px), including vertical cell padding.
     row_heights: Vec<f32>,
-    /// The thin delimiter-row band height (device px) — just the header separator rule.
+    /// Grid height (device px) of the delimiter buffer-line. Zero: the delimiter row is
+    /// not drawn in grid mode (the header's background fill already sets it apart), so the
+    /// header sits directly above the first body row with no gap.
     delim_height: f32,
-    /// Total table width (device px, from the line origin) including borders + padding.
-    total_w: f32,
     /// Shaped cell layouts, parallel to `row_heights` rows × columns.
     row_layouts: GridLayouts,
 }
@@ -254,6 +285,44 @@ impl TableLayout {
             Some(r) => self.row_heights.get(r).copied().unwrap_or(0.0),
             None => self.delim_height,
         }
+    }
+
+    /// Map a click at cell-local X `lx` (device px from the line origin, i.e.
+    /// `click_x - pad_x`) on the grid row playing `kind` to a buffer offset inside the
+    /// clicked cell. Picks the column by `col_x` boundaries (clamping to the grid on
+    /// either side), then hit-tests within the cell's own layout → display offset →
+    /// buffer offset via its `SegmentMap`; an empty cell lands just inside its opening
+    /// pipe. Returns `None` for the (zero-height, caret-free) delimiter row.
+    fn hit_test(&self, kind: RowKind, lx: f32, cell_pad_x: f32) -> Option<usize> {
+        let row_idx = Self::row_index(kind)?;
+        let row = self.row_layouts.get(row_idx)?;
+        let cols = self.col_x.len();
+        if cols == 0 {
+            return None;
+        }
+        let mut col = self
+            .col_x
+            .partition_point(|&cx| cx <= lx)
+            .saturating_sub(1)
+            .min(cols - 1);
+        // Ragged row: clamp down to the last cell actually present in this row.
+        while col > 0 && row.get(col).map(|c| c.is_none()).unwrap_or(true) {
+            col -= 1;
+        }
+        let slot = row.get(col)?.as_ref()?;
+        if let Some(landing) = slot.empty_landing {
+            return Some(landing);
+        }
+        let align = self.aligns.get(col).copied().unwrap_or(Align::Left);
+        let extra = (self.col_w[col] - slot.layout.width()).max(0.0);
+        let shift = match align {
+            Align::Left => 0.0,
+            Align::Right => extra,
+            Align::Center => extra / 2.0,
+        };
+        let local_x = (lx - (self.col_x[col] + cell_pad_x + shift)).max(0.0);
+        let display_off = Cursor::from_point(&slot.layout, local_x, 0.0).index();
+        Some(slot.map.display_to_buffer(display_off))
     }
 }
 
@@ -345,7 +414,7 @@ fn build_table_layout(
         for c in 0..ncols {
             match row.cells.get(c) {
                 Some(cell) => {
-                    let (text, mut runs, _map) =
+                    let (text, mut runs, map) =
                         build_cell_render(snapshot, theme, cell.content.clone(), styles);
                     if is_header && !text.is_empty() {
                         // Bold the whole header cell; content color runs still win their spans.
@@ -357,7 +426,14 @@ fn build_table_layout(
                         .build_line(&text, scale, base_font_size, line_height, fg, None, &runs)
                         .width();
                     natural[c] = natural[c].max(w);
-                    rowdata.push(Some((text, runs)));
+                    let empty_landing = (cell.content.start >= cell.content.end)
+                        .then(|| cell_caret_landing(&snapshot.rope, &cell.content));
+                    rowdata.push(Some(MeasuredCell {
+                        text,
+                        runs,
+                        map,
+                        empty_landing,
+                    }));
                 }
                 None => rowdata.push(None),
             }
@@ -379,35 +455,43 @@ fn build_table_layout(
         }
     }
 
-    // Column x-origins (prefix sum of box widths + border) and the total table width.
+    // Column x-origins (prefix sum of box widths + border).
     let mut col_x = Vec::with_capacity(ncols);
     let mut x = border;
     for &w in &col_w {
         col_x.push(x);
         x += w + 2.0 * cell_pad_x + border;
     }
-    let total_w = x;
 
     // Re-lay each cell wrapped to its column width, tracking the tallest cell per row.
     let mut row_layouts: GridLayouts = Vec::with_capacity(rows.len());
     let mut row_heights = Vec::with_capacity(rows.len());
-    for rowdata in &grid {
+    for rowdata in grid {
         let mut layouts = Vec::with_capacity(ncols);
         let mut max_h = 0f32;
-        for (c, cell) in rowdata.iter().enumerate() {
+        for (c, cell) in rowdata.into_iter().enumerate() {
             match cell {
-                Some((text, runs)) => {
+                Some(MeasuredCell {
+                    text,
+                    runs,
+                    map,
+                    empty_landing,
+                }) => {
                     let layout = Rc::new(engine.build_line(
-                        text,
+                        &text,
                         scale,
                         base_font_size,
                         line_height,
                         fg,
                         Some(col_w[c].max(1.0)),
-                        runs,
+                        &runs,
                     ));
                     max_h = max_h.max(layout.height());
-                    layouts.push(Some(layout));
+                    layouts.push(Some(CellSlot {
+                        layout,
+                        map,
+                        empty_landing,
+                    }));
                 }
                 None => layouts.push(None),
             }
@@ -425,8 +509,7 @@ fn build_table_layout(
         col_w,
         aligns: table.aligns.clone(),
         row_heights,
-        delim_height: 2.0 * cell_pad_y,
-        total_w,
+        delim_height: 0.0,
         row_layouts,
     }
 }
@@ -898,6 +981,9 @@ impl DocLayout {
         let cursor_line = snapshot
             .rope
             .byte_to_line(cursor_offset.min(snapshot.rope.len_bytes()));
+        // Line-based table membership (start of the cursor's line), matching
+        // `build_line_render`'s reveal predicate so cache keys agree at row edges.
+        let cursor_line_start = snapshot.line_byte_range(cursor_line).start;
         // Shared placeholders for estimated (un-laid-out) lines. They're never drawn or
         // cursor-queried (only visible lines are, and those are always materialized), so
         // an empty layout / identity render is safe; `Rc::clone` keeps it O(1).
@@ -959,7 +1045,7 @@ impl DocLayout {
                 .filter(|(t, _)| table_grid_ok(t))
             {
                 Some((t, _)) => {
-                    if !t.block.contains(&cursor_offset) {
+                    if !t.block.contains(&cursor_line_start) {
                         usize::MAX
                     } else if onkey != usize::MAX {
                         onkey
@@ -1404,6 +1490,13 @@ impl DocLayout {
         let layout = &self.layouts[line];
         let lx = (x - self.pad_x).max(0.0);
         let ly = (cy - real_top).max(0.0);
+        // Grid table row: its own text layout is empty (hidden), so hit-test the clicked
+        // cell within the shared TableLayout instead of collapsing to the line start.
+        if let Some((tl, kind)) = &self.table_lines[line]
+            && let Some(off) = tl.hit_test(*kind, lx, self.table_cell_pad_x)
+        {
+            return Some(off);
+        }
         let display_off = Cursor::from_point(layout, lx, ly).index();
         Some(self.renders[line].map.display_to_buffer(display_off))
     }
@@ -1684,9 +1777,10 @@ impl DocLayout {
     }
 
     /// Paint grid-table rows: per-cell background + border rects and the shaped cell
-    /// glyphs, plus the header-separator rule on the delimiter line. Call BEFORE `draw`
-    /// (a grid row's own text layout is empty, so no glyphs collide). Cell layouts are
-    /// held in the shared `TableLayout`, so this is pure drawing — no shaping.
+    /// glyphs. The header row's distinct background fill separates it from the body, so no
+    /// delimiter rule is drawn (the delimiter line has zero grid height). Call BEFORE
+    /// `draw` (a grid row's own text layout is empty, so no glyphs collide). Cell layouts
+    /// are held in the shared `TableLayout`, so this is pure drawing — no shaping.
     pub fn draw_tables(&self, engine: &TextEngine, scene: &mut Scene, viewport_h: f32) {
         let (first, last) = self.visible_range(viewport_h);
         let pad_x = self.pad_x as f64;
@@ -1697,64 +1791,44 @@ impl DocLayout {
             let Some((tl, kind)) = &self.table_lines[i] else {
                 continue;
             };
+            // The delimiter row is not drawn: it takes zero grid height, so the header
+            // (distinguished by its background fill) sits directly on the first body row.
+            let Some(row_idx) = TableLayout::row_index(*kind) else {
+                continue;
+            };
             let top = (self.real_top(i) - self.scroll_y) as f64;
             let bottom = (self.tops[i + 1] - self.scroll_y) as f64;
-            match kind {
-                RowKind::Delimiter => {
-                    // The `|---|` row renders as a single header-separator rule, centered
-                    // in its thin band.
-                    let mid = (top + bottom) / 2.0;
-                    scene.fill(
-                        Fill::NonZero,
-                        Affine::IDENTITY,
-                        self.table_border_color,
-                        None,
-                        &Rect::new(
-                            pad_x,
-                            mid - border / 2.0,
-                            pad_x + tl.total_w as f64,
-                            mid + border / 2.0,
-                        ),
-                    );
-                }
-                _ => {
-                    let Some(row_idx) = TableLayout::row_index(*kind) else {
-                        continue;
+            let is_header = matches!(kind, RowKind::Header);
+            let bg = if is_header {
+                self.table_header_bg
+            } else {
+                self.table_bg
+            };
+            for c in 0..tl.col_x.len() {
+                let cx = pad_x + tl.col_x[c] as f64;
+                let box_w = (tl.col_w[c] + 2.0 * cell_pad_x) as f64;
+                let rect = Rect::new(cx, top, cx + box_w, bottom);
+                scene.fill(Fill::NonZero, Affine::IDENTITY, bg, None, &rect);
+                scene.stroke(
+                    &Stroke::new(border),
+                    Affine::IDENTITY,
+                    self.table_border_color,
+                    None,
+                    &rect,
+                );
+                // Cell glyphs, aligned within the column's content width.
+                if let Some(Some(slot)) = tl.row_layouts.get(row_idx).and_then(|r| r.get(c)) {
+                    let layout = &slot.layout;
+                    let align = tl.aligns.get(c).copied().unwrap_or(Align::Left);
+                    let extra = (tl.col_w[c] - layout.width()).max(0.0);
+                    let shift = match align {
+                        Align::Left => 0.0,
+                        Align::Right => extra,
+                        Align::Center => extra / 2.0,
                     };
-                    let is_header = matches!(kind, RowKind::Header);
-                    let bg = if is_header {
-                        self.table_header_bg
-                    } else {
-                        self.table_bg
-                    };
-                    for c in 0..tl.col_x.len() {
-                        let cx = pad_x + tl.col_x[c] as f64;
-                        let box_w = (tl.col_w[c] + 2.0 * cell_pad_x) as f64;
-                        let rect = Rect::new(cx, top, cx + box_w, bottom);
-                        scene.fill(Fill::NonZero, Affine::IDENTITY, bg, None, &rect);
-                        scene.stroke(
-                            &Stroke::new(border),
-                            Affine::IDENTITY,
-                            self.table_border_color,
-                            None,
-                            &rect,
-                        );
-                        // Cell glyphs, aligned within the column's content width.
-                        if let Some(Some(layout)) =
-                            tl.row_layouts.get(row_idx).and_then(|r| r.get(c))
-                        {
-                            let align = tl.aligns.get(c).copied().unwrap_or(Align::Left);
-                            let extra = (tl.col_w[c] - layout.width()).max(0.0);
-                            let shift = match align {
-                                Align::Left => 0.0,
-                                Align::Right => extra,
-                                Align::Center => extra / 2.0,
-                            };
-                            let gx = cx as f32 + cell_pad_x + shift;
-                            let gy = top as f32 + cell_pad_y;
-                            engine.draw_line(scene, layout, (gx, gy));
-                        }
-                    }
+                    let gx = cx as f32 + cell_pad_x + shift;
+                    let gy = top as f32 + cell_pad_y;
+                    engine.draw_line(scene, layout, (gx, gy));
                 }
             }
         }
@@ -2543,10 +2617,15 @@ mod tests {
             "the long cell's column is wider: {:?}",
             tl.col_w
         );
+        // Right edge of the last column's box (col origin + content width + cell padding
+        // + trailing border) must fit the content width.
+        let cell_pad_x = TABLE_CELL_PAD_X * params.scale;
+        let border = TABLE_BORDER * params.scale;
+        let total_w =
+            tl.col_x.last().unwrap() + tl.col_w.last().unwrap() + 2.0 * cell_pad_x + border;
         assert!(
-            tl.total_w <= max_advance + 0.5,
-            "grid fits the content width, total_w={}",
-            tl.total_w
+            total_w <= max_advance + 0.5,
+            "grid fits the content width, total_w={total_w}"
         );
         // Header + two body rows → three row heights, all positive.
         assert_eq!(tl.row_heights.len(), 3);
@@ -2694,5 +2773,134 @@ mod tests {
             );
             assert!(on.table_lines[line].is_none());
         }
+    }
+
+    /// Build a whole-document layout with the cursor off the table (grid mode).
+    fn build_grid_doc(engine: &mut TextEngine, snap: &RenderSnapshot, cursor: usize) -> DocLayout {
+        let theme = EditorTheme::dracula();
+        let params = test_params(&theme, 1200.0);
+        DocLayout::build(
+            engine,
+            &mut LineCache::new(),
+            &mut RenderCache::new(),
+            &mut HeightCache::new(),
+            &mut TableCache::new(),
+            0,
+            snap,
+            &theme,
+            None,
+            None,
+            &ImageCache::new(),
+            cursor,
+            &params,
+            None,
+            0,
+            f32::INFINITY,
+        )
+    }
+
+    /// Clicking a grid table row lands the caret inside the clicked cell (character-level
+    /// via the cell's own layout + map), not at the line start / column 0.
+    #[test]
+    fn hit_test_lands_inside_clicked_table_cell() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        // Leading paragraph so the table isn't at offset 0; cursor 0 keeps it grid mode.
+        let src = "para\n\n| aa | bb | cc |\n| --- | --- | --- |\n| 11 | 22 | 33 |\n";
+        let mut buf: Buffer = src.parse().unwrap();
+        let snap = buf.render_snapshot();
+        let doc = build_grid_doc(&mut engine, &snap, 0);
+
+        let body_line = 4;
+        let (tl, kind) = doc.table_lines[body_line]
+            .as_ref()
+            .expect("body row is a grid row");
+        assert_eq!(*kind, RowKind::Body(0));
+        let line_start = snap.line_byte_range(body_line).start;
+        let table = snap.table_containing_offset(line_start).unwrap();
+        let y = doc.real_top(body_line) + 2.0;
+        for c in 0..3 {
+            let content = table.body[0].cells[c].content.clone();
+            let x = doc.pad_x + tl.col_x[c] + doc.table_cell_pad_x + tl.col_w[c] * 0.5;
+            let off = doc.hit_test(x, y).expect("hit-test returns an offset");
+            assert!(
+                off >= content.start && off <= content.end,
+                "click on column {c} lands in its cell content {content:?}, got {off}"
+            );
+            assert_ne!(off, line_start, "click does not collapse to the line start");
+        }
+    }
+
+    /// Tier-2 character-level: clicking nearer a cell's end yields a larger buffer offset
+    /// than clicking nearer its start.
+    #[test]
+    fn hit_test_table_cell_start_before_end() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let src = "para\n\n| aaaa | bbbb |\n| --- | --- |\n| wxyz | 2222 |\n";
+        let mut buf: Buffer = src.parse().unwrap();
+        let snap = buf.render_snapshot();
+        let doc = build_grid_doc(&mut engine, &snap, 0);
+
+        let (tl, _) = doc.table_lines[4].as_ref().unwrap();
+        let y = doc.real_top(4) + 2.0;
+        let base = doc.pad_x + tl.col_x[0] + doc.table_cell_pad_x;
+        let near_start = doc.hit_test(base + 1.0, y).unwrap();
+        let near_end = doc.hit_test(base + tl.col_w[0] - 1.0, y).unwrap();
+        assert!(
+            near_end > near_start,
+            "click near the cell end ({near_end}) is past click near its start ({near_start})"
+        );
+    }
+
+    /// Clicks left of / right of the grid clamp to the first / last column.
+    #[test]
+    fn hit_test_table_clamps_to_edge_columns() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let src = "para\n\n| aa | bb | cc |\n| --- | --- | --- |\n| 11 | 22 | 33 |\n";
+        let mut buf: Buffer = src.parse().unwrap();
+        let snap = buf.render_snapshot();
+        let doc = build_grid_doc(&mut engine, &snap, 0);
+
+        let line_start = snap.line_byte_range(4).start;
+        let table = snap.table_containing_offset(line_start).unwrap();
+        let y = doc.real_top(4) + 2.0;
+        let first = table.body[0].cells[0].content.clone();
+        let last = table.body[0].cells[2].content.clone();
+
+        let left = doc.hit_test(0.0, y).unwrap();
+        assert!(
+            left >= first.start && left <= first.end,
+            "far-left click clamps to the first cell {first:?}, got {left}"
+        );
+        let right = doc.hit_test(1199.0, y).unwrap();
+        assert!(
+            right >= last.start && right <= last.end,
+            "far-right click clamps to the last cell {last:?}, got {right}"
+        );
+    }
+
+    /// Clicking an empty grid cell lands the caret between its pipes (on a space), not on
+    /// a pipe.
+    #[test]
+    fn hit_test_empty_table_cell_lands_off_pipe() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let src = "para\n\n| a | b |\n| --- | --- |\n|  |  |\n";
+        let mut buf: Buffer = src.parse().unwrap();
+        let snap = buf.render_snapshot();
+        let doc = build_grid_doc(&mut engine, &snap, 0);
+
+        let body_line = 4;
+        let (tl, _) = doc.table_lines[body_line].as_ref().unwrap();
+        let y = doc.real_top(body_line) + 2.0;
+        let x = doc.pad_x + tl.col_x[0] + doc.table_cell_pad_x + tl.col_w[0] * 0.5;
+        let off = doc.hit_test(x, y).unwrap();
+        assert_eq!(
+            snap.rope.get_byte(off),
+            Some(b' '),
+            "empty-cell click lands on a space between the pipes, not on a pipe"
+        );
     }
 }
