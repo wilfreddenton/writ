@@ -279,6 +279,22 @@ pub struct LayoutParams {
 /// Build the ghost (deleted) lines that render above buffer line `new_line`,
 /// laying out each from the HEAD snapshot. `usize::MAX` cursor keeps every marker
 /// hidden in ghosts (the cursor is never "on" a ghost line).
+/// Max ghost (deleted) lines shaped per block. A huge deletion only *shapes* the lines
+/// nearest the real line (the ones that can be on screen); the rest contribute estimated
+/// height only — bounds per-frame shaping regardless of deletion size.
+const GHOST_SHAPE_CAP: usize = 300;
+
+/// Cheap estimate (no shaping) of a deletion hunk's block height above `new_line`:
+/// deleted-line count × body row height. Used for off-screen (virtualized) lines.
+fn estimate_ghost_height(diff: Option<&DiffState>, new_line: usize, min_row: f32) -> f32 {
+    diff.and_then(|d| d.ghost_lines_before(new_line))
+        .map(|r| r.len() as f32 * min_row)
+        .unwrap_or(0.0)
+}
+
+/// Build the ghost (deleted) lines that render above buffer line `new_line`. Returns the
+/// shaped ghosts (bottom-aligned to the real line by the draw pass) and the block's TOTAL
+/// height — shaped rows plus the estimated height of any lines beyond `GHOST_SHAPE_CAP`.
 fn build_ghosts_before(
     engine: &mut TextEngine,
     diff: Option<&DiffState>,
@@ -286,7 +302,8 @@ fn build_ghosts_before(
     theme: &EditorTheme,
     params: &LayoutParams,
     max_advance: f32,
-) -> Vec<Ghost> {
+    min_row: f32,
+) -> (Vec<Ghost>, f32) {
     let LayoutParams {
         scale,
         base_font_size,
@@ -294,13 +311,18 @@ fn build_ghosts_before(
         fg,
         ..
     } = *params;
-    let Some(d) = diff else { return Vec::new() };
+    let Some(d) = diff else { return (Vec::new(), 0.0) };
     let Some(old_range) = d.ghost_lines_before(new_line) else {
-        return Vec::new();
+        return (Vec::new(), 0.0);
     };
     let old = &d.old_snapshot;
+    // Shape only the last GHOST_SHAPE_CAP lines (nearest the real line, most likely on
+    // screen); estimate the height of the earlier ones.
+    let count = old_range.len();
+    let shape_from = old_range.start + count.saturating_sub(GHOST_SHAPE_CAP);
+    let mut block_height = (shape_from - old_range.start) as f32 * min_row;
     let mut out = Vec::new();
-    for old_line in old_range {
+    for old_line in shape_from..old_range.end {
         if old_line >= old.line_count() {
             break;
         }
@@ -324,13 +346,14 @@ fn build_ghosts_before(
             .old_inline_changes(old_line)
             .map(|changes| map_changes_to_display(&lr.map, line_start, changes))
             .unwrap_or_default();
+        block_height += layout.height();
         out.push(Ghost {
             height: layout.height(),
             layout,
             inline,
         });
     }
-    out
+    (out, block_height)
 }
 
 /// Map line-relative inline-change byte ranges through a line's segment map into
@@ -529,6 +552,11 @@ pub struct DocLayout {
     quote_bars: Vec<Vec<f32>>,
     /// Total ghost-block height above each real line, parallel to `layouts`.
     ghost_height: Vec<f32>,
+    /// Deleted (ghost) rows at the very end of the document — a deletion hunk anchored
+    /// past the last line, which has no host line to hang above. Drawn below the last
+    /// real line; without this, trailing deletions (esp. with no final newline) vanish.
+    trailing_ghosts: Vec<Ghost>,
+    trailing_ghost_height: f32,
     /// Top y of each line's *ghost block*; the real line begins at
     /// `tops[i] + ghost_height[i]`. Length `layouts.len() + 1`. Device px.
     tops: Vec<f32>,
@@ -677,21 +705,26 @@ impl DocLayout {
                     let est_rows = (byte_len * k / max_advance).ceil().max(1.0);
                     est_rows * min_row
                 });
-                heights.push(h);
+                // A deletion hunk anchored at this (off-screen) line still consumes height:
+                // estimate it (deleted-line count × row height) so the scroll extent stays
+                // stable instead of jumping when the line scrolls into the materialized band.
+                let gh = estimate_ghost_height(diff, i, min_row);
+                heights.push(gh + h);
                 layouts.push(empty_layout.clone());
                 renders.push(empty_render.clone());
                 line_ranges.push(range);
                 line_diffs.push(LineDiff::default());
                 ghosts.push(Vec::new());
-                ghost_height.push(0.0);
+                ghost_height.push(gh);
                 quote_bars.push(Vec::new());
                 image_blocks.push(None);
                 inline_draws.push(Vec::new());
                 continue;
             }
             // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
-            let line_ghosts = build_ghosts_before(engine, diff, i, theme, params, max_advance);
-            let gh: f32 = line_ghosts.iter().map(|g| g.height).sum();
+            // `gh` is the full block height (shaped rows + estimated overflow beyond the cap).
+            let (line_ghosts, gh) =
+                build_ghosts_before(engine, diff, i, theme, params, max_advance, min_row);
 
             // Line byte range + render key, computed once and shared by the render cache,
             // the height cache, and the diff mapping below. (`line_markers(i).range` is
@@ -855,6 +888,10 @@ impl DocLayout {
         cache.sweep();
         render_cache.sweep();
         height_cache.sweep();
+        // Trailing deletions: a hunk anchored at `n` (past the last line) has no host line
+        // to hang above; build it here and draw it below the last real line.
+        let (trailing_ghosts, trailing_ghost_height) =
+            build_ghosts_before(engine, diff, n, theme, params, max_advance, min_row);
         // Row tint ~0.15 and word tint ~0.40 alpha, matching GitHub's dark-mode diff
         // line/word background strengths (the row was previously a near-invisible 0.05).
         let diff_colors = DiffColors {
@@ -870,6 +907,8 @@ impl DocLayout {
             line_diffs,
             ghosts,
             ghost_height,
+            trailing_ghosts,
+            trailing_ghost_height,
             quote_bars,
             image_blocks,
             inline_draws,
@@ -1075,7 +1114,9 @@ impl DocLayout {
 
     /// Total document height in device px (last line bottom + bottom padding).
     pub fn content_height(&self) -> f32 {
-        self.tops.last().copied().unwrap_or(self.pad_top) + self.pad_bottom
+        self.tops.last().copied().unwrap_or(self.pad_top)
+            + self.trailing_ghost_height
+            + self.pad_bottom
     }
 
     /// Largest valid scroll offset so the document bottom aligns to the viewport.
@@ -1187,39 +1228,64 @@ impl DocLayout {
     pub fn draw(&self, engine: &TextEngine, scene: &mut Scene, viewport_h: f32) {
         let (first, last) = self.visible_range(viewport_h);
         for i in first..last {
-            // Ghost (deleted) rows stacked in this line's ghost block.
-            let mut gy = self.tops[i] - self.scroll_y;
+            // Shaped ghost rows sit directly above the real line (bottom-aligned); for a
+            // capped huge deletion the estimated overflow is the empty gap above them.
+            let real_top = self.real_top(i) - self.scroll_y;
+            let shaped_h: f32 = self.ghosts[i].iter().map(|g| g.height).sum();
+            let mut gy = real_top - shaped_h;
             for ghost in &self.ghosts[i] {
-                let top = gy as f64;
-                let bottom = (gy + ghost.height) as f64;
-                scene.fill(
-                    Fill::NonZero,
-                    Affine::IDENTITY,
-                    self.diff_colors.deleted_bg,
-                    None,
-                    &Rect::new(self.pad_x as f64, top, (self.width - self.pad_x) as f64, bottom),
-                );
-                self.fill_word_ranges(
-                    scene,
-                    &ghost.layout,
-                    &ghost.inline,
-                    top,
-                    self.diff_colors.deleted_inline,
-                );
-                engine.draw_line(scene, &ghost.layout, (self.pad_x, gy));
+                self.draw_ghost(engine, scene, ghost, gy, viewport_h);
                 gy += ghost.height;
             }
             // Background chips behind inline code, under the real line's glyphs.
             let code = &self.renders[i].code_ranges;
             if !code.is_empty() {
-                self.fill_word_ranges(scene, &self.layouts[i], code, gy as f64, self.code_bg);
+                self.fill_word_ranges(scene, &self.layouts[i], code, real_top as f64, self.code_bg);
             }
             // Inline images: paint each at its laid-out box position (a loaded image, or a
             // faint bordered placeholder). Parley left a gap in the glyphs where the box is.
-            self.draw_inline_images(scene, i, gy);
+            self.draw_inline_images(scene, i, real_top);
             // The real line, below its ghost block.
-            engine.draw_line(scene, &self.layouts[i], (self.pad_x, gy));
+            engine.draw_line(scene, &self.layouts[i], (self.pad_x, real_top));
         }
+        // Trailing deletions below the last real line (a hunk anchored past the end).
+        let mut gy = self.tops[self.layouts.len()] - self.scroll_y;
+        for ghost in &self.trailing_ghosts {
+            self.draw_ghost(engine, scene, ghost, gy, viewport_h);
+            gy += ghost.height;
+        }
+    }
+
+    /// Paint one ghost (deleted) row at `gy` — red row band, word-level deletion tint,
+    /// then the text — skipping it entirely when it falls outside the viewport.
+    fn draw_ghost(
+        &self,
+        engine: &TextEngine,
+        scene: &mut Scene,
+        ghost: &Ghost,
+        gy: f32,
+        viewport_h: f32,
+    ) {
+        if gy + ghost.height < 0.0 || gy > viewport_h {
+            return; // off-screen — cull
+        }
+        let top = gy as f64;
+        let bottom = (gy + ghost.height) as f64;
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            self.diff_colors.deleted_bg,
+            None,
+            &Rect::new(self.pad_x as f64, top, (self.width - self.pad_x) as f64, bottom),
+        );
+        self.fill_word_ranges(
+            scene,
+            &ghost.layout,
+            &ghost.inline,
+            top,
+            self.diff_colors.deleted_inline,
+        );
+        engine.draw_line(scene, &ghost.layout, (self.pad_x, gy));
     }
 
     /// Paint blockquote gutter rules: one continuous vertical rect per nesting level,
@@ -1522,6 +1588,8 @@ mod tests {
             line_diffs: heights.iter().map(|_| LineDiff::default()).collect(),
             ghosts: heights.iter().map(|_| Vec::new()).collect(),
             ghost_height: heights.iter().map(|_| 0.0).collect(),
+            trailing_ghosts: Vec::new(),
+            trailing_ghost_height: 0.0,
             quote_bars: heights.iter().map(|_| Vec::new()).collect(),
             image_blocks: heights.iter().map(|_| None).collect(),
             inline_draws: heights.iter().map(|_| Vec::new()).collect(),
@@ -1662,6 +1730,49 @@ mod tests {
         // A click in the ghost block is inert → maps to the real line start (offset 0).
         let ghost_mid = doc.tops[0] + doc.ghost_height[0] * 0.5;
         assert_eq!(doc.hit_test(50.0, ghost_mid), Some(0));
+    }
+
+    /// Trailing deletions (a hunk anchored past the last line, with no final newline) must
+    /// render as trailing ghost rows below the last line — they used to vanish entirely.
+    #[test]
+    fn trailing_deletions_render_as_ghosts() {
+        use crate::buffer::Buffer;
+        use crate::diff::DiffState;
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let old_text = "keep\ndelete one\ndelete two\n";
+        let new_text = "keep"; // no trailing newline; the last two lines were deleted
+        let mut base: Buffer = old_text.parse().unwrap();
+        let diff = DiffState::compute(base.render_snapshot(), old_text, new_text);
+        assert!(diff.has_hunks());
+
+        let mut buf: Buffer = new_text.parse().unwrap();
+        let snapshot = buf.render_snapshot();
+        let params = test_params(&theme, 1200.0);
+        let doc = DocLayout::build(
+            &mut engine,
+            &mut LineCache::new(),
+            &mut RenderCache::new(),
+            &mut HeightCache::new(),
+            0,
+            &snapshot,
+            &theme,
+            Some(&diff),
+            None,
+            &ImageCache::new(),
+            usize::MAX,
+            &params,
+            None,
+            0,
+            f32::INFINITY,
+        );
+        assert!(
+            !doc.trailing_ghosts.is_empty(),
+            "trailing deletion should render ghost rows (was: vanished)"
+        );
+        assert!(doc.trailing_ghost_height > 0.0);
+        // Trailing ghost height is included in the scroll extent.
+        assert!(doc.content_height() > doc.tops[doc.line_count()]);
     }
 
     /// The layout cache reuses unchanged lines: a warm rebuild (cache populated)
