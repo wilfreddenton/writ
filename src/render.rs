@@ -236,15 +236,12 @@ pub fn build_line_render(
         // structural), substituting `- `→`• `, `> `→`  ` (the blockquote bar is painted
         // as a continuous rule in the draw path, not a per-line glyph). Indent whitespace and
         // ordered-list numbers stay literal; checkbox stays as `[ ]`/`[x]`.
-        // On a task item the checkbox is the marker, so suppress the list bullet.
-        let has_checkbox = markers
-            .markers
-            .iter()
-            .any(|m| matches!(m.kind, MarkerKind::Checkbox { .. }));
+        // On a task item the checkbox is the marker, so suppress the list bullet
+        // (`has_checkbox_style`, computed above, is the same scan).
         for marker in &markers.markers {
             let sub = match &marker.kind {
                 // Task item: hide the `- ` so the checkbox is the marker.
-                MarkerKind::ListItem { ordered: false, .. } if has_checkbox => Some(""),
+                MarkerKind::ListItem { ordered: false, .. } if has_checkbox_style => Some(""),
                 MarkerKind::ListItem {
                     ordered: false,
                     unordered_marker,

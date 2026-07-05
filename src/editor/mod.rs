@@ -9,19 +9,9 @@ use crate::cursor::{Cursor, Selection, grapheme_column, offset_at_column, prev_g
 use crate::marker::{LineMarkers, MarkerKind, OrderedMarker, UnorderedMarker};
 
 /// Context about the line at the cursor, used by smart editing actions.
-pub struct LineContext {
-    /// Current cursor byte offset.
-    pub cursor_offset: usize,
-    /// Index of the current line.
-    pub line_idx: usize,
+struct LineContext {
     /// The current line's markers.
-    pub line: LineMarkers,
-    /// Whether content after markers is empty (whitespace only).
-    pub is_empty: bool,
-    /// Whether this line has any container markers.
-    pub has_container: bool,
-    /// The previous line, if any.
-    pub prev_line: Option<LineMarkers>,
+    line: LineMarkers,
 }
 
 /// Cached tab cycle states for a specific line.
@@ -208,23 +198,6 @@ impl EditorState {
         ancestor_of_kind(node, "fenced_code_block").is_some()
     }
 
-    /// Check if a line has content after its markers.
-    /// Lines with code fences are always considered to have content.
-    fn line_has_content(&self, line: &LineMarkers) -> bool {
-        if line.is_fence() {
-            return true;
-        }
-        let content_start = line
-            .marker_range()
-            .map(|r| r.end)
-            .unwrap_or(line.range.start);
-        !self
-            .buffer
-            .slice_cow(content_start..line.range.end)
-            .trim()
-            .is_empty()
-    }
-
     /// Get context about the line at the cursor.
     /// Returns None if the cursor is not on a valid line.
     fn line_context(&self) -> Option<LineContext> {
@@ -235,23 +208,7 @@ impl EditorState {
         }
         let line = self.buffer.line_markers(line_idx);
 
-        let is_empty = !self.line_has_content(&line);
-        let has_container = line.has_container();
-
-        let prev_line = if line_idx > 0 {
-            Some(self.buffer.line_markers(line_idx - 1))
-        } else {
-            None
-        };
-
-        Some(LineContext {
-            cursor_offset,
-            line_idx,
-            line,
-            is_empty,
-            has_container,
-            prev_line,
-        })
+        Some(LineContext { line })
     }
 
     /// Auto-insert space after `>` if it just became a blockquote marker.

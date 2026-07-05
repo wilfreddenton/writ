@@ -413,34 +413,30 @@ pub fn detect_github_references_in_line(
         !line.as_bytes()[pos].is_ascii_alphanumeric()
     };
 
-    // Cross-repo issues: owner/repo#123 (check before simple #123)
-    for cap in CROSS_REPO_ISSUE_RE.captures_iter(line) {
-        // cap[1] is the full match without trailing boundary
-        let full = cap.get(1).unwrap();
-        let abs_range = (line_byte_offset + full.start())..(line_byte_offset + full.end());
-        if is_in_code(abs_range.start) {
-            continue;
+    // Cross-repo refs (owner/repo#123, owner/repo@sha): cap[1] is the full match
+    // without the trailing boundary. Checked before the simple #123 / @user passes.
+    let mut push_cross_repo = |re: &Regex, make: fn(&regex::Captures) -> GitHubRef| {
+        for cap in re.captures_iter(line) {
+            let full = cap.get(1).unwrap();
+            let abs_range = (line_byte_offset + full.start())..(line_byte_offset + full.end());
+            if is_in_code(abs_range.start) {
+                continue;
+            }
+            matched_ranges.push(abs_range.clone());
+            matches.push(RawGitHubMatch {
+                reference: make(&cap),
+                byte_range: abs_range,
+            });
         }
-        matched_ranges.push(abs_range.clone());
-        matches.push(RawGitHubMatch {
-            reference: GitHubRef::from_cross_repo_issue_capture(&cap),
-            byte_range: abs_range,
-        });
-    }
-
-    // Cross-repo commits: owner/repo@sha (check before @user which could match the @sha part)
-    for cap in CROSS_REPO_COMMIT_RE.captures_iter(line) {
-        let full = cap.get(1).unwrap();
-        let abs_range = (line_byte_offset + full.start())..(line_byte_offset + full.end());
-        if is_in_code(abs_range.start) {
-            continue;
-        }
-        matched_ranges.push(abs_range.clone());
-        matches.push(RawGitHubMatch {
-            reference: GitHubRef::from_cross_repo_commit_capture(&cap),
-            byte_range: abs_range,
-        });
-    }
+    };
+    push_cross_repo(
+        &CROSS_REPO_ISSUE_RE,
+        GitHubRef::from_cross_repo_issue_capture,
+    );
+    push_cross_repo(
+        &CROSS_REPO_COMMIT_RE,
+        GitHubRef::from_cross_repo_commit_capture,
+    );
 
     // User mentions: @username
     for cap in USER_RE.captures_iter(line) {

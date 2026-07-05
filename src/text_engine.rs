@@ -8,9 +8,10 @@
 use std::ops::Range;
 
 use parley::{
-    Alignment, AlignmentOptions, CHROMIUM_LINE_BREAK_OVERRIDE, Cluster, FontContext, FontFamily,
-    FontFamilyName, FontStyle, FontWeight, GenericFamily, IndentOptions, InlineBox, InlineBoxKind,
-    Layout, LayoutContext, LineHeight, OverflowWrap, PositionedLayoutItem, StyleProperty,
+    Affinity, Alignment, AlignmentOptions, CHROMIUM_LINE_BREAK_OVERRIDE, Cluster, Cursor,
+    FontContext, FontFamily, FontFamilyName, FontStyle, FontWeight, GenericFamily, IndentOptions,
+    InlineBox, InlineBoxKind, Layout, LayoutContext, LineHeight, OverflowWrap,
+    PositionedLayoutItem, Selection, StyleProperty,
 };
 use vello::Scene;
 use vello::kurbo::{Affine, Line, Stroke};
@@ -293,6 +294,15 @@ fn stroke_decoration(
 /// avoid churning every `peniko_color(theme.x)` call site; can be inlined later.
 pub fn peniko_color(c: Color) -> Color {
     c
+}
+
+/// Build a Parley `Selection` spanning a display byte range (Downstream at the
+/// start, Upstream at the end) for geometry/highlight queries.
+pub(crate) fn display_range_selection(layout: &Layout<Brush>, range: Range<usize>) -> Selection {
+    Selection::new(
+        Cursor::from_byte_index(layout, range.start, Affinity::Downstream),
+        Cursor::from_byte_index(layout, range.end, Affinity::Upstream),
+    )
 }
 
 /// A theme color at an explicit alpha (0..1) — for translucent diff backgrounds.

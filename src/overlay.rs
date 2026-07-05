@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use parley::{Affinity, Cursor, Layout, Selection};
+use parley::Layout;
 use vello::Scene;
 use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Brush, Fill};
@@ -15,7 +15,9 @@ use crate::core::{AutocompleteState, AutocompleteSuggestion, Editor};
 use crate::doc_layout::{DocLayout, ScreenRect};
 use crate::editor::EditorTheme;
 use crate::inline::{GitHubContext, GitHubRef};
-use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
+use crate::text_engine::{
+    StyleRun, TextEngine, display_range_selection, peniko_color, peniko_color_alpha,
+};
 use crate::validation::{IssueStatus, ValidatedRefData, ValidationState};
 
 /// A GitHub ref currently under the pointer, plus its on-screen caret rect (used to
@@ -100,6 +102,36 @@ impl PanelSeg {
             mono: false,
         }
     }
+
+    fn bold(text: String, color: vello::peniko::Color) -> Self {
+        Self {
+            text,
+            color,
+            bold: true,
+            italic: false,
+            mono: false,
+        }
+    }
+
+    fn italic(text: String, color: vello::peniko::Color) -> Self {
+        Self {
+            text,
+            color,
+            bold: false,
+            italic: true,
+            mono: false,
+        }
+    }
+
+    fn mono(text: String, color: vello::peniko::Color) -> Self {
+        Self {
+            text,
+            color,
+            bold: false,
+            italic: false,
+            mono: true,
+        }
+    }
 }
 
 /// Scan an issue/PR `title` and emit styled spans, translating a small subset of
@@ -124,26 +156,14 @@ fn parse_title_markdown(title: &str, color: vello::peniko::Color) -> Vec<PanelSe
         if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
             if let Some(end) = find_close_double(&chars, i + 2, '*') {
                 flush_plain(&mut plain, &mut out);
-                out.push(PanelSeg {
-                    text: chars[i + 2..end].iter().collect(),
-                    color,
-                    bold: true,
-                    italic: false,
-                    mono: false,
-                });
+                out.push(PanelSeg::bold(chars[i + 2..end].iter().collect(), color));
                 i = end + 2;
                 continue;
             }
         } else if c == '*' || c == '_' {
             if let Some(end) = find_close_single(&chars, i + 1, c) {
                 flush_plain(&mut plain, &mut out);
-                out.push(PanelSeg {
-                    text: chars[i + 1..end].iter().collect(),
-                    color,
-                    bold: false,
-                    italic: true,
-                    mono: false,
-                });
+                out.push(PanelSeg::italic(chars[i + 1..end].iter().collect(), color));
                 i = end + 1;
                 continue;
             }
@@ -151,13 +171,7 @@ fn parse_title_markdown(title: &str, color: vello::peniko::Color) -> Vec<PanelSe
             && let Some(end) = find_close_single(&chars, i + 1, '`')
         {
             flush_plain(&mut plain, &mut out);
-            out.push(PanelSeg {
-                text: chars[i + 1..end].iter().collect(),
-                color,
-                bold: false,
-                italic: false,
-                mono: true,
-            });
+            out.push(PanelSeg::mono(chars[i + 1..end].iter().collect(), color));
             i = end + 1;
             continue;
         }
@@ -261,10 +275,7 @@ fn fill_code_chips(
     color: vello::peniko::Color,
 ) {
     for r in ranges {
-        let sel = Selection::new(
-            Cursor::from_byte_index(layout, r.start, Affinity::Downstream),
-            Cursor::from_byte_index(layout, r.end, Affinity::Upstream),
-        );
+        let sel = display_range_selection(layout, r.clone());
         for (bb, _) in sel.geometry(layout) {
             scene.fill(
                 Fill::NonZero,
@@ -326,19 +337,31 @@ fn hover_segments(
         Some(ValidationState::Valid(Some(ValidatedRefData::User(user)))) => {
             user_segments(&user.login, user.name.as_deref(), theme)
         }
-        Some(ValidationState::Valid(None)) => vec![
-            PanelSeg::plain("✓ ".to_string(), theme.green),
-            PanelSeg::plain(reference.short_display(context), theme.cyan),
-        ],
-        Some(ValidationState::Invalid) => vec![
-            PanelSeg::plain("✗ ".to_string(), theme.red),
-            PanelSeg::plain(reference.short_display(context), theme.cyan),
-        ],
-        Some(ValidationState::Pending) | None => vec![
-            PanelSeg::plain("… ".to_string(), theme.comment),
-            PanelSeg::plain(reference.short_display(context), theme.cyan),
-        ],
+        Some(ValidationState::Valid(None)) => {
+            status_display_line("✓ ", theme.green, reference, context, theme)
+        }
+        Some(ValidationState::Invalid) => {
+            status_display_line("✗ ", theme.red, reference, context, theme)
+        }
+        Some(ValidationState::Pending) | None => {
+            status_display_line("… ", theme.comment, reference, context, theme)
+        }
     }
+}
+
+/// A hover line for a ref that has no validated title: a status glyph followed by
+/// the ref's short display text.
+fn status_display_line(
+    symbol: &str,
+    symbol_color: vello::peniko::Color,
+    reference: &GitHubRef,
+    context: Option<&GitHubContext>,
+    theme: &EditorTheme,
+) -> Vec<PanelSeg> {
+    vec![
+        PanelSeg::plain(symbol.to_string(), symbol_color),
+        PanelSeg::plain(reference.short_display(context), theme.cyan),
+    ]
 }
 
 /// Draw the GitHub ref hover popover: a bordered panel anchored below (or above,

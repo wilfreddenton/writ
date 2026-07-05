@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
 
-use parley::{Affinity, Cluster, Cursor, PositionedLayoutItem, Selection};
+use parley::{Affinity, Cluster, Cursor, PositionedLayoutItem};
 use vello::Scene;
 use vello::kurbo::{Affine, Rect, Stroke};
 use vello::peniko::{Brush, Color, Fill, ImageBrush};
@@ -28,7 +28,9 @@ use crate::inline::{
 };
 use crate::render::{ImageRef, InlineImageRef, LineRender, build_line_render};
 use crate::segment_map::SegmentMap;
-use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
+use crate::text_engine::{
+    StyleRun, TextEngine, display_range_selection, peniko_color, peniko_color_alpha,
+};
 use crate::validation::GitHubValidationCache;
 
 /// A screen-space rectangle (device px), already offset by padding + scroll.
@@ -1049,10 +1051,7 @@ impl DocLayout {
                 continue;
             }
             let layout = &self.layouts[line];
-            let sel = Selection::new(
-                Cursor::from_byte_index(layout, ds, Affinity::Downstream),
-                Cursor::from_byte_index(layout, de, Affinity::Upstream),
-            );
+            let sel = display_range_selection(layout, ds..de);
             let dx = self.pad_x as f64;
             let dy = (self.real_top(line) - self.scroll_y) as f64;
             for (bb, _) in sel.geometry(layout) {
@@ -1181,10 +1180,7 @@ impl DocLayout {
         color: Color,
     ) {
         for r in ranges {
-            let sel = Selection::new(
-                Cursor::from_byte_index(layout, r.start, Affinity::Downstream),
-                Cursor::from_byte_index(layout, r.end, Affinity::Upstream),
-            );
+            let sel = display_range_selection(layout, r.clone());
             for (bb, _) in sel.geometry(layout) {
                 scene.fill(
                     Fill::NonZero,
