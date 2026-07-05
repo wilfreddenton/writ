@@ -188,7 +188,7 @@ and opt into only what you need:
 
 ```toml
 # render-only: pulls in none of tokio/reqwest/gix/github/winit
-writ = { version = "0.12", default-features = false }
+writ = { version = "0.13", default-features = false }
 ```
 
 | Feature | Adds |
