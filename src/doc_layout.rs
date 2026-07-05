@@ -855,11 +855,13 @@ impl DocLayout {
         cache.sweep();
         render_cache.sweep();
         height_cache.sweep();
+        // Row tint ~0.15 and word tint ~0.40 alpha, matching GitHub's dark-mode diff
+        // line/word background strengths (the row was previously a near-invisible 0.05).
         let diff_colors = DiffColors {
-            added_bg: peniko_color_alpha(theme.green, 0.05),
-            added_inline: peniko_color_alpha(theme.green, 0.25),
-            deleted_bg: peniko_color_alpha(theme.red, 0.05),
-            deleted_inline: peniko_color_alpha(theme.red, 0.25),
+            added_bg: peniko_color_alpha(theme.green, 0.15),
+            added_inline: peniko_color_alpha(theme.green, 0.40),
+            deleted_bg: peniko_color_alpha(theme.red, 0.15),
+            deleted_inline: peniko_color_alpha(theme.red, 0.40),
         };
         Self {
             layouts,

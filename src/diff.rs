@@ -167,139 +167,97 @@ fn compute_line_hunks(old_text: &str, new_text: &str) -> Vec<DiffHunk> {
         .collect()
 }
 
-/// Maximum number of lines in a hunk to compute word-level diffs.
-/// Larger hunks are shown as full line additions/deletions for readability.
-/// This matches Zed's approach (MAX_WORD_DIFF_LINE_COUNT: 5).
-const MAX_WORD_DIFF_LINE_COUNT: usize = 5;
-
-/// Compute word-level changes between old and new line sets.
-/// Returns (old_changes, new_changes) for highlighting deleted/added words.
-/// Returns empty vecs if the hunk is too large (exceeds MAX_WORD_DIFF_LINE_COUNT).
+/// Compute word-level changes between old and new line sets by pairing old line `i` with
+/// new line `i` and diffing each pair independently (like GitHub). Cost is bounded per
+/// line, so there is no whole-hunk size cap, and words are never misattributed across
+/// lines. Extra lines on either side (unequal counts) are wholly added/deleted and need
+/// no intra-line emphasis — the row tint already covers them.
 fn compute_word_changes(
     old_lines: &[&str],
     new_lines: &[&str],
 ) -> (LineInlineChanges, LineInlineChanges) {
-    // Skip word-level diff for large hunks - they'd be overwhelming to read
-    let total_lines = old_lines.len() + new_lines.len();
-    if total_lines > MAX_WORD_DIFF_LINE_COUNT {
-        return (vec![], vec![]);
+    let mut old_changes: LineInlineChanges = vec![Vec::new(); old_lines.len()];
+    let mut new_changes: LineInlineChanges = vec![Vec::new(); new_lines.len()];
+    for i in 0..old_lines.len().min(new_lines.len()) {
+        let (dels, adds) = word_diff_line(old_lines[i], new_lines[i]);
+        old_changes[i] = dels;
+        new_changes[i] = adds;
     }
+    (old_changes, new_changes)
+}
 
-    // Join lines for word-level diff
-    let old_text = old_lines.join("\n");
-    let new_text = new_lines.join("\n");
-
-    // Tokenize into words (keeping track of positions)
-    let old_tokens = tokenize_with_positions(&old_text);
-    let new_tokens = tokenize_with_positions(&new_text);
-
-    if old_tokens.is_empty() || new_tokens.is_empty() {
-        return (vec![], vec![]);
+/// Word-diff two single lines, returning the line-relative changed ranges on each side.
+fn word_diff_line(old: &str, new: &str) -> (Vec<InlineChange>, Vec<InlineChange>) {
+    if old == new {
+        return (Vec::new(), Vec::new());
     }
-
-    // Build word strings joined by newline for line-based diffing
+    let old_tokens = tokenize_with_positions(old);
+    let new_tokens = tokenize_with_positions(new);
     let old_words: Vec<&str> = old_tokens.iter().map(|(s, _)| *s).collect();
     let new_words: Vec<&str> = new_tokens.iter().map(|(s, _)| *s).collect();
-
+    // Diff treating each token as a "line". Tokens never contain a newline (single-line
+    // input), so joining by '\n' for the interner is safe.
     let old_joined = old_words.join("\n");
     let new_joined = new_words.join("\n");
-
-    // Diff treating each word as a "line"
     let input = InternedInput::new(old_joined.as_str(), new_joined.as_str());
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
 
-    // Collect deleted/added word positions
-    let mut old_deleted_ranges: Vec<Range<usize>> = vec![];
-    let mut new_added_ranges: Vec<Range<usize>> = vec![];
-
+    let mut dels = Vec::new();
+    let mut adds = Vec::new();
     for hunk in diff.hunks() {
-        for word_idx in hunk.before.start as usize..hunk.before.end as usize {
-            if let Some((_, range)) = old_tokens.get(word_idx) {
-                old_deleted_ranges.push(range.clone());
+        for idx in hunk.before.start as usize..hunk.before.end as usize {
+            if let Some((_, r)) = old_tokens.get(idx) {
+                dels.push(InlineChange { range: r.clone() });
             }
         }
-        for word_idx in hunk.after.start as usize..hunk.after.end as usize {
-            if let Some((_, range)) = new_tokens.get(word_idx) {
-                new_added_ranges.push(range.clone());
+        for idx in hunk.after.start as usize..hunk.after.end as usize {
+            if let Some((_, r)) = new_tokens.get(idx) {
+                adds.push(InlineChange { range: r.clone() });
             }
         }
     }
-
-    // Convert absolute positions to per-line positions
-    let old_changes = ranges_to_per_line_changes(&old_text, old_lines, &old_deleted_ranges);
-    let new_changes = ranges_to_per_line_changes(&new_text, new_lines, &new_added_ranges);
-
-    (old_changes, new_changes)
+    (dels, adds)
 }
 
-/// Tokenize text into words with their byte positions.
-/// Returns Vec<(word, byte_range)>.
+/// Tokenize a line into a gap-free stream of `(token, byte_range)` covering every byte:
+/// maximal runs of word chars (alphanumeric + `_`), whitespace runs, and punctuation
+/// runs each form a token. Because no bytes are dropped, punctuation- and whitespace-only
+/// edits produce a highlighted token (GitHub does this; the old alnum-only tokenizer left
+/// them invisible). `-` is punctuation, so hyphenated parts diff separately.
 fn tokenize_with_positions(text: &str) -> Vec<(&str, Range<usize>)> {
-    let mut tokens = vec![];
-    let mut start = None;
-
-    for (i, c) in text.char_indices() {
-        if c.is_alphanumeric() || c == '_' || c == '-' {
-            if start.is_none() {
-                start = Some(i);
-            }
-        } else if let Some(s) = start {
-            tokens.push((&text[s..i], s..i));
-            start = None;
+    #[derive(PartialEq)]
+    enum Class {
+        Word,
+        Space,
+        Punct,
+    }
+    fn classify(c: char) -> Class {
+        if c.is_alphanumeric() || c == '_' {
+            Class::Word
+        } else if c.is_whitespace() {
+            Class::Space
+        } else {
+            Class::Punct
         }
     }
 
-    // Handle last token
-    if let Some(s) = start {
-        tokens.push((&text[s..], s..text.len()));
-    }
-
-    tokens
-}
-
-/// Convert absolute byte ranges to per-line Vec<Vec<InlineChange>>.
-/// Returns a dense vec indexed by line offset within the hunk.
-fn ranges_to_per_line_changes(
-    full_text: &str,
-    lines: &[&str],
-    ranges: &[Range<usize>],
-) -> Vec<Vec<InlineChange>> {
-    // Initialize with empty vecs for each line
-    let mut per_line: Vec<Vec<InlineChange>> = vec![vec![]; lines.len()];
-
-    if ranges.is_empty() {
-        return per_line;
-    }
-
-    // Build line start offsets
-    let mut line_starts = vec![0usize];
-    let mut pos = 0;
-    for line in lines {
-        pos += line.len() + 1; // +1 for newline
-        line_starts.push(pos.min(full_text.len()));
-    }
-
-    // Group ranges by line
-    for range in ranges {
-        // Find which line this range belongs to
-        for (line_idx, window) in line_starts.windows(2).enumerate() {
-            let line_start = window[0];
-            let line_end = window[1];
-
-            if range.start >= line_start && range.start < line_end {
-                let relative_range =
-                    (range.start - line_start)..(range.end - line_start).min(lines[line_idx].len());
-
-                per_line[line_idx].push(InlineChange {
-                    range: relative_range,
-                });
+    let mut tokens = Vec::new();
+    let mut iter = text.char_indices().peekable();
+    while let Some(&(start, c)) = iter.peek() {
+        let class = classify(c);
+        let mut end = start;
+        while let Some(&(i, ch)) = iter.peek() {
+            if classify(ch) == class {
+                end = i + ch.len_utf8();
+                iter.next();
+            } else {
                 break;
             }
         }
+        tokens.push((&text[start..end], start..end));
     }
-
-    per_line
+    tokens
 }
 
 #[cfg(test)]
