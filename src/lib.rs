@@ -18,6 +18,7 @@
 
 pub use core::Editor;
 pub use editor::{Direction, EditorTheme};
+pub use markdown_view::MarkdownView;
 
 pub mod buffer;
 pub mod chrome;
@@ -34,6 +35,7 @@ pub mod highlight;
 pub mod image_cache;
 pub mod image_load;
 pub mod inline;
+pub mod markdown_view;
 pub mod marker;
 pub mod overlay;
 pub mod parser;
