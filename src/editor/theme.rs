@@ -9,6 +9,9 @@ use crate::highlight::Highlighter;
 #[derive(Clone)]
 pub struct EditorTheme {
     pub background: Color,
+    /// Slightly-darker fill for chrome (the status bar) so it reads as a distinct
+    /// surface rather than blending into the document background.
+    pub surface: Color,
     pub foreground: Color,
     pub selection: Color,
     pub comment: Color,
@@ -26,6 +29,7 @@ impl EditorTheme {
     pub fn dracula() -> Self {
         Self {
             background: Color::from_rgba8(0x28, 0x2A, 0x36, 0xFF),
+            surface: Color::from_rgba8(0x21, 0x22, 0x2C, 0xFF),
             foreground: Color::from_rgba8(0xF8, 0xF8, 0xF2, 0xFF),
             selection: Color::from_rgba8(0x44, 0x47, 0x5A, 0xFF),
             comment: Color::from_rgba8(0x62, 0x72, 0xA4, 0xFF),

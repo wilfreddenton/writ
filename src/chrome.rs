@@ -72,6 +72,12 @@ fn baseline_top(bar: &BarRect, font_size: f32) -> f32 {
     (bar.y0 as f32) + ((bar.y1 - bar.y0) as f32 - font_size * UI_LINE_HEIGHT) / 2.0
 }
 
+/// Vertically-center a built layout within a bar using its *actual* height, so the
+/// glyphs sit on the bar's centerline regardless of the font's line-box metrics.
+fn center_top(bar: &BarRect, layout_height: f32) -> f32 {
+    (bar.y0 as f32) + ((bar.y1 - bar.y0) as f32 - layout_height) / 2.0
+}
+
 /// Draw the top title bar: centered filename with a leading `*` when dirty.
 pub fn draw_title_bar(
     engine: &mut TextEngine,
@@ -119,7 +125,7 @@ pub fn draw_status_bar(
     info: &StatusInfo,
     scale: f32,
 ) {
-    fill_rect(scene, peniko_color(theme.background), bar);
+    fill_rect(scene, peniko_color(theme.surface), bar);
     hline(
         scene,
         peniko_color(theme.selection),
@@ -129,9 +135,8 @@ pub fn draw_status_bar(
         scale as f64,
     );
 
-    let font_size = 13.0;
+    let font_size = 15.0;
     let pad = PADDING * scale;
-    let y = baseline_top(bar, font_size);
 
     // --- left: context markers, colored by nesting depth ---
     let depth_colors = [
@@ -169,7 +174,7 @@ pub fn draw_status_bar(
             None,
             &runs,
         );
-        engine.draw_line(scene, &layout, (bar.x0 as f32 + pad, y));
+        engine.draw_line(scene, &layout, (bar.x0 as f32 + pad, center_top(bar, layout.height())));
     }
 
     // --- right: H-level · Ln,Col · lines · scroll ---
@@ -187,14 +192,14 @@ pub fn draw_status_bar(
             (info.last_visible + 1) * 100 / info.total_lines.max(1)
         )
     };
-    let heading = info
-        .heading_level
-        .map(|l| format!("H{l}  "))
-        .unwrap_or_default();
-    let right = format!(
-        "{heading}Ln {}, Col {}  ·  {} lines  ·  {scroll}",
-        info.cursor_line, info.cursor_col, info.total_lines
-    );
+    let mut segments = Vec::new();
+    if let Some(l) = info.heading_level {
+        segments.push(format!("H{l}"));
+    }
+    segments.push(format!("Ln {}, Col {}", info.cursor_line, info.cursor_col));
+    segments.push(format!("{} lines", info.total_lines));
+    segments.push(scroll);
+    let right = segments.join("  ·  ");
     let layout = engine.build_line(
         &right,
         scale,
@@ -205,5 +210,5 @@ pub fn draw_status_bar(
         &[],
     );
     let x = bar.x1 as f32 - pad - layout.width();
-    engine.draw_line(scene, &layout, (x, y));
+    engine.draw_line(scene, &layout, (x, center_top(bar, layout.height())));
 }

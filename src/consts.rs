@@ -17,7 +17,7 @@ pub const LINE_HEIGHT: f32 = 1.5;
 /// labels) — tighter than the document body.
 pub const UI_LINE_HEIGHT: f32 = 1.3;
 /// Height of the bottom status bar.
-pub const STATUS_BAR_H: f32 = 24.0;
+pub const STATUS_BAR_H: f32 = 30.0;
 /// Text caret width.
 pub const CARET_WIDTH: f32 = 2.0;
 /// Scroll distance per wheel line-delta.
