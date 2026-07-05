@@ -1,10 +1,13 @@
+#[cfg(feature = "app")]
 use std::path::PathBuf;
 
+#[cfg(feature = "app")]
 use clap::Parser;
 
 /// Environment variable name for GitHub token (shared between clap and tests)
 pub const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
 
+#[cfg(feature = "app")]
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Config {

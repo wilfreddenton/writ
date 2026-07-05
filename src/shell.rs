@@ -48,10 +48,7 @@ use crate::doc_layout::{
 };
 use crate::editor::{Direction, EditorTheme};
 use crate::git::{detect_github_context, parse_github_repo_string};
-use crate::github::{
-    GitHubClient, GitHubValidationCache, IssueOrPr, MentionableUser, ValidatedRefData,
-    ValidationResult,
-};
+use crate::github::{GitHubClient, ValidationResult};
 use crate::image_cache::ImageCache;
 use crate::image_load::{RepaintSignal, load_local_images_blocking, spawn_image_loads};
 use crate::inline::{GitHubContext, GitHubRef};
@@ -61,6 +58,7 @@ use crate::overlay::{
 };
 use crate::raster::rasterize_scene_to_png;
 use crate::text_engine::{TextEngine, peniko_color};
+use crate::validation::{GitHubValidationCache, IssueOrPr, MentionableUser, ValidatedRefData};
 
 /// Chrome layout in device px: y where editor content begins, and its height.
 fn chrome_metrics(scale: f32, height_dev: f32) -> (f32, f32) {

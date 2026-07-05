@@ -84,7 +84,7 @@ async fn load_remote_image(url: &str) -> Option<LoadedImage> {
 /// worker: remote `http(s)` via reqwest on the async runtime, else a local file read +
 /// decode on a blocking task (so IO/decoding doesn't stall the runtime). Each finish
 /// calls `signal.notify()` so an event-driven consumer rebuilds around the now-known height.
-pub(crate) fn spawn_image_loads(
+pub fn spawn_image_loads(
     doc_dir: Option<PathBuf>,
     urls: &[String],
     cache: &ImageCache,
@@ -135,7 +135,7 @@ pub(crate) fn spawn_image_loads(
 /// Synchronously decode standalone images into the cache for the headless snapshot
 /// frame: local reads (relative to the doc's directory) plus remote `http(s)` fetched
 /// by blocking on the current runtime, so the golden frame reflects the real result.
-pub(crate) fn load_local_images_blocking(
+pub fn load_local_images_blocking(
     doc_dir: Option<&Path>,
     urls: &[String],
     cache: &ImageCache,

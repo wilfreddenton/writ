@@ -9,8 +9,8 @@ use std::ops::Range;
 use std::sync::LazyLock;
 use tree_sitter::Node;
 
-use crate::github::GitHubValidationCache;
 use crate::parser::MarkdownTree;
+use crate::validation::GitHubValidationCache;
 
 /// GitHub repository context for resolving relative references like #123.
 #[derive(Debug, Clone, PartialEq, Eq)]

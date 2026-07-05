@@ -21,7 +21,7 @@ use crate::buffer::RenderSnapshot;
 use crate::consts::{MAX_CONTENT_WIDTH, UI_LINE_HEIGHT};
 use crate::diff::{DiffState, InlineChange};
 use crate::editor::EditorTheme;
-use crate::github::GitHubValidationCache;
+use crate::validation::GitHubValidationCache;
 use crate::image_cache::{ImageCache, ImageState};
 use crate::inline::{
     GitHubContext, NakedUrl, RawGitHubMatch, StyledRegion, github_refs_to_styled_regions,

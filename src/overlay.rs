@@ -14,7 +14,7 @@ use crate::consts::{PADDING, UI_LINE_HEIGHT};
 use crate::core::{AutocompleteState, AutocompleteSuggestion, Editor};
 use crate::doc_layout::{DocLayout, ScreenRect};
 use crate::editor::EditorTheme;
-use crate::github::{IssueStatus, ValidatedRefData, ValidationState};
+use crate::validation::{IssueStatus, ValidatedRefData, ValidationState};
 use crate::inline::{GitHubContext, GitHubRef};
 use crate::text_engine::{StyleRun, TextEngine, peniko_color, peniko_color_alpha};
 

@@ -1,6 +1,6 @@
 //! Shared, cheaply-cloneable cache of decoded images for standalone-image rendering.
 //!
-//! Mirrors `github::GitHubValidationCache`: an `Arc<Mutex<HashMap>>` keyed by the raw
+//! Mirrors `validation::GitHubValidationCache`: an `Arc<Mutex<HashMap>>` keyed by the raw
 //! URL string. Loads (local file reads or remote fetches) run on worker tasks that
 //! write their result here and wake the winit loop; the layout/draw path reads it.
 

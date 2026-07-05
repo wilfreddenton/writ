@@ -16,8 +16,10 @@
 //! writ::shell::run()?; // opens a window and edits the file from --file
 //! ```
 
+#[cfg(feature = "editor")]
 pub use core::Editor;
 pub use editor::{Direction, EditorTheme};
+#[cfg(feature = "remote-images")]
 pub use image_load::RepaintSignal;
 pub use markdown_view::MarkdownView;
 pub use raster::rasterize_scene_to_png;
@@ -26,25 +28,32 @@ pub mod buffer;
 pub mod chrome;
 pub mod config;
 pub mod consts;
+#[cfg(feature = "editor")]
 pub mod core;
 pub mod cursor;
 pub mod diff;
 pub mod doc_layout;
 pub mod editor;
+#[cfg(feature = "git")]
 pub mod git;
+#[cfg(feature = "github")]
 pub mod github;
 pub mod highlight;
 pub mod image_cache;
+#[cfg(feature = "remote-images")]
 pub mod image_load;
 pub mod inline;
 pub mod markdown_view;
 pub mod marker;
+#[cfg(feature = "app")]
 pub mod overlay;
 pub mod parser;
 pub mod paste;
 pub mod raster;
 pub mod render;
 pub mod segment_map;
+#[cfg(feature = "app")]
 pub mod shell;
 pub mod status_bar;
 pub mod text_engine;
+pub mod validation;

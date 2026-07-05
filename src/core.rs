@@ -26,13 +26,14 @@ use crate::cursor::Selection;
 use crate::diff::DiffState;
 use crate::editor::{Direction, EditorState};
 use crate::git::head_blob_text;
-use crate::github::{GitHubClient, GitHubValidationCache, IssueStatus};
+use crate::github::GitHubClient;
 use crate::inline::{
     GitHubContext, GitHubRef, NakedUrl, RawGitHubMatch, detect_github_references_in_line,
     detect_naked_urls,
 };
 use crate::marker::MarkerKind;
 use crate::paste::{PasteContext, transform_paste};
+use crate::validation::{GitHubValidationCache, IssueStatus};
 
 /// The kind of autocomplete triggered at the cursor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
