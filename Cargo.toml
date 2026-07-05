@@ -74,3 +74,4 @@ codegen-units = 16
 
 [dev-dependencies]
 rustls = { version = "0.23.36", features = ["ring"] }
+vello = "0.9"

@@ -11,7 +11,7 @@
 //! them). CSD (custom window frame) and the async-blocked overlays are deferred.
 //! Run with
 //! `WGPU_BACKEND=vulkan cargo run --bin writ-next` on Asahi; set
-//! `WRIT_SHELL_SNAPSHOT=out.ppm` (+ optional `WRIT_SHELL_{W,H,SCROLL,CURSOR,SEL_A,SEL_B}`)
+//! `WRIT_SHELL_SNAPSHOT=out.png` (+ optional `WRIT_SHELL_{W,H,SCROLL,CURSOR,SEL_A,SEL_B}`)
 //! to render one frame headlessly instead.
 
 use std::ops::Range;
@@ -59,6 +59,7 @@ use crate::marker::MarkerKind;
 use crate::overlay::{
     HoverTarget, draw_autocomplete, draw_hover_popover, find_hover_target, hover_target_at_offset,
 };
+use crate::raster::rasterize_scene_to_png;
 use crate::text_engine::{TextEngine, peniko_color};
 
 /// Chrome layout in device px: y where editor content begins, and its height.
@@ -1799,18 +1800,6 @@ fn fetch_autocomplete_blocking(editor: &mut Editor) {
 /// `path` as a PNG. Independent of any surface/window, so it runs headlessly and
 /// doubles as a golden-image harness for later phases.
 pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()> {
-    use vello::wgpu::{
-        BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d, MapMode, Origin3d,
-        PollType, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
-        TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
-    };
-
-    let mut context = RenderContext::new();
-    let dev_id = pollster::block_on(context.device(None))
-        .ok_or_else(|| anyhow::anyhow!("no wgpu device (set WGPU_BACKEND=vulkan on Asahi)"))?;
-    let device = &context.devices[dev_id].device;
-    let queue = &context.devices[dev_id].queue;
-
     // WRIT_SHELL_FILE opens a real file (with live HEAD diff); else the demo doc.
     let mut editor = match std::env::var("WRIT_SHELL_FILE") {
         Ok(p) => Editor::open(std::path::Path::new(&p)),
@@ -1929,96 +1918,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         );
     }
 
-    let target = device.create_texture(&TextureDescriptor {
-        label: Some("snapshot_target"),
-        size: Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8Unorm,
-        usage: TextureUsages::STORAGE_BINDING | TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let target_view = target.create_view(&TextureViewDescriptor::default());
-
-    let mut renderer = Renderer::new(
-        device,
-        RendererOptions {
-            use_cpu: false,
-            antialiasing_support: vello::AaSupport::area_only(),
-            num_init_threads: None,
-            pipeline_cache: None,
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("Renderer::new failed: {e:?}"))?;
-    renderer
-        .render_to_texture(
-            device,
-            queue,
-            &scene,
-            &target_view,
-            &RenderParams {
-                base_color: peniko_color(de.theme.background),
-                width,
-                height,
-                antialiasing_method: AaConfig::Area,
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("render_to_texture failed: {e:?}"))?;
-
-    // Copy the texture into a mappable buffer (rows padded to 256-byte alignment).
-    let bytes_per_pixel = 4u32;
-    let unpadded = width * bytes_per_pixel;
-    let align = 256u32;
-    let padded = unpadded.div_ceil(align) * align;
-    let buffer = device.create_buffer(&BufferDescriptor {
-        label: Some("snapshot_readback"),
-        size: (padded * height) as u64,
-        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: None });
-    encoder.copy_texture_to_buffer(
-        TexelCopyTextureInfo {
-            texture: &target,
-            mip_level: 0,
-            origin: Origin3d::ZERO,
-            aspect: TextureAspect::All,
-        },
-        TexelCopyBufferInfo {
-            buffer: &buffer,
-            layout: TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(padded),
-                rows_per_image: Some(height),
-            },
-        },
-        Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    queue.submit([encoder.finish()]);
-
-    let slice = buffer.slice(..);
-    slice.map_async(MapMode::Read, |r| r.expect("map_async failed"));
-    let _ = device.poll(PollType::wait_indefinitely());
-    let data = slice.get_mapped_range();
-
-    // Write a binary PPM (P6) — dependency-free; converted to PNG by the caller.
-    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
-    for y in 0..height {
-        let row = &data[(y * padded) as usize..(y * padded + unpadded) as usize];
-        for px in row.chunks_exact(4) {
-            ppm.extend_from_slice(&px[..3]); // drop alpha
-        }
-    }
-    std::fs::write(path, &ppm)?;
+    rasterize_scene_to_png(&scene, width, height, peniko_color(de.theme.background), path)?;
     eprintln!("[writ] wrote snapshot: {path} ({width}x{height})");
     Ok(())
 }

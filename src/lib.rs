@@ -19,6 +19,7 @@
 pub use core::Editor;
 pub use editor::{Direction, EditorTheme};
 pub use markdown_view::MarkdownView;
+pub use raster::rasterize_scene_to_png;
 
 pub mod buffer;
 pub mod chrome;
@@ -40,6 +41,7 @@ pub mod marker;
 pub mod overlay;
 pub mod parser;
 pub mod paste;
+pub mod raster;
 pub mod render;
 pub mod segment_map;
 pub mod shell;
