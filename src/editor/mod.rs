@@ -1449,9 +1449,37 @@ impl EditorState {
                     self.selection = Selection::select_line_at(buffer_offset, &self.buffer);
                 }
                 _ => {
-                    self.selection = Selection::new(buffer_offset, buffer_offset);
+                    let off = self.snap_out_of_list_prefix(buffer_offset);
+                    self.selection = Selection::new(off, off);
                 }
             }
+        }
+    }
+
+    /// A list item's leading marker whitespace (indent + bullet, before the checkbox or
+    /// content) is structural, not text: a click there snaps to the nearer of the line
+    /// start or the content boundary, so the caret can't land mid-prefix in a space.
+    fn snap_out_of_list_prefix(&self, offset: usize) -> usize {
+        let line = self.buffer.byte_to_line(offset);
+        let markers = self.buffer.line_markers(line);
+        if !markers
+            .markers
+            .iter()
+            .any(|m| matches!(m.kind, MarkerKind::ListItem { .. }))
+        {
+            return offset;
+        }
+        let Some(prefix) = markers.marker_range() else {
+            return offset;
+        };
+        if offset > prefix.start && offset < prefix.end {
+            if offset - prefix.start <= prefix.end - offset {
+                prefix.start
+            } else {
+                prefix.end
+            }
+        } else {
+            offset
         }
     }
 

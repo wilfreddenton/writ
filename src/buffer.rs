@@ -12,8 +12,8 @@ static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
 use crate::highlight::{HighlightSpan, Highlighter};
 use crate::inline::{StyledRegion, extract_all_inline_styles, styles_in_range};
 use crate::marker::{
-    HeadingInfo, LineMarkers, ParsedNodes, collect_node_infos, is_line_in_checked_task,
-    is_line_in_code_block, markers_at_from_infos,
+    HeadingInfo, LineMarkers, ListItemInfo, ParsedNodes, collect_node_infos,
+    is_line_in_checked_task, is_line_in_code_block, markers_at_from_infos,
 };
 use crate::parser::{MarkdownParser, MarkdownTree};
 use crate::table::{RowKind, TableInfo};
@@ -672,6 +672,12 @@ impl BufferContent {
     /// parse tree, so this is auto-invalidated on edit.
     pub fn headings(&self) -> &[HeadingInfo] {
         &self.parsed().headings
+    }
+
+    /// List items in document order (parent before child), for list folding.
+    /// Rc-cached with the parse tree, so auto-invalidated on edit.
+    pub fn list_items(&self) -> &[ListItemInfo] {
+        &self.parsed().list_items
     }
 
     /// Compute LineMarkers for a specific line on demand.

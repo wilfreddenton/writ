@@ -1272,49 +1272,56 @@ fn draw_fold_chevrons(
     hover: Option<usize>,
     scale: f32,
 ) -> Vec<(usize, ScreenRect)> {
-    let headings = editor.state.buffer.headings();
-    if headings.is_empty() {
-        return Vec::new();
-    }
     let line_count = editor.line_count();
     let (first, last) = doc.visible_range(editor_h);
-    // Headings collapsed inside a folded ancestor are zero-height but still fall inside
-    // the contiguous visible-index span — exclude them so no stray chevron paints at the
+    // Anchors collapsed inside a folded ancestor are zero-height but still fall inside the
+    // contiguous visible-index span — exclude them so no stray chevron paints at the
     // ancestor's y.
     let hidden = editor.hidden_line_ranges();
+    let visible_foldable = |line: usize| -> bool {
+        line >= first && line < last && !hidden.iter().any(|r| r.contains(&line))
+    };
+    // Every visible, non-collapsed, foldable anchor — headings AND list items alike; the
+    // draw + hit-rect geometry below is identical for both.
+    let headings = editor.state.buffer.headings();
+    let list_items = editor.state.buffer.list_items();
+    let mut anchors: Vec<(usize, usize)> = Vec::new(); // (line, byte_offset)
+    for (idx, h) in headings.iter().enumerate() {
+        if visible_foldable(h.line) && fold::heading_is_foldable(headings, idx, line_count) {
+            anchors.push((h.line, h.byte_offset));
+        }
+    }
+    for (idx, it) in list_items.iter().enumerate() {
+        if visible_foldable(it.line) && fold::list_item_is_foldable(list_items, idx) {
+            anchors.push((it.line, it.byte_offset));
+        }
+    }
+
     let body_left = doc.body_left();
     let s = 9.0 * scale; // chevron glyph size (device px)
     let mut rects: Vec<(usize, ScreenRect)> = Vec::new();
-    for (idx, h) in headings.iter().enumerate() {
-        if h.line < first || h.line >= last {
-            continue;
-        }
-        if hidden.iter().any(|r| r.contains(&h.line)) {
-            continue;
-        }
-        if !fold::heading_is_foldable(headings, idx, line_count) {
-            continue;
-        }
-        let Some(top) = doc.line_top_screen(h.line) else {
+    for (line, byte_offset) in anchors {
+        let Some(top) = doc.line_top_screen(line) else {
             continue;
         };
-        let folded = editor.is_heading_folded(h.byte_offset);
+        // The fold set holds both heading and list-item offsets, so this reports either.
+        let folded = editor.is_heading_folded(byte_offset);
         // Full-height gutter hit target for easy clicking; the glyph is centered in it.
-        let row_h = doc.line_text_height(h.line);
+        let row_h = doc.line_text_height(line);
         let hit: ScreenRect = (
             (body_left - 20.0 * scale) as f64,
             top as f64,
             (body_left - 2.0 * scale) as f64,
             (top + row_h) as f64,
         );
-        rects.push((h.byte_offset, hit));
+        rects.push((byte_offset, hit));
         // Expanded chevrons only appear on hover; folded ones are always shown.
-        if !folded && hover != Some(h.byte_offset) {
+        if !folded && hover != Some(byte_offset) {
             continue;
         }
         let cx = body_left - 13.0 * scale;
         let cy = top + row_h / 2.0;
-        let color = if hover == Some(h.byte_offset) {
+        let color = if hover == Some(byte_offset) {
             peniko_color(theme.foreground)
         } else {
             peniko_color(theme.comment)
@@ -1801,16 +1808,22 @@ impl ApplicationHandler<WritEvent> for App {
                     .iter()
                     .find(|(_, r)| rect_contains(r, self.mouse_pos))
                 {
-                    // Modifier-clicks escalate scope: Ctrl = all sections at this level,
-                    // Shift = this section + all nested (recursive), Ctrl+Shift = all
-                    // sections at this level AND deeper, plain = just this one.
+                    // Modifier-clicks escalate scope on the same two axes for both kinds:
+                    // Ctrl = breadth (all at this heading level / list depth), Shift = depth
+                    // (recursive: this item + everything nested), Ctrl+Shift = breadth AND
+                    // depth, plain = just this one.
                     let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
                     let shift = self.modifiers.shift_key();
-                    match (ctrl, shift) {
-                        (true, true) => self.doc_engine.editor.toggle_fold_level_deep_at(off),
-                        (true, false) => self.doc_engine.editor.toggle_fold_level_at(off),
-                        (false, true) => self.doc_engine.editor.toggle_fold_recursive(off),
-                        (false, false) => self.doc_engine.editor.toggle_fold(off),
+                    let editor = &mut self.doc_engine.editor;
+                    match (editor.is_list_fold_offset(off), ctrl, shift) {
+                        (true, true, true) => editor.toggle_fold_list_level_deep_at(off),
+                        (true, true, false) => editor.toggle_fold_list_level_at(off),
+                        (true, false, true) => editor.toggle_fold_recursive(off),
+                        (true, false, false) => editor.toggle_fold(off),
+                        (false, true, true) => editor.toggle_fold_level_deep_at(off),
+                        (false, true, false) => editor.toggle_fold_level_at(off),
+                        (false, false, true) => editor.toggle_fold_recursive(off),
+                        (false, false, false) => editor.toggle_fold(off),
                     }
                     self.doc_engine
                         .rebuild_preserving_scroll(w, state.scale, vh);
