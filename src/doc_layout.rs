@@ -2365,7 +2365,7 @@ mod tests {
             )
         };
         let full = build(&mut engine, &[]);
-        let folded = build(&mut engine, &[1..3]); // hide lines 1 and 2
+        let folded = build(&mut engine, std::slice::from_ref(&(1..3))); // hide lines 1 and 2
 
         // Lines 1 and 2 collapse: their tops tie, and content height drops by exactly
         // the height those two lines occupied in the unfolded layout.
