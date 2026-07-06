@@ -57,4 +57,5 @@ pub mod shell;
 pub mod status_bar;
 pub mod table;
 pub mod text_engine;
+pub mod text_input;
 pub mod validation;
