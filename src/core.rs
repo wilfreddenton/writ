@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use regex::Regex;
 use std::time::SystemTime;
 
 use crate::buffer::{Buffer, RenderSnapshot};
@@ -33,6 +34,7 @@ use crate::inline::{
 };
 use crate::marker::MarkerKind;
 use crate::paste::{PasteContext, transform_paste};
+use crate::text_input::TextField;
 use crate::validation::{GitHubValidationCache, IssueStatus};
 
 /// The kind of autocomplete triggered at the cursor.
@@ -75,6 +77,40 @@ pub struct AutocompleteState {
     pub fetched_prefix: Option<String>,
 }
 
+/// Whether the find bar shows just the search field (Find) or search + replace (Replace).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FindMode {
+    Find,
+    Replace,
+}
+
+/// Which text field of the find bar currently receives keystrokes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FieldFocus {
+    Search,
+    Replace,
+}
+
+/// State for the find (and replace) bar. `matches` are buffer byte ranges, sorted
+/// left-to-right and non-overlapping (regex `find_iter` semantics); `active` indexes
+/// into it. `scanned` records the `(version, query, case, regex)` the current `matches`
+/// reflect so a cursor-only redraw can skip the rescan.
+pub struct FindState {
+    pub search: TextField,
+    pub replace: TextField,
+    pub mode: FindMode,
+    pub focus: FieldFocus,
+    /// Whether the find bar owns keyboard focus. While `true`, keys type into the
+    /// focused field; while `false` (bar open but the document was clicked) keys fall
+    /// through to the document so you can edit the buffer with the bar still visible.
+    pub focused: bool,
+    pub case_sensitive: bool,
+    pub regex: bool,
+    pub matches: Vec<Range<usize>>,
+    pub active: Option<usize>,
+    scanned: Option<(u64, String, bool, bool)>,
+}
+
 pub struct Editor {
     pub state: EditorState,
     file_path: Option<PathBuf>,
@@ -97,6 +133,9 @@ pub struct Editor {
     detection_key: Option<(u64, Range<usize>)>,
     /// Active `#`/`@` autocomplete popup, if the cursor is inside a trigger token.
     autocomplete: Option<AutocompleteState>,
+    /// Active find bar, if find (Ctrl+F) is open. While `Some`, the shell routes all
+    /// keystrokes to it instead of the document.
+    find: Option<FindState>,
 
     // --- inline git diff against HEAD ---
     /// (raw HEAD text, rendered snapshot of it) reused as the diff base.
@@ -126,6 +165,7 @@ impl Editor {
             github_refs_by_line: HashMap::new(),
             detection_key: None,
             autocomplete: None,
+            find: None,
             head_base: None,
             diff_state: None,
             file_watcher: None,
@@ -561,6 +601,291 @@ impl Editor {
         self.detection_key = Some((version, lines));
     }
 
+    // --- find bar -----------------------------------------------------------
+
+    /// Open the find bar in Find or Replace mode, focus the search field, and rescan.
+    /// An already-open bar keeps its typed query/replacement (only the mode/focus change),
+    /// so toggling Find↔Replace doesn't lose what you typed.
+    pub fn open_find(&mut self, replace: bool) {
+        let mode = if replace {
+            FindMode::Replace
+        } else {
+            FindMode::Find
+        };
+        match self.find.as_mut() {
+            Some(find) => {
+                find.mode = mode;
+                find.focus = FieldFocus::Search;
+                find.focused = true;
+            }
+            None => {
+                self.find = Some(FindState {
+                    search: TextField::new(),
+                    replace: TextField::new(),
+                    mode,
+                    focus: FieldFocus::Search,
+                    focused: true,
+                    case_sensitive: false,
+                    regex: false,
+                    matches: Vec::new(),
+                    active: None,
+                    scanned: None,
+                });
+            }
+        }
+        self.find_rescan();
+    }
+
+    pub fn close_find(&mut self) {
+        self.find = None;
+    }
+
+    pub fn find_state(&self) -> Option<&FindState> {
+        self.find.as_ref()
+    }
+
+    pub fn find_state_mut(&mut self) -> Option<&mut FindState> {
+        self.find.as_mut()
+    }
+
+    /// Rebuild the match list for the current query. Uses the regex crate for BOTH
+    /// literal and regex modes so byte offsets stay exact and case-folding is correct:
+    /// a literal query is `regex::escape`d, and `(?i)` is prepended when case-insensitive.
+    /// An invalid pattern (e.g. a half-typed `(`) yields no matches rather than panicking.
+    /// Sets the document selection to the active match so it gets caret/highlight/scroll
+    /// for free. A no-op when `(version, query, case, regex)` is unchanged.
+    pub fn find_rescan(&mut self) {
+        let Some(find) = self.find.as_ref() else {
+            return;
+        };
+        let query = find.search.text().to_string();
+        let case = find.case_sensitive;
+        let regex = find.regex;
+        let focused = find.focused;
+        let version = self.state.buffer.version();
+        if find.scanned.as_ref() == Some(&(version, query.clone(), case, regex)) {
+            return;
+        }
+
+        if query.is_empty() {
+            let find = self.find.as_mut().expect("find open");
+            find.matches.clear();
+            find.active = None;
+            find.scanned = Some((version, query, case, regex));
+            return;
+        }
+
+        let escaped;
+        let base = if regex {
+            query.as_str()
+        } else {
+            escaped = regex::escape(&query);
+            escaped.as_str()
+        };
+        let pattern = if case {
+            base.to_string()
+        } else {
+            format!("(?i){base}")
+        };
+
+        let matches: Vec<Range<usize>> = match Regex::new(&pattern) {
+            Ok(re) => {
+                let text = self.state.buffer.text();
+                re.find_iter(&text).map(|m| m.start()..m.end()).collect()
+            }
+            Err(_) => Vec::new(),
+        };
+
+        let cursor = self.cursor_position();
+        let active = (!matches.is_empty())
+            .then(|| matches.iter().position(|m| m.start >= cursor).unwrap_or(0));
+        // Only pull the document selection onto the active match when the bar owns focus.
+        // While the document is focused (bar open but unfocused), a rescan triggered by a
+        // buffer edit must not yank the caret away from where the user is typing.
+        if let Some(idx) = active
+            && focused
+        {
+            let r = matches[idx].clone();
+            self.state.selection = Selection::new(r.start, r.end);
+        }
+
+        let find = self.find.as_mut().expect("find open");
+        find.matches = matches;
+        find.active = active;
+        find.scanned = Some((version, query, case, regex));
+    }
+
+    /// Advance to the next match (wrapping), moving the document selection onto it.
+    /// Returns the new active match range so the shell can scroll it into view.
+    pub fn find_next(&mut self) -> Option<Range<usize>> {
+        self.find_step(true)
+    }
+
+    /// Retreat to the previous match (wrapping); otherwise like [`find_next`].
+    pub fn find_prev(&mut self) -> Option<Range<usize>> {
+        self.find_step(false)
+    }
+
+    fn find_step(&mut self, forward: bool) -> Option<Range<usize>> {
+        let find = self.find.as_mut()?;
+        let n = find.matches.len();
+        if n == 0 {
+            return None;
+        }
+        let cur = find.active.unwrap_or(0);
+        let next = if forward {
+            (cur + 1) % n
+        } else {
+            (cur + n - 1) % n
+        };
+        find.active = Some(next);
+        let r = find.matches[next].clone();
+        self.state.selection = Selection::new(r.start, r.end);
+        Some(r)
+    }
+
+    pub fn find_toggle_case(&mut self) {
+        if let Some(find) = self.find.as_mut() {
+            find.case_sensitive = !find.case_sensitive;
+        }
+        self.find_rescan();
+    }
+
+    pub fn find_toggle_regex(&mut self) {
+        if let Some(find) = self.find.as_mut() {
+            find.regex = !find.regex;
+        }
+        self.find_rescan();
+    }
+
+    /// Swap keyboard focus between the search and replace fields. A no-op in Find mode,
+    /// where there is no replace field to focus.
+    pub fn find_toggle_field(&mut self) {
+        if let Some(find) = self.find.as_mut()
+            && find.mode == FindMode::Replace
+        {
+            find.focus = match find.focus {
+                FieldFocus::Search => FieldFocus::Replace,
+                FieldFocus::Replace => FieldFocus::Search,
+            };
+        }
+    }
+
+    /// Recompile the exact `Regex` `find_rescan` used for the current query (literal
+    /// queries are `regex::escape`d, `(?i)` prepended when case-insensitive) so replace
+    /// can expand `$1`/`${name}` capture groups against a matched slice. `None` for an
+    /// empty or invalid pattern.
+    fn find_regex(&self) -> Option<Regex> {
+        let find = self.find.as_ref()?;
+        let query = find.search.text();
+        if query.is_empty() {
+            return None;
+        }
+        let escaped;
+        let base = if find.regex {
+            query
+        } else {
+            escaped = regex::escape(query);
+            escaped.as_str()
+        };
+        let pattern = if find.case_sensitive {
+            base.to_string()
+        } else {
+            format!("(?i){base}")
+        };
+        Regex::new(&pattern).ok()
+    }
+
+    /// Replace the active match with the replacement text (one undo step), then rescan
+    /// and land on the next match. In regex mode the replacement's `$1`/`${name}` groups
+    /// expand from the matched slice; in literal mode it is inserted verbatim. No-op when
+    /// there is no active match.
+    pub fn find_replace_current(&mut self) {
+        let Some(find) = self.find.as_ref() else {
+            return;
+        };
+        let Some(active) = find.active else {
+            return;
+        };
+        let range = find.matches[active].clone();
+        let replacement = find.replace.text().to_string();
+        let regex_mode = find.regex;
+
+        let expanded = if regex_mode {
+            match self.find_regex() {
+                Some(re) => {
+                    let text = self.state.buffer.text();
+                    re.replace(&text[range.clone()], replacement.as_str())
+                        .into_owned()
+                }
+                None => replacement,
+            }
+        } else {
+            replacement
+        };
+
+        // Replace the match range in a SINGLE undo step (a bare select+insert_text is a
+        // delete then an insert — two undo entries — so one Ctrl+Z wouldn't fully revert
+        // it). Same coalesce pattern as `find_replace_all`.
+        self.edit(|s| {
+            let head = s.buffer.undo_head();
+            let text_before = s.buffer.text();
+            let cursor_before = s.cursor().offset;
+            s.buffer.replace(range.clone(), &expanded, cursor_before);
+            let text_after = s.buffer.text();
+            let cursor_after = (range.start + expanded.len()).min(text_after.len());
+            s.buffer
+                .coalesce_since(head, &text_before, &text_after, cursor_before, cursor_after);
+            s.selection = Selection::new(cursor_after, cursor_after);
+        });
+
+        // Rescan advances `active`/selection to the first match at/after the new caret
+        // (skipping any occurrence the replacement itself introduced), and the shell
+        // scrolls that selection into view.
+        self.find_rescan();
+    }
+
+    /// Replace every current match in a single undo step, keeping the bar open. Regex
+    /// mode expands capture groups per match; literal mode inserts verbatim. Matches are
+    /// applied right-to-left so earlier byte offsets stay valid as the text shifts.
+    pub fn find_replace_all(&mut self) {
+        let Some(find) = self.find.as_ref() else {
+            return;
+        };
+        if find.matches.is_empty() {
+            return;
+        }
+        let matches = find.matches.clone();
+        let replacement = find.replace.text().to_string();
+        let re = self.find_regex();
+        let regex_mode = find.regex;
+
+        self.edit(|s| {
+            let head = s.buffer.undo_head();
+            let text_before = s.buffer.text();
+            let cursor_before = s.cursor().offset;
+
+            for range in matches.iter().rev() {
+                let expanded = match (regex_mode, &re) {
+                    (true, Some(re)) => re
+                        .replace(&text_before[range.clone()], replacement.as_str())
+                        .into_owned(),
+                    _ => replacement.clone(),
+                };
+                s.buffer.replace(range.clone(), &expanded, cursor_before);
+            }
+
+            let text_after = s.buffer.text();
+            let cursor_after = cursor_before.min(text_after.len());
+            // Collapse the per-match edits into one minimal undo entry.
+            s.buffer
+                .coalesce_since(head, &text_before, &text_after, cursor_before, cursor_after);
+            s.selection = Selection::new(cursor_after, cursor_after);
+        });
+
+        self.find_rescan();
+    }
+
     // --- GitHub autocomplete (#/@) ------------------------------------------
 
     pub fn autocomplete(&self) -> Option<&AutocompleteState> {
@@ -936,6 +1261,44 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    /// Secondary find-feature spike: measure whether a full-document scan per keystroke
+    /// (rope→String, then `match_indices`) is cheap enough to run live. Not asserted on
+    /// (timings are flaky in CI); run with `--ignored --nocapture` to see the numbers.
+    #[test]
+    #[ignore = "manual measurement; prints timing, no assertions"]
+    fn find_scan_cost_on_large_document() {
+        // ~10k lines of representative markdown (headings, prose, lists, code).
+        let unit = "\
+# Heading with a searchable word target here
+Some prose paragraph mentioning target and other words in a sentence.
+- a list item with target inside it
+- another item, plainer
+```
+let code = target(); // fenced block line
+```
+> a blockquote line about targets and things
+";
+        let reps = 10_000 / unit.lines().count();
+        let mut src = String::with_capacity(unit.len() * reps);
+        for _ in 0..reps {
+            src.push_str(unit);
+        }
+        let mut buffer = Buffer::new();
+        buffer.insert(0, &src, 0);
+        let line_count = buffer.text().lines().count();
+
+        for query in ["target", "the", "nonexistent_zzz"] {
+            let t = Instant::now();
+            let text = buffer.text();
+            let count = text.match_indices(query).count();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "scan {line_count} lines for {query:?}: {count} hits in {ms:.3} ms (text()+match_indices)",
+            );
+        }
+    }
 
     /// Autosave (used by the GhostText daemon via `--autosave`) writes every edit back to
     /// the file with no explicit save — the daemon relays that to the browser.
@@ -1256,5 +1619,290 @@ mod tests {
         assert!(!editor.is_dirty(), "saved buffer is clean");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Type `query` into the open find bar's search field and rescan.
+    fn set_query(editor: &mut Editor, query: &str) {
+        editor.find_state_mut().unwrap().search.set_text(query);
+        editor.find_rescan();
+    }
+
+    #[test]
+    fn find_literal_and_case_toggle() {
+        let mut e = Editor::new("Cat cat CAT cot\n");
+        e.set_cursor(0);
+        e.open_find(false);
+
+        // Case-insensitive (default): all three "cat"s match, not "cot".
+        set_query(&mut e, "cat");
+        assert_eq!(e.find_state().unwrap().matches.len(), 3);
+
+        // Toggling case-sensitive drops "Cat" and "CAT", leaving only "cat".
+        e.find_toggle_case();
+        assert_eq!(e.find_state().unwrap().matches.len(), 1);
+    }
+
+    #[test]
+    fn find_regex_mode_and_invalid_pattern() {
+        let mut e = Editor::new("a table, a tible, a topple\n");
+        e.set_cursor(0);
+        e.open_find(false);
+        e.find_toggle_regex();
+
+        set_query(&mut e, "t.ble");
+        assert_eq!(
+            e.find_state().unwrap().matches.len(),
+            2,
+            "t.ble matches table and tible"
+        );
+
+        // A half-typed pattern must not panic — it just yields no matches.
+        set_query(&mut e, "(");
+        assert!(e.find_state().unwrap().matches.is_empty());
+        assert!(e.find_state().unwrap().active.is_none());
+    }
+
+    #[test]
+    fn find_adjacent_matches_are_non_overlapping() {
+        let mut e = Editor::new("aaaa\n");
+        e.set_cursor(0);
+        e.open_find(false);
+        set_query(&mut e, "aa");
+        // Non-overlapping left-to-right: [0..2, 2..4], not 3.
+        assert_eq!(e.find_state().unwrap().matches.len(), 2);
+    }
+
+    #[test]
+    fn find_next_cycles_and_sets_selection() {
+        let mut e = Editor::new("x . x . x\n");
+        e.set_cursor(0);
+        e.open_find(false);
+        set_query(&mut e, "x");
+        let m = &e.find_state().unwrap().matches;
+        assert_eq!(m.len(), 3);
+        let ranges: Vec<_> = m.clone();
+
+        // active starts at the first match at/after the caret (offset 0).
+        assert_eq!(e.find_state().unwrap().active, Some(0));
+        assert_eq!(e.selection_range(), Some(ranges[0].clone()));
+
+        assert_eq!(e.find_next(), Some(ranges[1].clone()));
+        assert_eq!(e.find_state().unwrap().active, Some(1));
+        assert_eq!(e.selection_range(), Some(ranges[1].clone()));
+
+        assert_eq!(e.find_next(), Some(ranges[2].clone()));
+        assert_eq!(e.find_next(), Some(ranges[0].clone()), "wraps to start");
+        assert_eq!(e.find_state().unwrap().active, Some(0));
+
+        assert_eq!(e.find_prev(), Some(ranges[2].clone()), "prev wraps back");
+    }
+
+    #[test]
+    fn find_active_picks_match_at_or_after_caret() {
+        // Caret just past the second "x": active is the third match (first at/after caret).
+        let mut e = Editor::new("x . x . x\n");
+        let third = e.text().rfind('x').unwrap();
+        e.set_cursor(e.text()[..third].rfind('x').unwrap() + 1);
+        e.open_find(false);
+        set_query(&mut e, "x");
+        assert_eq!(e.find_state().unwrap().active, Some(2));
+
+        // Caret past every match wraps active back to the first.
+        let mut e = Editor::new("x . x . x\n");
+        e.set_cursor(e.len());
+        e.open_find(false);
+        set_query(&mut e, "x");
+        assert_eq!(
+            e.find_state().unwrap().active,
+            Some(0),
+            "wraps to first match"
+        );
+    }
+
+    fn set_replace(editor: &mut Editor, replacement: &str) {
+        editor
+            .find_state_mut()
+            .unwrap()
+            .replace
+            .set_text(replacement);
+    }
+
+    #[test]
+    fn find_replace_current_literal_advances() {
+        let mut e = Editor::new("cat cat cat\n");
+        e.set_cursor(0);
+        e.open_find(true);
+        set_query(&mut e, "cat");
+        set_replace(&mut e, "dog");
+        assert_eq!(e.find_state().unwrap().active, Some(0));
+
+        e.find_replace_current();
+        assert_eq!(e.text(), "dog cat cat\n");
+        // Rescan finds the remaining two "cat"s and lands on the next one.
+        assert_eq!(e.find_state().unwrap().matches.len(), 2);
+        assert_eq!(e.find_state().unwrap().active, Some(0));
+        assert_eq!(e.selection_range(), Some(4..7));
+    }
+
+    #[test]
+    fn find_replace_current_noop_without_active() {
+        let mut e = Editor::new("hello\n");
+        e.set_cursor(0);
+        e.open_find(true);
+        set_query(&mut e, "zzz");
+        set_replace(&mut e, "x");
+        assert!(e.find_state().unwrap().active.is_none());
+        e.find_replace_current();
+        assert_eq!(e.text(), "hello\n");
+    }
+
+    #[test]
+    fn find_replace_all_literal_longer_and_shorter() {
+        // Longer replacement.
+        let mut e = Editor::new("a a a\n");
+        e.set_cursor(0);
+        e.open_find(true);
+        set_query(&mut e, "a");
+        set_replace(&mut e, "bb");
+        e.find_replace_all();
+        assert_eq!(e.text(), "bb bb bb\n");
+        assert!(e.find_state().unwrap().matches.is_empty());
+
+        // Shorter replacement.
+        let mut e = Editor::new("aa aa\n");
+        e.set_cursor(0);
+        e.open_find(true);
+        set_query(&mut e, "aa");
+        set_replace(&mut e, "x");
+        e.find_replace_all();
+        assert_eq!(e.text(), "x x\n");
+    }
+
+    #[test]
+    fn find_replace_current_regex_expands_capture() {
+        let mut e = Editor::new("user_id and role_id\n");
+        e.set_cursor(0);
+        e.open_find(true);
+        e.find_toggle_regex();
+        set_query(&mut e, r"(\w+)_id");
+        set_replace(&mut e, "${1}Id");
+        e.find_replace_current();
+        assert_eq!(e.text(), "userId and role_id\n");
+    }
+
+    #[test]
+    fn find_replace_all_regex_expands_every_capture() {
+        let mut e = Editor::new("user_id and role_id\n");
+        e.set_cursor(0);
+        e.open_find(true);
+        e.find_toggle_regex();
+        set_query(&mut e, r"(\w+)_id");
+        set_replace(&mut e, "${1}Id");
+        e.find_replace_all();
+        assert_eq!(e.text(), "userId and roleId\n");
+    }
+
+    #[test]
+    fn find_replace_current_replacement_containing_query_no_loop() {
+        let mut e = Editor::new("cat cat\n");
+        e.set_cursor(0);
+        e.open_find(true);
+        set_query(&mut e, "cat");
+        set_replace(&mut e, "cat!");
+        e.find_replace_current();
+        assert_eq!(e.text(), "cat! cat\n");
+        // The occurrence inside the just-inserted replacement is skipped; active is the
+        // next real match past the caret, so repeated replace can't spin forever.
+        assert_eq!(e.find_state().unwrap().matches.len(), 2);
+        assert_eq!(e.find_state().unwrap().active, Some(1));
+        assert_eq!(e.selection_range(), Some(5..8));
+    }
+
+    #[test]
+    fn find_replace_all_is_single_undo_step() {
+        let mut e = Editor::new("a a a\n");
+        e.set_cursor(0);
+        e.open_find(true);
+        set_query(&mut e, "a");
+        set_replace(&mut e, "bb");
+        e.find_replace_all();
+        assert_eq!(e.text(), "bb bb bb\n");
+        e.undo();
+        assert_eq!(
+            e.text(),
+            "a a a\n",
+            "one undo reverts the whole replace-all"
+        );
+    }
+
+    #[test]
+    fn find_replace_current_is_single_undo_step() {
+        let mut e = Editor::new("a a a\n");
+        e.set_cursor(0);
+        e.open_find(true);
+        set_query(&mut e, "a");
+        set_replace(&mut e, "bb");
+        e.find_replace_current();
+        assert_eq!(e.text(), "bb a a\n");
+        e.undo();
+        assert_eq!(e.text(), "a a a\n", "one undo reverts a single replace");
+    }
+
+    #[test]
+    fn open_find_focuses_the_bar() {
+        let mut e = Editor::new("hi\n");
+        e.open_find(false);
+        assert!(e.find_state().unwrap().focused, "opens focused");
+
+        // Simulate a document click unfocusing the bar; re-opening (Ctrl+F) refocuses it.
+        e.find_state_mut().unwrap().focused = false;
+        e.open_find(false);
+        assert!(e.find_state().unwrap().focused, "re-opening refocuses");
+    }
+
+    #[test]
+    fn rescan_while_unfocused_does_not_move_selection() {
+        let mut e = Editor::new("cat cat cat\n");
+        e.set_cursor(0);
+        e.open_find(false);
+        set_query(&mut e, "cat");
+        // Focused: the active match owns the document selection.
+        assert_eq!(e.selection_range(), Some(0..3));
+
+        // Unfocus the bar (as a document click does) and edit the buffer in the doc.
+        e.find_state_mut().unwrap().focused = false;
+        e.set_cursor(9);
+        e.insert_str("X");
+        e.find_rescan();
+
+        // Highlights track the edit, but the caret stays where the user typed — the rescan
+        // must not yank the selection onto a match.
+        assert_eq!(e.find_state().unwrap().matches.len(), 2);
+        assert!(
+            e.selection_range().is_none(),
+            "unfocused rescan leaves the doc caret alone"
+        );
+    }
+
+    #[test]
+    fn undo_of_replace_restores_text_and_rescan_refreshes_matches() {
+        let mut e = Editor::new("cat cat cat\n");
+        e.set_cursor(0);
+        e.open_find(true);
+        set_query(&mut e, "cat");
+        set_replace(&mut e, "dog");
+        e.find_replace_all();
+        assert_eq!(e.text(), "dog dog dog\n");
+        assert!(e.find_state().unwrap().matches.is_empty());
+
+        // The find-bar undo passthrough: undo the replace, then rescan the stale matches.
+        e.undo();
+        e.find_rescan();
+        assert_eq!(e.text(), "cat cat cat\n");
+        assert_eq!(
+            e.find_state().unwrap().matches.len(),
+            3,
+            "rescan after undo restores the full match set"
+        );
     }
 }

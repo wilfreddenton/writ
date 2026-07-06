@@ -1376,7 +1376,7 @@ impl DocLayout {
     }
 
     /// Buffer line index containing `buffer_off` (clamped to the last line).
-    fn line_of(&self, buffer_off: usize) -> usize {
+    pub fn line_of(&self, buffer_off: usize) -> usize {
         let n = self.line_ranges.len();
         if n == 0 {
             return 0;
