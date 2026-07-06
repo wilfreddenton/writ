@@ -106,15 +106,18 @@ pub struct LineRender {
     pub table: Option<TableLineRef>,
 }
 
-/// Font-size multiplier for a heading level (1 = largest). 0 = body text.
+/// Font-size multiplier for a heading level (1 = largest). 0 = body text. A modular type
+/// scale on the Major Third ratio (1.25), anchored so H6 = body size (the floor — no
+/// heading is ever smaller than body) and each step up is 1.25× the last, giving large,
+/// evenly-exaggerated jumps that keep adjacent levels clearly distinct.
 fn heading_scale(level: u8) -> f32 {
     match level {
-        1 => 1.8,
-        2 => 1.5,
-        3 => 1.3,
-        4 => 1.15,
-        5 => 1.05,
-        _ => 1.0,
+        1 => 3.05, // 1.25^5
+        2 => 2.44, // 1.25^4
+        3 => 1.95, // 1.25^3
+        4 => 1.56, // 1.25^2
+        5 => 1.25, // 1.25^1
+        _ => 1.0,  // H6+ = body
     }
 }
 

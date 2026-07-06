@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use unicode_segmentation::UnicodeSegmentation;
-use vello::kurbo::{Affine, Rect, Stroke};
+use vello::kurbo::{Affine, BezPath, Point, Rect, Stroke};
 use vello::peniko::Fill;
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
@@ -32,7 +32,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Theme, Window, WindowId};
 
 use winit::event_loop::ControlFlow;
@@ -50,6 +50,7 @@ use crate::doc_layout::{
     ScreenRect, TableCache,
 };
 use crate::editor::{Direction, EditorTheme};
+use crate::fold;
 use crate::git::{detect_github_context, parse_github_repo_string};
 use crate::github::{GitHubClient, ValidationResult};
 use crate::image_cache::ImageCache;
@@ -348,6 +349,11 @@ struct App {
     outline_row_rects: Vec<ScreenRect>,
     /// Outline row under the pointer, if any (drives the hover tint).
     outline_hover: Option<usize>,
+    /// Fold chevron hit rects (heading byte offset → gutter rect) from the last paint.
+    fold_chevron_rects: Vec<(usize, ScreenRect)>,
+    /// Heading (by byte offset) whose gutter chevron is under the pointer, if any. Drives
+    /// hover-reveal of the expanded (▾) chevron on non-folded headings.
+    gutter_hover: Option<usize>,
     /// Screen rects of the find bar's Replace/All buttons (for click routing), when the
     /// bar is open in Replace mode.
     find_btn_rects: Option<FindButtonRects>,
@@ -413,6 +419,8 @@ impl App {
             ac_row_rects: Vec::new(),
             outline_row_rects: Vec::new(),
             outline_hover: None,
+            fold_chevron_rects: Vec::new(),
+            gutter_hover: None,
             find_btn_rects: None,
             ac_gen: Arc::new(AtomicU64::new(0)),
             ac_slot: Arc::new(Mutex::new(None)),
@@ -839,6 +847,9 @@ impl DocEngine {
     }
 
     fn refresh(&mut self, device_width: f32, scale: f32, editor_h: f32) {
+        // Auto-unfold if a cursor move (arrows, typing, find fall-through) entered a
+        // folded region, before we lay out around the new position.
+        self.editor.reveal_cursor();
         self.editor
             .refresh_detection(self.detection_range(editor_h));
         let mut new_doc = self.relayout_at_anchor(device_width, scale, editor_h);
@@ -909,6 +920,7 @@ impl DocEngine {
             text: &p.text,
             cursor: p.cursor,
         });
+        let folds = self.editor.hidden_line_ranges();
         DocLayout::build(
             &mut self.text_engine,
             &mut self.line_cache,
@@ -926,6 +938,7 @@ impl DocEngine {
             preedit.as_ref(),
             anchor_line,
             viewport_h,
+            &folds,
         )
     }
 }
@@ -1068,7 +1081,12 @@ fn paint_document(
     height: f32,
     scale: f32,
     outline_hover: Option<usize>,
-) -> (Option<FindButtonRects>, Vec<ScreenRect>) {
+    gutter_hover: Option<usize>,
+) -> (
+    Option<FindButtonRects>,
+    Vec<ScreenRect>,
+    Vec<(usize, ScreenRect)>,
+) {
     // The outline panel (when open) reserves a right strip; clip the document body to the
     // reduced region so glyphs/backgrounds never draw under the panel.
     let outline_w = outline_width(editor, scale);
@@ -1153,6 +1171,7 @@ fn paint_document(
             &Rect::new(x0, y0, x1.max(x0 + 1.0), y1),
         );
     }
+    let fold_rects = draw_fold_chevrons(scene, theme, editor, doc, editor_h, gutter_hover, scale);
     scene.pop_layer();
 
     // The right-docked outline panel: the document's heading list with the current
@@ -1168,6 +1187,10 @@ fn paint_document(
         let headings = buffer.headings();
         let cursor_line = buffer.byte_to_line(editor.cursor_position());
         let current = current_heading_index(headings, cursor_line);
+        let folded: Vec<bool> = headings
+            .iter()
+            .map(|h| editor.is_heading_folded(h.byte_offset))
+            .collect();
         draw_outline(
             engine,
             scene,
@@ -1175,6 +1198,7 @@ fn paint_document(
             headings,
             current,
             outline_hover,
+            &folded,
             &panel,
             scale,
         )
@@ -1219,7 +1243,98 @@ fn paint_document(
         &info,
         scale,
     );
-    (btn_rects, outline_rects)
+    (btn_rects, outline_rects, fold_rects)
+}
+
+/// Heading depth for a `Ctrl+Shift+<n>` fold-to-level shortcut, from the physical digit
+/// key (1..6), or `None` for any other key.
+fn fold_level_key(key: PhysicalKey) -> Option<u8> {
+    match key {
+        PhysicalKey::Code(KeyCode::Digit1) => Some(1),
+        PhysicalKey::Code(KeyCode::Digit2) => Some(2),
+        PhysicalKey::Code(KeyCode::Digit3) => Some(3),
+        PhysicalKey::Code(KeyCode::Digit4) => Some(4),
+        PhysicalKey::Code(KeyCode::Digit5) => Some(5),
+        PhysicalKey::Code(KeyCode::Digit6) => Some(6),
+        _ => None,
+    }
+}
+
+/// Draw fold chevrons in the left gutter beside every visible foldable heading, and
+/// return their hit rects keyed by heading byte offset. A folded heading shows a
+/// persistent ▸; an expanded heading shows ▾ only while its gutter is hovered.
+fn draw_fold_chevrons(
+    scene: &mut Scene,
+    theme: &EditorTheme,
+    editor: &Editor,
+    doc: &DocLayout,
+    editor_h: f32,
+    hover: Option<usize>,
+    scale: f32,
+) -> Vec<(usize, ScreenRect)> {
+    let headings = editor.state.buffer.headings();
+    if headings.is_empty() {
+        return Vec::new();
+    }
+    let line_count = editor.line_count();
+    let (first, last) = doc.visible_range(editor_h);
+    // Headings collapsed inside a folded ancestor are zero-height but still fall inside
+    // the contiguous visible-index span — exclude them so no stray chevron paints at the
+    // ancestor's y.
+    let hidden = editor.hidden_line_ranges();
+    let body_left = doc.body_left();
+    let s = 9.0 * scale; // chevron glyph size (device px)
+    let mut rects: Vec<(usize, ScreenRect)> = Vec::new();
+    for (idx, h) in headings.iter().enumerate() {
+        if h.line < first || h.line >= last {
+            continue;
+        }
+        if hidden.iter().any(|r| r.contains(&h.line)) {
+            continue;
+        }
+        if !fold::heading_is_foldable(headings, idx, line_count) {
+            continue;
+        }
+        let Some(top) = doc.line_top_screen(h.line) else {
+            continue;
+        };
+        let folded = editor.is_heading_folded(h.byte_offset);
+        // Full-height gutter hit target for easy clicking; the glyph is centered in it.
+        let row_h = doc.line_text_height(h.line);
+        let hit: ScreenRect = (
+            (body_left - 20.0 * scale) as f64,
+            top as f64,
+            (body_left - 2.0 * scale) as f64,
+            (top + row_h) as f64,
+        );
+        rects.push((h.byte_offset, hit));
+        // Expanded chevrons only appear on hover; folded ones are always shown.
+        if !folded && hover != Some(h.byte_offset) {
+            continue;
+        }
+        let cx = body_left - 13.0 * scale;
+        let cy = top + row_h / 2.0;
+        let color = if hover == Some(h.byte_offset) {
+            peniko_color(theme.foreground)
+        } else {
+            peniko_color(theme.comment)
+        };
+        let mut tri = BezPath::new();
+        if folded {
+            // ▸ pointing right.
+            tri.move_to(Point::new((cx - s * 0.3) as f64, (cy - s * 0.5) as f64));
+            tri.line_to(Point::new((cx - s * 0.3) as f64, (cy + s * 0.5) as f64));
+            tri.line_to(Point::new((cx + s * 0.45) as f64, cy as f64));
+        } else {
+            // ▾ pointing down.
+            tri.move_to(Point::new((cx - s * 0.5) as f64, (cy - s * 0.3) as f64));
+            tri.line_to(Point::new((cx + s * 0.5) as f64, (cy - s * 0.3) as f64));
+            tri.line_to(Point::new(cx as f64, (cy + s * 0.45) as f64));
+        }
+        tri.close_path();
+        scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &tri);
+    }
+    rects
 }
 
 impl ApplicationHandler<WritEvent> for App {
@@ -1525,6 +1640,16 @@ impl ApplicationHandler<WritEvent> for App {
                     self.outline_hover = new_outline_hover;
                     state.window.request_redraw();
                 }
+                // Fold-gutter hover: reveal the expanded (▾) chevron under the pointer.
+                let new_gutter_hover = self
+                    .fold_chevron_rects
+                    .iter()
+                    .find(|(_, r)| rect_contains(r, self.mouse_pos))
+                    .map(|(off, _)| *off);
+                if new_gutter_hover != self.gutter_hover {
+                    self.gutter_hover = new_gutter_hover;
+                    state.window.request_redraw();
+                }
                 if self.mouse_down {
                     let (w, vh, _) = state.viewport();
                     // Record the edge auto-scroll velocity for the timer tick; the move
@@ -1668,6 +1793,31 @@ impl ApplicationHandler<WritEvent> for App {
                     return;
                 }
 
+                // Fold-gutter chevron click: toggle that heading's fold, don't place the
+                // caret. Checked before the document hit-test since the chevron sits in
+                // the left margin, outside the text body.
+                if let Some(&(off, _)) = self
+                    .fold_chevron_rects
+                    .iter()
+                    .find(|(_, r)| rect_contains(r, self.mouse_pos))
+                {
+                    // Modifier-clicks escalate scope: Ctrl = all sections at this level,
+                    // Shift = this section + all nested (recursive), Ctrl+Shift = all
+                    // sections at this level AND deeper, plain = just this one.
+                    let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
+                    let shift = self.modifiers.shift_key();
+                    match (ctrl, shift) {
+                        (true, true) => self.doc_engine.editor.toggle_fold_level_deep_at(off),
+                        (true, false) => self.doc_engine.editor.toggle_fold_level_at(off),
+                        (false, true) => self.doc_engine.editor.toggle_fold_recursive(off),
+                        (false, false) => self.doc_engine.editor.toggle_fold(off),
+                    }
+                    self.doc_engine
+                        .rebuild_preserving_scroll(w, state.scale, vh);
+                    state.window.request_redraw();
+                    return;
+                }
+
                 // Outline panel click: jump to the clicked heading (pin it to the top).
                 // A click anywhere in the strip returns without placing the doc caret,
                 // even if it missed a row (the strip isn't part of the document).
@@ -1685,6 +1835,12 @@ impl ApplicationHandler<WritEvent> for App {
                             .map(|h| h.byte_offset);
                         if let Some(off) = off {
                             self.doc_engine.editor.set_cursor(off);
+                            // The clicked heading may sit inside a folded ancestor; reveal
+                            // it and relayout so its geometry exists before we pin it.
+                            if self.doc_engine.editor.reveal_cursor() {
+                                self.doc_engine
+                                    .rebuild_preserving_scroll(w, state.scale, vh);
+                            }
                             let mut remeasure = false;
                             if let Some(doc) = self.doc_engine.doc.as_mut() {
                                 doc.scroll_line_to_top(doc.line_of(off), vh);
@@ -1835,6 +1991,43 @@ impl ApplicationHandler<WritEvent> for App {
                     return;
                 }
 
+                // Heading folding: Ctrl/Cmd+Shift+[ / ] fold / unfold the current section;
+                // Ctrl/Cmd+Alt+[ / ] fold / unfold all headings; Ctrl/Cmd+Shift+1..6 fold
+                // to that heading depth (Sublime's chord-free "fold by level"). Matched on
+                // physical keys so Shift's `{`/`}`/`!` remaps don't matter.
+                let alt = self.modifiers.alt_key();
+                if cmd && (shift || alt) {
+                    let bracket = match event.physical_key {
+                        PhysicalKey::Code(KeyCode::BracketLeft) => Some(true),
+                        PhysicalKey::Code(KeyCode::BracketRight) => Some(false),
+                        _ => None,
+                    };
+                    let level = shift.then(|| fold_level_key(event.physical_key)).flatten();
+                    let acted = if let Some(left) = bracket {
+                        match (shift, left) {
+                            (true, true) => self.doc_engine.editor.fold_at_cursor(),
+                            (true, false) => self.doc_engine.editor.unfold_at_cursor(),
+                            (false, true) => self.doc_engine.editor.fold_all_headings(),
+                            (false, false) => self.doc_engine.editor.unfold_all(),
+                        }
+                        true
+                    } else if let Some(level) = level {
+                        self.doc_engine.editor.fold_to_level(level);
+                        true
+                    } else {
+                        false
+                    };
+                    if acted {
+                        let (fw, feh, fscale) = state.viewport();
+                        self.doc_engine.rebuild_preserving_scroll(fw, fscale, feh);
+                        if let Some(doc) = self.doc_engine.doc.as_mut() {
+                            doc.scroll_to(self.doc_engine.editor.cursor_position(), feh);
+                        }
+                        state.window.request_redraw();
+                        return;
+                    }
+                }
+
                 // Escape closes the find bar regardless of which pane holds focus (so it
                 // works even after clicking into the document unfocuses the bar).
                 if self.doc_engine.editor.find_state().is_some()
@@ -1923,10 +2116,18 @@ impl ApplicationHandler<WritEvent> for App {
                                 } else {
                                     self.doc_engine.editor.find_next()
                                 };
-                                if hit.is_some()
-                                    && let Some(doc) = self.doc_engine.doc.as_mut()
-                                {
-                                    doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
+                                if hit.is_some() {
+                                    // Jumping to a match inside a folded section reveals it.
+                                    if self.doc_engine.editor.reveal_cursor() {
+                                        self.doc_engine.rebuild_preserving_scroll(
+                                            w,
+                                            state.scale,
+                                            vh,
+                                        );
+                                    }
+                                    if let Some(doc) = self.doc_engine.doc.as_mut() {
+                                        doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
+                                    }
                                 }
                             }
                         }
@@ -2123,7 +2324,7 @@ impl ApplicationHandler<WritEvent> for App {
                 }
 
                 if let Some(doc) = self.doc_engine.doc.as_ref() {
-                    let (btn_rects, outline_rects) = paint_document(
+                    let (btn_rects, outline_rects, fold_rects) = paint_document(
                         &mut self.scene,
                         &mut self.doc_engine.text_engine,
                         &self.doc_engine.theme,
@@ -2136,9 +2337,11 @@ impl ApplicationHandler<WritEvent> for App {
                         height,
                         state.scale,
                         self.outline_hover,
+                        self.gutter_hover,
                     );
                     self.find_btn_rects = btn_rects;
                     self.outline_row_rects = outline_rects;
+                    self.fold_chevron_rects = fold_rects;
 
                     // Overlays on top of everything (unclipped): the autocomplete
                     // dropdown takes priority over the hover popover.
@@ -2474,6 +2677,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         width as f32,
         height as f32,
         1.0,
+        None,
         None,
     );
 

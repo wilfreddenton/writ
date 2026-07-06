@@ -34,6 +34,7 @@ pub mod cursor;
 pub mod diff;
 pub mod doc_layout;
 pub mod editor;
+pub mod fold;
 #[cfg(feature = "git")]
 pub mod git;
 #[cfg(feature = "github")]

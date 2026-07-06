@@ -11,7 +11,7 @@
 //! are intentionally not ported here yet; they return to the shell on real tokio
 //! in a later phase. Detection (the synchronous scan) lives here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -26,6 +26,7 @@ use crate::buffer::{Buffer, RenderSnapshot};
 use crate::cursor::Selection;
 use crate::diff::DiffState;
 use crate::editor::{Direction, EditorState};
+use crate::fold;
 use crate::git::head_blob_text;
 use crate::github::GitHubClient;
 use crate::inline::{
@@ -139,6 +140,10 @@ pub struct Editor {
     /// Whether the right-docked outline panel is open. Reserves a horizontal strip so
     /// the document region insets (see `outline_width`).
     outline_open: bool,
+    /// Byte offsets of folded headings (session UI state, never written to the file).
+    /// Anchored by offset so a single-splice edit remaps them exactly; the hidden-line
+    /// derivation re-reads live headings each frame, so a fold's reach tracks edits.
+    folded_headings: HashSet<usize>,
 
     // --- inline git diff against HEAD ---
     /// (raw HEAD text, rendered snapshot of it) reused as the diff base.
@@ -170,6 +175,7 @@ impl Editor {
             autocomplete: None,
             find: None,
             outline_open: false,
+            folded_headings: HashSet::new(),
             head_base: None,
             diff_state: None,
             file_watcher: None,
@@ -271,10 +277,35 @@ impl Editor {
     /// diff so a new mutator can't silently skip the refresh. Cursor-only ops that don't
     /// touch the buffer (click/drag/move/select_all) deliberately bypass this.
     fn edit<R>(&mut self, f: impl FnOnce(&mut EditorState) -> R) -> R {
+        // Capture the splice so folded-heading offsets can be remapped exactly. `anchor`
+        // is the left edge of the affected region (selection start, or the caret).
+        let anchor = self.state.selection.range().start;
+        let len_before = self.state.buffer.len_bytes();
         let result = f(&mut self.state);
+        let len_after = self.state.buffer.len_bytes();
+        if !self.folded_headings.is_empty() && len_before != len_after {
+            self.remap_folds(anchor, len_before, len_after);
+        }
         self.recompute_diff();
         self.maybe_autosave();
         result
+    }
+
+    /// Shift folded-heading offsets across a single-splice edit at `anchor`. Offsets left
+    /// of the splice are fixed; those inside a deletion collapse below `anchor` and drop.
+    fn remap_folds(&mut self, anchor: usize, len_before: usize, len_after: usize) {
+        let delta = len_after as isize - len_before as isize;
+        let old = std::mem::take(&mut self.folded_headings);
+        self.folded_headings = old
+            .into_iter()
+            .filter_map(|o| {
+                if o < anchor {
+                    return Some(o);
+                }
+                let shifted = o as isize + delta;
+                (shifted >= anchor as isize).then_some(shifted as usize)
+            })
+            .collect();
     }
 
     pub fn insert_str(&mut self, text: &str) {
@@ -666,6 +697,225 @@ impl Editor {
     /// golden frame with the panel reserved.
     pub fn set_outline_open(&mut self, open: bool) {
         self.outline_open = open;
+    }
+
+    // --- heading folding (session UI state; see `fold`) ----------------------
+
+    pub fn line_count(&self) -> usize {
+        self.state.buffer.line_count()
+    }
+
+    /// Merged, sorted line ranges the layout should collapse to zero height.
+    pub fn hidden_line_ranges(&self) -> Vec<Range<usize>> {
+        fold::hidden_line_ranges(
+            self.state.buffer.headings(),
+            &self.folded_headings,
+            self.state.buffer.line_count(),
+        )
+    }
+
+    pub fn is_heading_folded(&self, byte_offset: usize) -> bool {
+        self.folded_headings.contains(&byte_offset)
+    }
+
+    /// Toggle the fold on the heading anchored at `byte_offset` (a gutter-chevron click).
+    pub fn toggle_fold(&mut self, byte_offset: usize) {
+        if !self.folded_headings.remove(&byte_offset) {
+            self.folded_headings.insert(byte_offset);
+        }
+        self.clamp_cursor_to_visible();
+    }
+
+    /// Recursive fold toggle (Shift+click a chevron): fold the heading together with all
+    /// its descendant subheadings, or — if it's already folded — unfold it and them. Folds
+    /// the descendants too so unfolding the parent later reveals a still-collapsed subtree,
+    /// matching the TextMate/VS Code "fold recursively" convention.
+    pub fn toggle_fold_recursive(&mut self, byte_offset: usize) {
+        let line_count = self.state.buffer.line_count();
+        let headings = self.state.buffer.headings();
+        let Some(idx) = headings.iter().position(|h| h.byte_offset == byte_offset) else {
+            return;
+        };
+        if !fold::heading_is_foldable(headings, idx, line_count) {
+            return;
+        }
+        // The heading plus every foldable heading nested inside its extent (all deeper,
+        // since the extent stops at the next same-or-higher heading).
+        let extent = fold::heading_extent(headings, idx, line_count);
+        let mut offs = vec![byte_offset];
+        for (j, h) in headings.iter().enumerate().skip(idx + 1) {
+            if h.line >= extent.end {
+                break;
+            }
+            if fold::heading_is_foldable(headings, j, line_count) {
+                offs.push(h.byte_offset);
+            }
+        }
+        let folding = !self.folded_headings.contains(&byte_offset);
+        for off in offs {
+            if folding {
+                self.folded_headings.insert(off);
+            } else {
+                self.folded_headings.remove(&off);
+            }
+        }
+        self.clamp_cursor_to_visible();
+    }
+
+    /// Fold the section the cursor is in (the nearest heading at or above the caret).
+    pub fn fold_at_cursor(&mut self) {
+        let line = self.line_of(self.cursor_position());
+        let line_count = self.state.buffer.line_count();
+        let headings = self.state.buffer.headings();
+        let Some(idx) = fold::section_heading(headings, line) else {
+            return;
+        };
+        if !fold::heading_is_foldable(headings, idx, line_count) {
+            return;
+        }
+        let off = headings[idx].byte_offset;
+        self.folded_headings.insert(off);
+        self.clamp_cursor_to_visible();
+    }
+
+    /// Unfold the section the cursor is in.
+    pub fn unfold_at_cursor(&mut self) {
+        let line = self.line_of(self.cursor_position());
+        let headings = self.state.buffer.headings();
+        let Some(idx) = fold::section_heading(headings, line) else {
+            return;
+        };
+        let off = headings[idx].byte_offset;
+        self.folded_headings.remove(&off);
+    }
+
+    pub fn fold_all_headings(&mut self) {
+        let line_count = self.state.buffer.line_count();
+        let headings = self.state.buffer.headings();
+        let offs: Vec<usize> = headings
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| fold::heading_is_foldable(headings, *i, line_count))
+            .map(|(_, h)| h.byte_offset)
+            .collect();
+        self.folded_headings.extend(offs);
+        self.clamp_cursor_to_visible();
+    }
+
+    pub fn unfold_all(&mut self) {
+        self.folded_headings.clear();
+    }
+
+    /// Ctrl+click a chevron: fold every section at the clicked heading's level (a mouse
+    /// path to [`fold_to_level`]). Toggles — if that heading is already folded, unfold all.
+    pub fn toggle_fold_level_at(&mut self, byte_offset: usize) {
+        self.toggle_level(byte_offset, false);
+    }
+
+    /// Ctrl+Shift+click a chevron: like [`toggle_fold_level_at`] but deep — every section
+    /// at this level *and* deeper folds, so expanding one reveals its children collapsed.
+    pub fn toggle_fold_level_deep_at(&mut self, byte_offset: usize) {
+        self.toggle_level(byte_offset, true);
+    }
+
+    fn toggle_level(&mut self, byte_offset: usize, deep: bool) {
+        let level = self
+            .state
+            .buffer
+            .headings()
+            .iter()
+            .find(|h| h.byte_offset == byte_offset)
+            .map(|h| h.level);
+        let Some(level) = level else {
+            return;
+        };
+        if self.folded_headings.contains(&byte_offset) {
+            self.unfold_all();
+        } else if deep {
+            self.fold_to_level_deep(level);
+        } else {
+            self.fold_to_level(level);
+        }
+    }
+
+    /// Fold to a heading depth: collapse exactly the sections at `level`, replacing any
+    /// current folds. Headings shallower than `level` stay visible (with their bodies),
+    /// and everything below a level-`level` heading hides — so expanding one reveals its
+    /// whole subtree at once. Level 1 leaves only the top-level headings showing.
+    pub fn fold_to_level(&mut self, level: u8) {
+        let line_count = self.state.buffer.line_count();
+        let headings = self.state.buffer.headings();
+        self.folded_headings = headings
+            .iter()
+            .enumerate()
+            .filter(|(i, h)| {
+                h.level == level && fold::heading_is_foldable(headings, *i, line_count)
+            })
+            .map(|(_, h)| h.byte_offset)
+            .collect();
+        self.clamp_cursor_to_visible();
+    }
+
+    /// Deep variant of [`fold_to_level`]: fold every foldable heading at `level` or deeper,
+    /// pre-collapsing descendants so expanding a section reveals its children still folded.
+    pub fn fold_to_level_deep(&mut self, level: u8) {
+        let line_count = self.state.buffer.line_count();
+        let headings = self.state.buffer.headings();
+        self.folded_headings = headings
+            .iter()
+            .enumerate()
+            .filter(|(i, h)| {
+                h.level >= level && fold::heading_is_foldable(headings, *i, line_count)
+            })
+            .map(|(_, h)| h.byte_offset)
+            .collect();
+        self.clamp_cursor_to_visible();
+    }
+
+    /// Auto-unfold any folded section the caret has entered (search-jump, outline click,
+    /// arrow keys). A no-op when the caret is already on a visible line. Also drops folds
+    /// whose heading was edited away (stale offset no longer matches any heading start).
+    /// Returns `true` if the fold set changed (the caller must relayout).
+    pub fn reveal_cursor(&mut self) -> bool {
+        if self.folded_headings.is_empty() {
+            return false;
+        }
+        let cursor_line = self.line_of(self.cursor_position());
+        let line_count = self.state.buffer.line_count();
+        let to_remove: Vec<usize> = {
+            let headings = self.state.buffer.headings();
+            self.folded_headings
+                .iter()
+                .copied()
+                .filter(
+                    |&off| match headings.iter().position(|h| h.byte_offset == off) {
+                        Some(idx) => {
+                            fold::heading_extent(headings, idx, line_count).contains(&cursor_line)
+                        }
+                        None => true,
+                    },
+                )
+                .collect()
+        };
+        for off in &to_remove {
+            self.folded_headings.remove(off);
+        }
+        !to_remove.is_empty()
+    }
+
+    /// Keep the "caret is never on a hidden line" invariant after a fold: if a collapse
+    /// hid the caret, move it up to the heading line that folds the region.
+    fn clamp_cursor_to_visible(&mut self) {
+        let ranges = self.hidden_line_ranges();
+        if ranges.is_empty() {
+            return;
+        }
+        let cursor_line = self.line_of(self.cursor_position());
+        if let Some(r) = ranges.iter().find(|r| r.contains(&cursor_line)) {
+            let heading_line = r.start.saturating_sub(1);
+            let off = self.state.buffer.line_to_byte(heading_line);
+            self.state.selection = Selection::new(off, off);
+        }
     }
 
     /// Rebuild the match list for the current query. Uses the regex crate for BOTH
@@ -1597,6 +1847,118 @@ let code = target(); // fenced block line
             all.contains(&1) && all.contains(&2),
             "wide range should include both refs"
         );
+    }
+
+    #[test]
+    fn folding_collapses_reveals_and_survives_edits() {
+        let mut editor = Editor::new("# A\nbody1\nbody2\n## B\nsub\n# C\ntail\n");
+
+        // Caret in A's body → folding A collapses lines 1..5 (through the deeper ## B),
+        // and relocates the caret onto the heading line so it never sits on a hidden line.
+        editor.set_cursor(editor.state.buffer.line_to_byte(1));
+        editor.fold_at_cursor();
+        assert_eq!(editor.hidden_line_ranges(), vec![1..5]);
+        assert_eq!(editor.line_of(editor.cursor_position()), 0);
+
+        // Moving the caret into the folded region auto-reveals it.
+        editor.set_cursor(editor.state.buffer.line_to_byte(2));
+        assert!(editor.reveal_cursor());
+        assert!(editor.hidden_line_ranges().is_empty());
+
+        // Fold the last section, then insert above it: the fold's byte anchor remaps.
+        let c_off = editor.state.buffer.headings()[2].byte_offset;
+        editor.toggle_fold(c_off);
+        assert!(!editor.hidden_line_ranges().is_empty());
+        editor.set_cursor(editor.state.buffer.line_to_byte(1));
+        editor.insert_str("x");
+        let c_off2 = editor.state.buffer.headings()[2].byte_offset;
+        assert_eq!(c_off2, c_off + 1);
+        assert!(editor.is_heading_folded(c_off2), "fold survived the edit");
+
+        editor.fold_all_headings();
+        assert!(!editor.hidden_line_ranges().is_empty());
+        editor.unfold_all();
+        assert!(editor.hidden_line_ranges().is_empty());
+    }
+
+    #[test]
+    fn fold_to_level_collapses_that_depth() {
+        // # A(0) a(1) ## B(2) b(3) # C(4) c(5)
+        let mut editor = Editor::new("# A\na\n## B\nb\n# C\nc\n");
+
+        // Level 1: fold both H1 sections → only the two H1 lines stay visible.
+        editor.fold_to_level(1);
+        assert_eq!(editor.hidden_line_ranges(), vec![1..4, 5..7]);
+
+        // Level 2: fold only the H2 section; H1 lines and their intro bodies stay visible.
+        editor.fold_to_level(2);
+        assert_eq!(editor.hidden_line_ranges(), vec![3..4]);
+
+        // Replaces prior folds rather than accumulating; a level with no headings clears.
+        editor.fold_to_level(4);
+        assert!(editor.hidden_line_ranges().is_empty());
+    }
+
+    #[test]
+    fn recursive_fold_pre_folds_descendants() {
+        // # A(0) a(1) ## B(2) b(3) ### C(4) c(5) # D(6) d(7)
+        let mut editor = Editor::new("# A\na\n## B\nb\n### C\nc\n# D\nd\n");
+        let a = editor.state.buffer.headings()[0].byte_offset;
+        let b = editor.state.buffer.headings()[1].byte_offset;
+        let c = editor.state.buffer.headings()[2].byte_offset;
+
+        // Recursively folding A folds A and its descendants B and C (but not sibling D).
+        editor.toggle_fold_recursive(a);
+        assert!(editor.is_heading_folded(a));
+        assert!(editor.is_heading_folded(b));
+        assert!(editor.is_heading_folded(c));
+
+        // Unfolding just A (plain toggle) reveals B, which is still folded underneath.
+        editor.toggle_fold(a);
+        assert!(!editor.is_heading_folded(a));
+        assert!(editor.is_heading_folded(b), "descendant stays folded");
+        assert_eq!(editor.hidden_line_ranges(), vec![3..6]); // B's subtree still collapsed
+
+        // Recursive toggle again (now A unfolded) folds the whole A subtree back down.
+        editor.toggle_fold_recursive(a);
+        assert!(editor.is_heading_folded(a) && editor.is_heading_folded(c));
+    }
+
+    #[test]
+    fn ctrl_click_folds_all_at_level() {
+        // # A(0) a(1) ## B(2) b(3) # C(4) c(5) ## D(6) d(7)
+        let mut editor = Editor::new("# A\na\n## B\nb\n# C\nc\n## D\nd\n");
+        let a = editor.state.buffer.headings()[0].byte_offset;
+        let b = editor.state.buffer.headings()[1].byte_offset;
+        let c = editor.state.buffer.headings()[2].byte_offset;
+        let d = editor.state.buffer.headings()[3].byte_offset;
+
+        // Ctrl+clicking the H2 "B" folds every H2 (B and D), not just B.
+        editor.toggle_fold_level_at(b);
+        assert!(editor.is_heading_folded(b) && editor.is_heading_folded(d));
+        assert!(!editor.is_heading_folded(a) && !editor.is_heading_folded(c));
+
+        // Ctrl+clicking a now-folded heading unfolds everything.
+        editor.toggle_fold_level_at(b);
+        assert!(editor.hidden_line_ranges().is_empty());
+    }
+
+    #[test]
+    fn ctrl_shift_click_folds_level_and_deeper() {
+        // # A(0) ## B(1) ### C(2) c(3) # D(4)
+        let mut editor = Editor::new("# A\n## B\n### C\nc\n# D\n");
+        let a = editor.state.buffer.headings()[0].byte_offset;
+        let b = editor.state.buffer.headings()[1].byte_offset;
+        let c = editor.state.buffer.headings()[2].byte_offset;
+
+        // Ctrl+Shift on the H2 folds this level and deeper: B and C, but not the H1s.
+        editor.toggle_fold_level_deep_at(b);
+        assert!(editor.is_heading_folded(b) && editor.is_heading_folded(c));
+        assert!(!editor.is_heading_folded(a));
+
+        // Toggles off when the clicked heading is already folded.
+        editor.toggle_fold_level_deep_at(b);
+        assert!(editor.hidden_line_ranges().is_empty());
     }
 
     #[test]
