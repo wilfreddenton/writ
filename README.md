@@ -119,6 +119,14 @@ Fenced code blocks render with syntax highlighting (currently Rust and Bash). Th
 
 Full selection support with click, drag (with edge auto-scroll), shift+arrow keys, double-click to select word, and triple-click to select line. Vertical movement keeps a sticky goal column through short lines. Copy, cut, and paste (with normalization) work as expected, and paste is context-aware inside blockquotes and code blocks. Undo/redo coalesce runs of typing into word-granular steps, with full cursor restoration. Cursor movement, selection, and deletion operate on whole grapheme clusters (so emoji and combining marks never split).
 
+### GFM Tables
+
+Pipe tables render as a live grid — bold header, per-column alignment (`:--`/`:-:`/`--:`), and inline styles (bold, code, links) inside cells. Move your cursor into a table and it reveals the raw pipe source for editing; move out and it snaps back to the grid. Type a header row like `| Name | Age |` and press Shift+Enter to scaffold the delimiter and a body row; Tab moves between cells (and appends a row from the last cell).
+
+### Find and Replace
+
+Ctrl+F opens a find bar docked above the status bar; Ctrl+H adds the replace row. Matches highlight live with a count, and the current match is emphasized; Enter/Shift+Enter cycle through them. Toggle regular expressions (Alt+R, with `$1` capture groups in the replacement) and case sensitivity (Alt+C). Enter in the replace field swaps the current match, Ctrl+Enter replaces all in one undo step. Click into the document to keep the bar open while you edit.
+
 ## Library Usage
 
 writ is also a library: its rendering and editing layers work independently of the
@@ -188,7 +196,7 @@ and opt into only what you need:
 
 ```toml
 # render-only: pulls in none of tokio/reqwest/gix/github/winit
-writ = { version = "0.13", default-features = false }
+writ = { version = "0.14", default-features = false }
 ```
 
 | Feature | Adds |
