@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use unicode_segmentation::UnicodeSegmentation;
-use vello::kurbo::{Affine, Rect};
+use vello::kurbo::{Affine, Rect, Stroke};
 use vello::peniko::Fill;
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
@@ -38,12 +38,12 @@ use winit::window::{Theme, Window, WindowId};
 use winit::event_loop::ControlFlow;
 
 use crate::buffer::Buffer;
-use crate::chrome::{BarRect, StatusInfo, draw_chrome_panel, draw_status_bar};
+use crate::chrome::{BarRect, FindButtonRects, StatusInfo, draw_find_bar, draw_status_bar};
 use crate::config::Config;
 use crate::consts::{
-    CARET_WIDTH, FONT_SIZE, LINE_HEIGHT, PADDING, STATUS_BAR_H, UI_LINE_HEIGHT, WHEEL_LINE_STEP,
+    CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, PADDING, STATUS_BAR_H, WHEEL_LINE_STEP,
 };
-use crate::core::{AutocompleteSuggestion, AutocompleteTrigger, Editor};
+use crate::core::{AutocompleteSuggestion, AutocompleteTrigger, Editor, FieldFocus, FindMode};
 use crate::doc_layout::{
     DocLayout, GithubRenderData, HeightCache, LayoutParams, LineCache, PreeditView, RenderCache,
     ScreenRect, TableCache,
@@ -59,17 +59,35 @@ use crate::overlay::{
     HoverTarget, draw_autocomplete, draw_hover_popover, find_hover_target, hover_target_at_offset,
 };
 use crate::raster::rasterize_scene_to_png;
-use crate::text_engine::{TextEngine, peniko_color};
-use crate::text_input::{self, draw_text_field};
+use crate::text_engine::{TextEngine, peniko_color, peniko_color_alpha};
+use crate::text_input;
 use crate::validation::{GitHubValidationCache, IssueOrPr, MentionableUser, ValidatedRefData};
 
-/// Chrome layout in device px: y where editor content begins, and its height.
-fn chrome_metrics(scale: f32, height_dev: f32) -> (f32, f32) {
+/// Chrome layout in device px: y where editor content begins, and its height. The
+/// bottom is inset by the status bar plus the find bar (`find_h`, 0 when closed), so
+/// the document viewport reflows above both.
+fn chrome_metrics(scale: f32, height_dev: f32, find_h: f32) -> (f32, f32) {
     // The title bar is the native window decoration now, so editor content starts at
-    // the surface top; only the bottom status bar is inset.
+    // the surface top; only the bottom strips are inset.
     let content_top = 0.0;
-    let editor_h = (height_dev - STATUS_BAR_H * scale).max(1.0);
+    let editor_h = (height_dev - STATUS_BAR_H * scale - find_h).max(1.0);
     (content_top, editor_h)
+}
+
+/// Device-px height of the bottom find bar for the current find state (0 when closed):
+/// one `FIND_ROW_H` row in Find mode, two in Replace mode, plus a small vertical pad.
+fn find_bar_height(editor: &Editor, scale: f32) -> f32 {
+    match editor.find_state() {
+        None => 0.0,
+        Some(find) => {
+            let rows = if find.mode == FindMode::Replace {
+                2.0
+            } else {
+                1.0
+            };
+            rows * FIND_ROW_H * scale + 8.0 * scale
+        }
+    }
 }
 
 /// The native window title: the file name with a `●` dirty marker, shown in the OS
@@ -235,13 +253,21 @@ struct ActiveSurface {
     surface: RenderSurface<'static>,
     window: Arc<Window>,
     scale: f32,
+    /// Current find-bar height (device px), 0 when the bar is closed. Kept here so the
+    /// shared `viewport()` accessor can shrink the editor height without threading the
+    /// editor's find state through its ten call sites; synced by `sync_find_chrome`.
+    find_bar_h: f32,
 }
 
 impl ActiveSurface {
     /// The editor viewport in device px: (surface width, editor content height, scale).
-    /// The content height excludes the bottom status-bar strip.
+    /// The content height excludes the bottom status-bar and find-bar strips.
     fn viewport(&self) -> (f32, f32, f32) {
-        let (_, editor_h) = chrome_metrics(self.scale, self.surface.config.height as f32);
+        let (_, editor_h) = chrome_metrics(
+            self.scale,
+            self.surface.config.height as f32,
+            self.find_bar_h,
+        );
         (self.surface.config.width as f32, editor_h, self.scale)
     }
 }
@@ -313,6 +339,9 @@ struct App {
     hovered: Option<HoverTarget>,
     /// Screen rects of the currently-drawn autocomplete rows (for click routing).
     ac_row_rects: Vec<ScreenRect>,
+    /// Screen rects of the find bar's Replace/All buttons (for click routing), when the
+    /// bar is open in Replace mode.
+    find_btn_rects: Option<FindButtonRects>,
     /// Monotonic generation for autocomplete-fetch debounce (latest wins).
     ac_gen: Arc<AtomicU64>,
     /// Slot a finished fetch task drops its results into for the main thread.
@@ -373,6 +402,7 @@ impl App {
             title,
             hovered: None,
             ac_row_rects: Vec::new(),
+            find_btn_rects: None,
             ac_gen: Arc::new(AtomicU64::new(0)),
             ac_slot: Arc::new(Mutex::new(None)),
             proxy,
@@ -467,6 +497,13 @@ fn apply_edit_effects(
     scale: f32,
     editor_h: f32,
 ) {
+    // A buffer edit while the find bar is open leaves the highlighted match set stale
+    // (fall-through typing, undo/redo, replace). Rescan so highlights track the document;
+    // it no-ops when (version, query, case, regex) is unchanged. Runs before `after_edit`
+    // so the cursor reveal below lands on the refreshed active match.
+    if doc_engine.editor.find_state().is_some() {
+        doc_engine.editor.find_rescan();
+    }
     *hovered = None;
     after_edit(doc_engine, runtime, proxy, w, scale, editor_h);
     if let Some((ac_gen, ac_slot)) = ac {
@@ -989,6 +1026,12 @@ fn ac_row_at(rects: &[ScreenRect], pos: (f32, f32)) -> Option<usize> {
         .position(|&(x0, y0, x1, y1)| px >= x0 && px <= x1 && py >= y0 && py <= y1)
 }
 
+fn rect_contains(rect: &ScreenRect, pos: (f32, f32)) -> bool {
+    let (px, py) = (pos.0 as f64, pos.1 as f64);
+    let &(x0, y0, x1, y1) = rect;
+    px >= x0 && px <= x1 && py >= y0 && py <= y1
+}
+
 /// Paint the clipped document body (diff backgrounds, quote gutters, rules, images,
 /// selection, glyphs, caret) plus the bottom status bar into `scene`. Overlays
 /// (hover popover / autocomplete) differ per caller and are drawn separately. Shared by
@@ -1004,10 +1047,11 @@ fn paint_document(
     doc: &DocLayout,
     content_top: f32,
     editor_h: f32,
+    find_h: f32,
     width: f32,
     height: f32,
     scale: f32,
-) {
+) -> Option<FindButtonRects> {
     let clip = Rect::new(
         0.0,
         content_top as f64,
@@ -1022,6 +1066,31 @@ fn paint_document(
     doc.draw_horizontal_rules(scene, editor_h);
     doc.draw_images(engine, scene, editor_h);
     doc.draw_tables(engine, scene, editor_h);
+    // Faint yellow tint under every visible find match EXCEPT the active one, which is
+    // drawn last (below) in a distinct warm orange so the current match reads clearly.
+    if let Some(find) = editor.find_state()
+        && !find.matches.is_empty()
+    {
+        let tint = peniko_color_alpha(theme.yellow, 0.16);
+        let (first, last) = doc.visible_range(editor_h);
+        for (i, m) in find.matches.iter().enumerate() {
+            if find.active == Some(i) {
+                continue;
+            }
+            if doc.line_of(m.end) < first || doc.line_of(m.start) >= last {
+                continue;
+            }
+            for (x0, y0, x1, y1) in doc.selection_rects(m.clone()) {
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    tint,
+                    None,
+                    &Rect::new(x0, y0, x1, y1),
+                );
+            }
+        }
+    }
     if let Some(sel) = editor.selection_range() {
         let color = peniko_color(theme.selection);
         for (x0, y0, x1, y1) in doc.selection_rects(sel) {
@@ -1032,6 +1101,21 @@ fn paint_document(
                 None,
                 &Rect::new(x0, y0, x1, y1),
             );
+        }
+    }
+    // The active find match, drawn last (over the selection) in a distinct warm orange
+    // with an outline, so the current match stands out from the faint-yellow others.
+    if let Some(find) = editor.find_state()
+        && let Some(active) = find.active
+        && let Some(m) = find.matches.get(active)
+    {
+        let fill = peniko_color_alpha(theme.orange, 0.34);
+        let border = peniko_color_alpha(theme.orange, 0.95);
+        let stroke = Stroke::new(1.5 * scale as f64);
+        for (x0, y0, x1, y1) in doc.selection_rects(m.clone()) {
+            let r = Rect::new(x0, y0, x1, y1);
+            scene.fill(Fill::NonZero, Affine::IDENTITY, fill, None, &r);
+            scene.stroke(&stroke, Affine::IDENTITY, border, None, &r);
         }
     }
     doc.draw(engine, scene, editor_h);
@@ -1050,7 +1134,29 @@ fn paint_document(
     }
     scene.pop_layer();
 
-    // Chrome: status bar (bottom). The title bar is the OS/compositor's native one.
+    // Chrome (bottom, above the OS-native title bar): the find bar sits in the gap
+    // between the document and the status bar, so the status bar starts below it.
+    let bar_top = (content_top + editor_h) as f64;
+    let status_top = bar_top + find_h as f64;
+    let btn_rects = if find_h > 0.0
+        && let Some(find) = editor.find_state()
+    {
+        draw_find_bar(
+            engine,
+            scene,
+            theme,
+            find,
+            &BarRect {
+                x0: 0.0,
+                y0: bar_top,
+                x1: width as f64,
+                y1: status_top,
+            },
+            scale,
+        )
+    } else {
+        None
+    };
     let info = build_status_info(editor, doc, editor_h);
     draw_status_bar(
         engine,
@@ -1058,13 +1164,14 @@ fn paint_document(
         theme,
         &BarRect {
             x0: 0.0,
-            y0: (content_top + editor_h) as f64,
+            y0: status_top,
             x1: width as f64,
             y1: height as f64,
         },
         &info,
         scale,
     );
+    btn_rects
 }
 
 impl ApplicationHandler<WritEvent> for App {
@@ -1171,7 +1278,8 @@ impl ApplicationHandler<WritEvent> for App {
         );
 
         let scale = window.scale_factor() as f32;
-        let (_, editor_h) = chrome_metrics(scale, size.height as f32);
+        // Find is closed at startup, so no find-bar inset yet.
+        let (_, editor_h) = chrome_metrics(scale, size.height as f32, 0.0);
         let doc = self
             .doc_engine
             .rebuild(size.width as f32, scale, 0, editor_h);
@@ -1180,6 +1288,7 @@ impl ApplicationHandler<WritEvent> for App {
             surface,
             window,
             scale,
+            find_bar_h: 0.0,
         });
         // Validate refs already present in the loaded file, and start loading images
         // (spawn_validations already calls sync_images).
@@ -1214,7 +1323,11 @@ impl ApplicationHandler<WritEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => -y * WHEEL_LINE_STEP * state.scale,
                     MouseScrollDelta::PixelDelta(p) => -p.y as f32,
                 };
-                let (_, editor_h) = chrome_metrics(state.scale, state.surface.config.height as f32);
+                let (_, editor_h) = chrome_metrics(
+                    state.scale,
+                    state.surface.config.height as f32,
+                    state.find_bar_h,
+                );
                 let remeasure = if let Some(doc) = self.doc_engine.doc.as_mut() {
                     doc.scroll_by(dy, editor_h);
                     doc.needs_remeasure(editor_h)
@@ -1255,6 +1368,18 @@ impl ApplicationHandler<WritEvent> for App {
             // In-progress composition: splice it into the caret line (render-only, no
             // buffer mutation) and move the OS candidate popup to the composition caret.
             WindowEvent::Ime(winit::event::Ime::Preedit(text, cursor)) => {
+                // While the find bar owns focus, never splice composition into the document
+                // behind it. When the bar is open but unfocused, composition targets the
+                // document as usual.
+                if self
+                    .doc_engine
+                    .editor
+                    .find_state()
+                    .is_some_and(|f| f.focused)
+                {
+                    state.window.request_redraw();
+                    return;
+                }
                 self.doc_engine.preedit = (!text.is_empty()).then_some(Preedit { text, cursor });
                 let (w, vh, _) = state.viewport();
                 self.doc_engine
@@ -1275,6 +1400,38 @@ impl ApplicationHandler<WritEvent> for App {
             }
             // Commit: clear the composition, then insert the finalized text.
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
+                // While the find bar owns focus, route committed IME text (CJK/dead-key/
+                // accent) to the focused field instead of the document.
+                if self
+                    .doc_engine
+                    .editor
+                    .find_state()
+                    .is_some_and(|f| f.focused)
+                {
+                    if !text.is_empty() {
+                        let to_replace = self
+                            .doc_engine
+                            .editor
+                            .find_state()
+                            .is_some_and(|f| f.focus == FieldFocus::Replace);
+                        if let Some(find) = self.doc_engine.editor.find_state_mut() {
+                            if to_replace {
+                                find.replace.insert(&text);
+                            } else {
+                                find.search.insert(&text);
+                            }
+                        }
+                        if !to_replace {
+                            let (_, vh, _) = state.viewport();
+                            self.doc_engine.editor.find_rescan();
+                            if let Some(doc) = self.doc_engine.doc.as_mut() {
+                                doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
+                            }
+                        }
+                    }
+                    state.window.request_redraw();
+                    return;
+                }
                 let had_preedit = self.doc_engine.preedit.take().is_some();
                 let (w, vh, _) = state.viewport();
                 if !text.is_empty() {
@@ -1353,6 +1510,81 @@ impl ApplicationHandler<WritEvent> for App {
             } => {
                 self.mouse_down = true;
                 let (w, vh, _) = state.viewport();
+
+                // Find-bar focus routing. The bar is docked at the bottom, so the document
+                // occupies y < vh, the find strip [vh, vh + find_bar_h), the status bar
+                // below that. A click in the strip focuses the bar (and picks the field by
+                // row); a click in the document unfocuses it (keys then type into the
+                // buffer) and falls through to normal caret placement.
+                let in_find_bar = if self.doc_engine.editor.find_state().is_some() {
+                    let bar_top = vh;
+                    let bar_bottom = vh + state.find_bar_h;
+                    let click_y = self.mouse_pos.1;
+                    if click_y < bar_top {
+                        if let Some(find) = self.doc_engine.editor.find_state_mut() {
+                            find.focused = false;
+                        }
+                        false
+                    } else if click_y < bar_bottom {
+                        // Coarse which-row hit test: in Replace mode the lower half is the
+                        // replace field, otherwise it's the search field (precise field
+                        // rects aren't threaded back here).
+                        let field = if self
+                            .doc_engine
+                            .editor
+                            .find_state()
+                            .is_some_and(|f| f.mode == FindMode::Replace)
+                            && click_y >= bar_top + state.find_bar_h / 2.0
+                        {
+                            FieldFocus::Replace
+                        } else {
+                            FieldFocus::Search
+                        };
+                        if let Some(find) = self.doc_engine.editor.find_state_mut() {
+                            find.focused = true;
+                            find.focus = field;
+                        }
+                        true
+                    } else {
+                        false // status bar: leave focus unchanged
+                    }
+                } else {
+                    false
+                };
+
+                // Find-bar Replace/All button click (only present in Replace mode).
+                if let Some(rects) = self.find_btn_rects.as_ref() {
+                    let hit_all = rect_contains(&rects.all, self.mouse_pos);
+                    let hit_replace = rect_contains(&rects.replace, self.mouse_pos);
+                    if hit_all || hit_replace {
+                        if hit_all {
+                            self.doc_engine.editor.find_replace_all();
+                        } else {
+                            self.doc_engine.editor.find_replace_current();
+                        }
+                        apply_edit_effects(
+                            &mut self.doc_engine,
+                            &mut self.hovered,
+                            &self.runtime,
+                            &self.proxy,
+                            None,
+                            &state.window,
+                            w,
+                            state.scale,
+                            vh,
+                        );
+                        return;
+                    }
+                }
+
+                // A click inside the find strip that missed the buttons just (re)focuses
+                // the bar — redraw the focus ring and don't fall through to doc caret
+                // placement (the doc's hit-test would otherwise snap the caret to the
+                // nearest line for a click below the content).
+                if in_find_bar {
+                    state.window.request_redraw();
+                    return;
+                }
 
                 // Autocomplete row click: accept that suggestion, don't move the caret.
                 if self.doc_engine.editor.autocomplete().is_some()
@@ -1469,22 +1701,142 @@ impl ApplicationHandler<WritEvent> for App {
                 }
                 let (w, vh, _) = state.viewport();
 
-                // Find bar (Ctrl+F). This intercept sits ABOVE clipboard/autocomplete/
-                // apply_key so, while the bar is open, it captures EVERY keystroke —
-                // even ones it doesn't act on — so nothing leaks into the document.
-                if cmd
-                    && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("f"))
-                {
-                    self.doc_engine.editor.open_find();
+                // Find / Replace bar (Ctrl+F / Ctrl+H). Opening or closing changes the
+                // editor height, so re-sync the find-bar inset and reflow the document.
+                // While open, this intercept sits ABOVE clipboard/autocomplete/apply_key
+                // and captures EVERY keystroke, so nothing leaks into the document.
+                let open_find = cmd
+                    && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("f"));
+                let open_replace = cmd
+                    && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("h"));
+                if open_find || open_replace {
+                    self.doc_engine.editor.open_find(open_replace);
+                    state.find_bar_h = find_bar_height(&self.doc_engine.editor, state.scale);
+                    let (fw, feh, fscale) = state.viewport();
+                    self.doc_engine.rebuild_preserving_scroll(fw, fscale, feh);
+                    if let Some(doc) = self.doc_engine.doc.as_mut() {
+                        doc.scroll_to(self.doc_engine.editor.cursor_position(), feh);
+                    }
                     state.window.request_redraw();
                     return;
                 }
-                if self.doc_engine.editor.find_state().is_some() {
+
+                // Escape closes the find bar regardless of which pane holds focus (so it
+                // works even after clicking into the document unfocuses the bar).
+                if self.doc_engine.editor.find_state().is_some()
+                    && matches!(&event.logical_key, Key::Named(NamedKey::Escape))
+                {
+                    self.doc_engine.editor.close_find();
+                    state.find_bar_h = find_bar_height(&self.doc_engine.editor, state.scale);
+                    let (fw, feh, fscale) = state.viewport();
+                    self.doc_engine.rebuild_preserving_scroll(fw, fscale, feh);
+                    state.window.request_redraw();
+                    return;
+                }
+
+                // The find intercept swallows keys ONLY while the bar owns focus. When it's
+                // open but unfocused (the document was clicked), keys fall through to the
+                // normal document handling below so typing/arrows/undo edit the buffer.
+                if self
+                    .doc_engine
+                    .editor
+                    .find_state()
+                    .is_some_and(|f| f.focused)
+                {
+                    let alt = self.modifiers.alt_key();
+                    let shift = self.modifiers.shift_key();
+
+                    // Undo/redo always act on the DOCUMENT, even with the find field
+                    // focused, so a replace can be undone without clicking away. The buffer
+                    // changed, so `apply_edit_effects` rescans + reveals the active match.
+                    let is_z = matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("z"));
+                    let is_y = matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("y"));
+                    if cmd && (is_z || is_y) {
+                        if is_y || (is_z && shift) {
+                            self.doc_engine.editor.redo();
+                        } else {
+                            self.doc_engine.editor.undo();
+                        }
+                        self.doc_engine.editor.find_rescan();
+                        apply_edit_effects(
+                            &mut self.doc_engine,
+                            &mut self.hovered,
+                            &self.runtime,
+                            &self.proxy,
+                            None,
+                            &state.window,
+                            w,
+                            state.scale,
+                            vh,
+                        );
+                        return;
+                    }
                     match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => self.doc_engine.editor.close_find(),
+                        Key::Named(NamedKey::Enter) => {
+                            let replace_mode = self
+                                .doc_engine
+                                .editor
+                                .find_state()
+                                .is_some_and(|f| f.mode == FindMode::Replace);
+                            let focus_replace = self
+                                .doc_engine
+                                .editor
+                                .find_state()
+                                .is_some_and(|f| f.focus == FieldFocus::Replace);
+                            if replace_mode && (cmd || (!shift && focus_replace)) {
+                                // Ctrl/Cmd+Enter replaces every match; a plain Enter in the
+                                // replace field replaces the active match and advances. Both
+                                // mutate the buffer, so run the full post-edit flow.
+                                if cmd {
+                                    self.doc_engine.editor.find_replace_all();
+                                } else {
+                                    self.doc_engine.editor.find_replace_current();
+                                }
+                                apply_edit_effects(
+                                    &mut self.doc_engine,
+                                    &mut self.hovered,
+                                    &self.runtime,
+                                    &self.proxy,
+                                    None,
+                                    &state.window,
+                                    w,
+                                    state.scale,
+                                    vh,
+                                );
+                            } else {
+                                let hit = if shift {
+                                    self.doc_engine.editor.find_prev()
+                                } else {
+                                    self.doc_engine.editor.find_next()
+                                };
+                                if hit.is_some()
+                                    && let Some(doc) = self.doc_engine.doc.as_mut()
+                                {
+                                    doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::Tab) => self.doc_engine.editor.find_toggle_field(),
+                        Key::Character(c) if alt && c.as_str().eq_ignore_ascii_case("r") => {
+                            self.doc_engine.editor.find_toggle_regex();
+                            if let Some(doc) = self.doc_engine.doc.as_mut() {
+                                doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
+                            }
+                        }
+                        Key::Character(c) if alt && c.as_str().eq_ignore_ascii_case("c") => {
+                            self.doc_engine.editor.find_toggle_case();
+                            if let Some(doc) = self.doc_engine.doc.as_mut() {
+                                doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
+                            }
+                        }
                         _ => {
                             let ctrl_v = cmd
                                 && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("v"));
+                            let to_replace = self
+                                .doc_engine
+                                .editor
+                                .find_state()
+                                .is_some_and(|f| f.focus == FieldFocus::Replace);
                             if ctrl_v {
                                 // Read the clipboard first, then insert — keeps the
                                 // clipboard borrow disjoint from the editor's.
@@ -1496,10 +1848,27 @@ impl ApplicationHandler<WritEvent> for App {
                                 if let Some(text) = text
                                     && let Some(find) = self.doc_engine.editor.find_state_mut()
                                 {
-                                    find.search.insert(&text);
+                                    if to_replace {
+                                        find.replace.insert(&text);
+                                    } else {
+                                        find.search.insert(&text);
+                                    }
                                 }
                             } else if let Some(find) = self.doc_engine.editor.find_state_mut() {
-                                text_input::apply_key(&mut find.search, &event, self.modifiers);
+                                let field = if to_replace {
+                                    &mut find.replace
+                                } else {
+                                    &mut find.search
+                                };
+                                text_input::apply_key(field, &event, self.modifiers);
+                            }
+                            // A search-field edit changes the match set: rescan, then
+                            // bring the (new) active match into view.
+                            if !to_replace {
+                                self.doc_engine.editor.find_rescan();
+                                if let Some(doc) = self.doc_engine.doc.as_mut() {
+                                    doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
+                                }
                             }
                         }
                     }
@@ -1629,7 +1998,7 @@ impl ApplicationHandler<WritEvent> for App {
 
                 let width = state.surface.config.width as f32;
                 let height = state.surface.config.height as f32;
-                let (content_top, editor_h) = chrome_metrics(state.scale, height);
+                let (content_top, editor_h) = chrome_metrics(state.scale, height, state.find_bar_h);
 
                 // Apply any coalesced async-completion rebuild once, before drawing.
                 if self.pending_rebuild {
@@ -1640,7 +2009,7 @@ impl ApplicationHandler<WritEvent> for App {
                 }
 
                 if let Some(doc) = self.doc_engine.doc.as_ref() {
-                    paint_document(
+                    self.find_btn_rects = paint_document(
                         &mut self.scene,
                         &mut self.doc_engine.text_engine,
                         &self.doc_engine.theme,
@@ -1648,6 +2017,7 @@ impl ApplicationHandler<WritEvent> for App {
                         doc,
                         content_top,
                         editor_h,
+                        state.find_bar_h,
                         width,
                         height,
                         state.scale,
@@ -1692,61 +2062,8 @@ impl ApplicationHandler<WritEvent> for App {
                             );
                         }
                     }
-
-                    // Find bar: a chrome panel near the editor's top-right with a
-                    // "Find:" label and the search field.
-                    if self.doc_engine.editor.find_state().is_some() {
-                        // The bar's OWN internal spacing is small UI padding — not the
-                        // document's much larger PADDING, which pushed the field far right.
-                        let margin = PADDING * state.scale;
-                        let inner = 8.0 * state.scale;
-                        let bar_w = 320.0 * state.scale;
-                        let bar_h = 32.0 * state.scale;
-                        let x1 = width - margin;
-                        let x0 = (x1 - bar_w).max(margin);
-                        let y0 = content_top + margin;
-                        let rect = Rect::new(x0 as f64, y0 as f64, x1 as f64, (y0 + bar_h) as f64);
-                        draw_chrome_panel(
-                            &mut self.scene,
-                            &self.doc_engine.theme,
-                            &rect,
-                            state.scale,
-                        );
-                        let label = self.doc_engine.text_engine.build_line(
-                            "Find:",
-                            state.scale,
-                            15.0,
-                            UI_LINE_HEIGHT,
-                            peniko_color(self.doc_engine.theme.comment),
-                            None,
-                            &[],
-                        );
-                        let label_w = label.width();
-                        let label_y =
-                            rect.y0 as f32 + (rect.height() as f32 - label.height()) / 2.0;
-                        self.doc_engine.text_engine.draw_line(
-                            &mut self.scene,
-                            &label,
-                            (rect.x0 as f32 + inner, label_y),
-                        );
-                        let field_rect = Rect::new(
-                            rect.x0 + (inner + label_w + inner) as f64,
-                            rect.y0,
-                            rect.x1 - inner as f64,
-                            rect.y1,
-                        );
-                        if let Some(find) = self.doc_engine.editor.find_state() {
-                            draw_text_field(
-                                &mut self.doc_engine.text_engine,
-                                &mut self.scene,
-                                &self.doc_engine.theme,
-                                &find.search,
-                                &field_rect,
-                                state.scale,
-                                true,
-                            );
-                        }
-                    }
+                    // The find bar itself is drawn inside `paint_document` as a bottom
+                    // chrome strip, so the document reflows above it.
                 }
 
                 let dev = &self.context.devices[state.surface.dev_id];
@@ -1995,7 +2312,8 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
             }
         }
     }
-    let (content_top, editor_h) = chrome_metrics(1.0, height as f32);
+    // Headless snapshots never open the find bar, so no find-bar inset.
+    let (content_top, editor_h) = chrome_metrics(1.0, height as f32, 0.0);
     // Reuse the shared rebuild path (caches + Parley/Vello engine) headlessly.
     let mut de = DocEngine {
         text_engine: TextEngine::new(),
@@ -2030,6 +2348,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         &doc,
         content_top,
         editor_h,
+        0.0,
         width as f32,
         height as f32,
         1.0,
