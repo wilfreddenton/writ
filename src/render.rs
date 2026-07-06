@@ -509,7 +509,7 @@ pub fn build_cell_render(
     theme: &EditorTheme,
     cell_range: Range<usize>,
     line_styles: &[StyledRegion],
-) -> (String, Vec<StyleRun>, SegmentMap) {
+) -> (String, Vec<StyleRun>, SegmentMap, Vec<Range<usize>>) {
     let rope = &snapshot.rope;
     let start = cell_range.start;
     let end = cell_range.end.max(start);
@@ -546,12 +546,16 @@ pub fn build_cell_render(
 
     let fg = peniko_color(theme.foreground);
     let mut runs = Vec::new();
+    let mut code_ranges = Vec::new();
     for r in &regions {
         let dr = map.buffer_range_to_display(r.content_range.clone());
         if dr.is_empty() {
             continue;
         }
         let style = &r.style;
+        if style.code && r.checkbox.is_none() && r.link_url.is_none() {
+            code_ranges.push(dr.clone());
+        }
         let color = match r.checkbox {
             Some(true) => peniko_color(theme.green),
             Some(false) => peniko_color(theme.comment),
@@ -567,7 +571,7 @@ pub fn build_cell_render(
         run.underline = r.link_url.is_some();
         runs.push(run);
     }
-    (text, runs, map)
+    (text, runs, map, code_ranges)
 }
 
 #[cfg(test)]
@@ -886,12 +890,12 @@ mod tests {
         let (table, _) = snap.table_row_at_line(0).unwrap();
 
         let bold_cell = table.header.cells[0].content.clone();
-        let (text, runs, _map) = build_cell_render(&snap, &theme, bold_cell, &styles[0]);
+        let (text, runs, _map, _code) = build_cell_render(&snap, &theme, bold_cell, &styles[0]);
         assert_eq!(text, "hi", "markers hidden, content shown");
         assert!(runs.iter().any(|r| r.bold), "cell content is bold");
 
         let plain_cell = table.header.cells[1].content.clone();
-        let (ptext, pruns, _) = build_cell_render(&snap, &theme, plain_cell, &styles[0]);
+        let (ptext, pruns, _, _) = build_cell_render(&snap, &theme, plain_cell, &styles[0]);
         assert_eq!(ptext, "plain");
         assert!(pruns.is_empty(), "a plain cell needs no style runs");
     }
