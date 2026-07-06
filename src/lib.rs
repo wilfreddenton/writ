@@ -46,6 +46,8 @@ pub mod image_load;
 pub mod inline;
 pub mod markdown_view;
 pub mod marker;
+#[cfg(feature = "mermaid")]
+pub mod mermaid;
 pub mod outline;
 #[cfg(feature = "app")]
 pub mod overlay;

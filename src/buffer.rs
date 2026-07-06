@@ -15,6 +15,8 @@ use crate::marker::{
     HeadingInfo, LineMarkers, ListItemInfo, ParsedNodes, collect_node_infos,
     is_line_in_checked_task, is_line_in_code_block, markers_at_from_infos,
 };
+#[cfg(feature = "mermaid")]
+use crate::mermaid::MermaidBlock;
 use crate::parser::{MarkdownParser, MarkdownTree};
 use crate::table::{RowKind, TableInfo};
 
@@ -206,6 +208,39 @@ impl RenderSnapshot {
             }
         }
         None
+    }
+
+    /// All ```` ```mermaid ```` fences in the document, scanned once. Computed per build
+    /// and reused across lines — a per-line info-string check would allocate a String for
+    /// every code-block line (including non-mermaid ones), which dominated build time.
+    #[cfg(feature = "mermaid")]
+    pub fn mermaid_blocks(&self) -> Vec<MermaidBlock> {
+        self.parsed
+            .code_blocks
+            .iter()
+            .filter_map(|cb| {
+                let range = cb.info_string_range.as_ref()?;
+                let lang = self
+                    .rope
+                    .slice(self.rope.byte_to_char(range.start)..self.rope.byte_to_char(range.end))
+                    .to_string();
+                (lang.trim() == "mermaid").then(|| MermaidBlock {
+                    block: cb.block_range.clone(),
+                    content: cb.content_range.clone(),
+                    anchor_line: self.rope.byte_to_line(cb.block_range.start),
+                })
+            })
+            .collect()
+    }
+
+    /// If `line_idx` falls inside a ```` ```mermaid ```` fence, the diagram block it
+    /// belongs to. `None` for a non-mermaid fence or a plain line. O(code_blocks) scan.
+    #[cfg(feature = "mermaid")]
+    pub fn mermaid_block_at_line(&self, line_idx: usize) -> Option<MermaidBlock> {
+        let line_start = self.line_byte_range(line_idx).start;
+        self.mermaid_blocks()
+            .into_iter()
+            .find(|m| m.block.contains(&line_start))
     }
 
     /// Get code highlights for a specific line. O(code_blocks) scan.
@@ -1543,6 +1578,34 @@ mod tests {
         assert!(lines[0].is_fence());
         assert!(!lines[1].is_fence());
         assert!(lines[2].is_fence());
+    }
+
+    #[cfg(feature = "mermaid")]
+    #[test]
+    fn test_mermaid_block_detection() {
+        // 0 "# H"  1 ""  2 "```mermaid"  3 "flowchart TD"  4 "A-->B"  5 "```"  6 ""
+        // 7 "```rust"  8 "let x=1;"  9 "```"
+        let mut buf: Buffer =
+            "# H\n\n```mermaid\nflowchart TD\nA-->B\n```\n\n```rust\nlet x=1;\n```\n"
+                .parse()
+                .unwrap();
+        let snap = buf.render_snapshot();
+        let m = snap
+            .mermaid_block_at_line(3)
+            .expect("line 3 is inside the mermaid fence");
+        assert_eq!(m.anchor_line, 2, "the fence-open line is the anchor");
+        assert!(
+            snap.mermaid_block_at_line(2).is_some(),
+            "the ```mermaid line"
+        );
+        assert!(
+            snap.mermaid_block_at_line(8).is_none(),
+            "a ```rust line is not mermaid"
+        );
+        assert!(
+            snap.mermaid_block_at_line(0).is_none(),
+            "a heading is not mermaid"
+        );
     }
 
     #[test]

@@ -14,8 +14,12 @@ use vello::peniko::{Blob, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
 /// Supersample factor for SVG rasterization: render at 2× the logical size so the
 /// vector art stays crisp on hidpi, then downscale to the logical dest at draw time.
 const SVG_SUPERSAMPLE: f32 = 2.0;
-/// Cap on the rasterized SVG pixel dimensions, so a large SVG doesn't blow up memory.
-const SVG_MAX_RASTER: f32 = 4096.0;
+/// Cap on the rasterized SVG pixel dimensions. Beyond ~1024px in a dimension, Vello's
+/// per-frame image render falls off a fast path on some backends (measured ~2ms at 900px
+/// vs ~16ms at 1159px on Asahi/Mesa) — and the whole scene, images included, re-renders
+/// every frame, so a large diagram makes every repaint drop frames. 900 keeps large
+/// diagrams (mermaid) on the fast path while staying crisp; badges are far below it.
+const SVG_MAX_RASTER: f32 = 900.0;
 
 /// System-font database, loaded once (the load is expensive) and shared across every
 /// SVG parse so badge `<text>` labels resolve to real fonts.
