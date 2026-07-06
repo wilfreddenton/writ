@@ -28,7 +28,7 @@ use vello::peniko::Fill;
 
 use crate::buffer::Buffer;
 use crate::consts::{FONT_SIZE, LINE_HEIGHT, PADDING};
-use crate::doc_layout::{DocLayout, HeightCache, LayoutParams, LineCache, RenderCache};
+use crate::doc_layout::{DocLayout, HeightCache, LayoutParams, LineCache, RenderCache, TableCache};
 use crate::editor::EditorTheme;
 use crate::image_cache::{ImageCache, decode};
 use crate::text_engine::{TextEngine, peniko_color};
@@ -41,6 +41,7 @@ pub struct MarkdownView {
     line_cache: LineCache,
     render_cache: RenderCache,
     height_cache: HeightCache,
+    table_cache: TableCache,
     theme: EditorTheme,
     buffer: Buffer,
     doc: Option<DocLayout>,
@@ -63,6 +64,7 @@ impl MarkdownView {
             line_cache: LineCache::new(),
             render_cache: RenderCache::new(),
             height_cache: HeightCache::new(),
+            table_cache: TableCache::new(),
             theme,
             buffer: Buffer::new(),
             doc: None,
@@ -115,6 +117,7 @@ impl MarkdownView {
             &mut self.line_cache,
             &mut self.render_cache,
             &mut self.height_cache,
+            &mut self.table_cache,
             version,
             &snapshot,
             &self.theme,
@@ -225,6 +228,7 @@ impl MarkdownView {
         doc.draw_blockquote_gutters(scene, height);
         doc.draw_horizontal_rules(scene, height);
         doc.draw_images(&mut self.text_engine, scene, height);
+        doc.draw_tables(&self.text_engine, scene, height);
         doc.draw(&self.text_engine, scene, height);
         scene.pop_layer();
     }

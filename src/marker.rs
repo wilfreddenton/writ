@@ -4,6 +4,7 @@
 //! headings, etc.) and functions for extracting them from the parse tree.
 
 use crate::parser::MarkdownParser;
+use crate::table::{TableInfo, extract_table};
 use ropey::Rope;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -45,6 +46,8 @@ pub struct ParsedNodes {
     pub nodes: Vec<NodeInfo>,
     /// Information about fenced code blocks, sorted by start position
     pub code_blocks: Vec<CodeBlockInfo>,
+    /// GFM tables, sorted by `block.start` (traversal order)
+    pub tables: Vec<TableInfo>,
 }
 
 /// The unordered list marker character.
@@ -733,10 +736,11 @@ fn list_item_is_checked_task(node: &Node) -> bool {
 
 /// Collect all nodes as owned NodeInfo structs (no lifetimes).
 /// Used for lazy LineMarkers computation during rendering.
-pub fn collect_node_infos(root: &Node) -> ParsedNodes {
+pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
     let mut cursor = root.walk();
     let mut nodes = Vec::new();
     let mut code_blocks = Vec::new();
+    let mut tables = Vec::new();
     let mut checked_task_stack: Vec<(usize, bool)> = Vec::new();
     let mut code_block_end: Option<usize> = None;
     // Ancestor kinds, pushed on descent and popped on ascent, so the current node's
@@ -815,6 +819,12 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
             });
         }
 
+        if node.kind() == "pipe_table"
+            && let Some(table) = extract_table(&node, rope)
+        {
+            tables.push(table);
+        }
+
         let in_checked_task = checked_task_stack.iter().any(|(_, checked)| *checked);
         let in_code_block = code_block_end.is_some();
         let parent_kind = kind_stack.last().copied();
@@ -850,7 +860,11 @@ pub fn collect_node_infos(root: &Node) -> ParsedNodes {
         }
         loop {
             if !cursor.goto_parent() {
-                return ParsedNodes { nodes, code_blocks };
+                return ParsedNodes {
+                    nodes,
+                    code_blocks,
+                    tables,
+                };
             }
             kind_stack.pop();
             if cursor.goto_next_sibling() {

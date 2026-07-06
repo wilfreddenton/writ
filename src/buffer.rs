@@ -16,6 +16,7 @@ use crate::marker::{
     markers_at_from_infos,
 };
 use crate::parser::{MarkdownParser, MarkdownTree};
+use crate::table::{RowKind, TableInfo};
 
 /// Compute the byte range for a line (excludes trailing newline).
 fn compute_line_byte_range(rope: &Rope, line_idx: usize) -> Range<usize> {
@@ -175,6 +176,36 @@ impl RenderSnapshot {
         // Re-sort by start position to maintain order
         styles.sort_by_key(|s| s.full_range.start);
         styles
+    }
+
+    /// Find the table whose `block` byte range contains `offset`. O(log n) binary
+    /// search over `tables`, which are sorted by `block.start`.
+    pub fn table_containing_offset(&self, offset: usize) -> Option<&TableInfo> {
+        let tables = &self.parsed.tables;
+        let idx = tables.partition_point(|t| t.block.start <= offset);
+        // Candidate is the last table whose block starts at or before `offset`.
+        let table = tables.get(idx.checked_sub(1)?)?;
+        (offset < table.block.end).then_some(table)
+    }
+
+    /// Map a buffer line to the table and row role it belongs to, if any. A line
+    /// belongs to a row when the row's `line` byte range contains the line's start.
+    pub fn table_row_at_line(&self, line_idx: usize) -> Option<(&TableInfo, RowKind)> {
+        let line_start = self.line_byte_range(line_idx).start;
+        let table = self.table_containing_offset(line_start)?;
+
+        if table.header.line.contains(&line_start) {
+            return Some((table, RowKind::Header));
+        }
+        if table.delimiter_line.contains(&line_start) {
+            return Some((table, RowKind::Delimiter));
+        }
+        for (i, row) in table.body.iter().enumerate() {
+            if row.line.contains(&line_start) {
+                return Some((table, RowKind::Body(i)));
+            }
+        }
+        None
     }
 
     /// Get code highlights for a specific line. O(code_blocks) scan.
@@ -345,7 +376,7 @@ impl BufferContent {
         self.parsed = Rc::new(
             self.tree
                 .as_ref()
-                .map(|t| collect_node_infos(&t.block_tree().root_node()))
+                .map(|t| collect_node_infos(&t.block_tree().root_node(), &self.text))
                 .unwrap_or_default(),
         );
 
