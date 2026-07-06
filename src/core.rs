@@ -136,6 +136,9 @@ pub struct Editor {
     /// Active find bar, if find (Ctrl+F) is open. While `Some`, the shell routes all
     /// keystrokes to it instead of the document.
     find: Option<FindState>,
+    /// Whether the right-docked outline panel is open. Reserves a horizontal strip so
+    /// the document region insets (see `outline_width`).
+    outline_open: bool,
 
     // --- inline git diff against HEAD ---
     /// (raw HEAD text, rendered snapshot of it) reused as the diff base.
@@ -166,6 +169,7 @@ impl Editor {
             detection_key: None,
             autocomplete: None,
             find: None,
+            outline_open: false,
             head_base: None,
             diff_state: None,
             file_watcher: None,
@@ -646,6 +650,22 @@ impl Editor {
 
     pub fn find_state_mut(&mut self) -> Option<&mut FindState> {
         self.find.as_mut()
+    }
+
+    /// Toggle the right-docked outline panel, returning the new open state.
+    pub fn toggle_outline(&mut self) -> bool {
+        self.outline_open = !self.outline_open;
+        self.outline_open
+    }
+
+    pub fn outline_open(&self) -> bool {
+        self.outline_open
+    }
+
+    /// Force the outline open/closed. Used by the headless snapshot path to render a
+    /// golden frame with the panel reserved.
+    pub fn set_outline_open(&mut self, open: bool) {
+        self.outline_open = open;
     }
 
     /// Rebuild the match list for the current query. Uses the regex crate for BOTH
