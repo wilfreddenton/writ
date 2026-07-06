@@ -1,18 +1,19 @@
-//! Heading-based folding (v1): pure geometry over the document's ATX headings.
+//! Folding: pure geometry over the document's ATX headings and list items.
 //!
 //! Folding never mutates the buffer — it is session UI state living on the `Editor`
-//! as a set of folded heading *byte offsets*. This module derives, from that set and
-//! the current headings, which lines the layout should collapse to zero height. Byte
-//! offsets (not line numbers) anchor a fold because a single-splice edit remaps them
-//! exactly; the derivation here re-reads live headings each frame, so a fold's reach
-//! tracks edits automatically. List-indent folding is a deliberate follow-up — this
-//! model generalizes (a fold is any block anchored at a start offset); only the
-//! extent derivation below is heading-specific.
+//! as a set of folded *byte offsets* (line-start of a heading or a list-item bullet).
+//! This module derives, from that set plus the current headings/list-items, which lines
+//! the layout should collapse to zero height. Byte offsets (not line numbers) anchor a
+//! fold because a single-splice edit remaps them exactly; the derivation re-reads the
+//! live parse each frame, so a fold's reach tracks edits automatically. A fold is any
+//! block anchored at a start offset — headings and list items differ only in how their
+//! hidden extent is derived (`heading_extent` by heading level; `list_item_extent` from
+//! the item's precomputed nested span).
 
 use std::collections::HashSet;
 use std::ops::Range;
 
-use crate::marker::HeadingInfo;
+use crate::marker::{HeadingInfo, ListItemInfo};
 
 /// Lines hidden when `headings[idx]` folds: from the line after the heading down to
 /// (but not including) the next heading of the same-or-higher level, else EOF.
@@ -36,10 +37,39 @@ pub fn heading_is_foldable(headings: &[HeadingInfo], idx: usize, line_count: usi
     r.end > r.start
 }
 
-/// Merged, sorted hidden-line ranges for every folded heading. Nested folds produce
-/// subset ranges, so the coalesce below collapses them into the enclosing range.
+/// Lines hidden when `list_items[idx]` folds: its nested/continuation lines, from the
+/// line after the bullet down to (but not including) `fold_end_line`.
+pub fn list_item_extent(items: &[ListItemInfo], idx: usize) -> Range<usize> {
+    let item = &items[idx];
+    (item.line + 1)..item.fold_end_line.max(item.line + 1)
+}
+
+/// Whether folding this list item would hide at least one line (has nested content).
+pub fn list_item_is_foldable(items: &[ListItemInfo], idx: usize) -> bool {
+    items[idx].fold_end_line > items[idx].line + 1
+}
+
+/// The hidden-line extent for a folded offset, whichever kind of foldable it anchors —
+/// heading or list item. `None` if `offset` no longer matches either (stale after an edit).
+pub fn extent_for_offset(
+    headings: &[HeadingInfo],
+    list_items: &[ListItemInfo],
+    offset: usize,
+    line_count: usize,
+) -> Option<Range<usize>> {
+    if let Some(idx) = headings.iter().position(|h| h.byte_offset == offset) {
+        return Some(heading_extent(headings, idx, line_count));
+    }
+    let idx = list_items.iter().position(|i| i.byte_offset == offset)?;
+    Some(list_item_extent(list_items, idx))
+}
+
+/// Merged, sorted hidden-line ranges for every folded heading AND list item. Nested
+/// folds (a folded parent + a folded child, or a heading enclosing a folded list)
+/// produce subset ranges, so the coalesce below collapses them into the enclosing range.
 pub fn hidden_line_ranges(
     headings: &[HeadingInfo],
+    list_items: &[ListItemInfo],
     folded: &HashSet<usize>,
     line_count: usize,
 ) -> Vec<Range<usize>> {
@@ -51,6 +81,13 @@ pub fn hidden_line_ranges(
         .enumerate()
         .filter(|(_, h)| folded.contains(&h.byte_offset))
         .map(|(i, _)| heading_extent(headings, i, line_count))
+        .chain(
+            list_items
+                .iter()
+                .enumerate()
+                .filter(|(_, li)| folded.contains(&li.byte_offset))
+                .map(|(i, _)| list_item_extent(list_items, i)),
+        )
         .filter(|r| r.end > r.start)
         .collect();
     ranges.sort_by_key(|r| r.start);
@@ -81,6 +118,15 @@ mod tests {
             line,
             // Unique, monotonic offsets so tests can fold by offset unambiguously.
             byte_offset: line * 100,
+        }
+    }
+
+    fn li(line: usize, fold_end_line: usize) -> ListItemInfo {
+        ListItemInfo {
+            line,
+            byte_offset: line * 100,
+            fold_end_line,
+            depth: 1,
         }
     }
 
@@ -115,14 +161,55 @@ mod tests {
         let hs = [h(1, 0), h(2, 2), h(3, 4), h(1, 6)];
         // Folding both A and its child B: A's range 1..6 subsumes B's 3..6.
         let folded: HashSet<usize> = [hs[0].byte_offset, hs[1].byte_offset].into();
-        assert_eq!(hidden_line_ranges(&hs, &folded, 10), vec![1..6]);
+        assert_eq!(hidden_line_ranges(&hs, &[], &folded, 10), vec![1..6]);
     }
 
     #[test]
     fn disjoint_folds_stay_separate() {
         let hs = [h(1, 0), h(1, 3), h(1, 6)];
         let folded: HashSet<usize> = [hs[0].byte_offset, hs[2].byte_offset].into();
-        assert_eq!(hidden_line_ranges(&hs, &folded, 10), vec![1..3, 7..10]);
+        assert_eq!(hidden_line_ranges(&hs, &[], &folded, 10), vec![1..3, 7..10]);
+    }
+
+    #[test]
+    fn list_item_extent_and_foldability() {
+        // Parent on line 0 (children on 1,2), a nested child on line 1 (its child on 2),
+        // and a leaf on line 2. fold_end_line is the first line NOT in the item.
+        let items = [li(0, 3), li(1, 3), li(2, 3)];
+        assert_eq!(list_item_extent(&items, 0), 1..3);
+        assert!(list_item_is_foldable(&items, 0));
+        assert_eq!(list_item_extent(&items, 1), 2..3);
+        assert!(list_item_is_foldable(&items, 1));
+        assert!(!list_item_is_foldable(&items, 2)); // 3..3 empty → leaf
+    }
+
+    #[test]
+    fn nested_list_folds_coalesce() {
+        // Parent li(0,3) subsumes child li(1,3) when both folded.
+        let items = [li(0, 3), li(1, 3)];
+        let folded: HashSet<usize> = [items[0].byte_offset, items[1].byte_offset].into();
+        assert_eq!(hidden_line_ranges(&[], &items, &folded, 10), vec![1..3]);
+    }
+
+    #[test]
+    fn mixed_heading_and_list_union() {
+        // A folded heading and a disjoint folded list item both appear, sorted.
+        let hs = [h(1, 0)]; // heading at line 0 → extent 1..3
+        let items = [li(5, 8)]; // list item at line 5 → extent 6..8
+        let folded: HashSet<usize> = [hs[0].byte_offset, items[0].byte_offset].into();
+        assert_eq!(
+            hidden_line_ranges(&hs, &items, &folded, 3),
+            vec![1..3, 6..8]
+        );
+    }
+
+    #[test]
+    fn extent_for_offset_resolves_both_kinds() {
+        let hs = [h(1, 0)];
+        let items = [li(5, 8)];
+        assert_eq!(extent_for_offset(&hs, &items, 0, 3), Some(1..3)); // heading
+        assert_eq!(extent_for_offset(&hs, &items, 500, 3), Some(6..8)); // list (line 5 * 100)
+        assert_eq!(extent_for_offset(&hs, &items, 999, 3), None); // stale
     }
 
     #[test]

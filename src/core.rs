@@ -277,33 +277,51 @@ impl Editor {
     /// diff so a new mutator can't silently skip the refresh. Cursor-only ops that don't
     /// touch the buffer (click/drag/move/select_all) deliberately bypass this.
     fn edit<R>(&mut self, f: impl FnOnce(&mut EditorState) -> R) -> R {
-        // Capture the splice so folded-heading offsets can be remapped exactly. `anchor`
-        // is the left edge of the affected region (selection start, or the caret).
-        let anchor = self.state.selection.range().start;
-        let len_before = self.state.buffer.len_bytes();
+        // Snapshot the text (only when something is folded) so fold offsets can be remapped
+        // across the edit from the actual splice — computed from the common prefix/suffix,
+        // NOT the caret, since some edits (e.g. checkbox toggle) mutate away from the caret.
+        let before = (!self.folded_headings.is_empty()).then(|| self.state.buffer.text());
         let result = f(&mut self.state);
-        let len_after = self.state.buffer.len_bytes();
-        if !self.folded_headings.is_empty() && len_before != len_after {
-            self.remap_folds(anchor, len_before, len_after);
+        if let Some(before) = before {
+            let after = self.state.buffer.text();
+            if before != after {
+                self.remap_folds(&before, &after);
+            }
         }
         self.recompute_diff();
         self.maybe_autosave();
         result
     }
 
-    /// Shift folded-heading offsets across a single-splice edit at `anchor`. Offsets left
-    /// of the splice are fixed; those inside a deletion collapse below `anchor` and drop.
-    fn remap_folds(&mut self, anchor: usize, len_before: usize, len_after: usize) {
-        let delta = len_after as isize - len_before as isize;
+    /// Remap folded heading/list offsets across a single-splice edit, derived from the
+    /// common prefix/suffix of the old and new text. Offsets before the splice are fixed,
+    /// those after shift by the length delta, and any inside the replaced region drop.
+    fn remap_folds(&mut self, before: &str, after: &str) {
+        let (bb, ab) = (before.as_bytes(), after.as_bytes());
+        let mut prefix = 0;
+        while prefix < bb.len() && prefix < ab.len() && bb[prefix] == ab[prefix] {
+            prefix += 1;
+        }
+        let mut suffix = 0;
+        while suffix < bb.len() - prefix
+            && suffix < ab.len() - prefix
+            && bb[bb.len() - 1 - suffix] == ab[ab.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        let old_end = bb.len() - suffix; // end (in `before`) of the replaced region
+        let delta = ab.len() as isize - bb.len() as isize;
         let old = std::mem::take(&mut self.folded_headings);
         self.folded_headings = old
             .into_iter()
             .filter_map(|o| {
-                if o < anchor {
-                    return Some(o);
+                if o <= prefix {
+                    Some(o)
+                } else if o >= old_end {
+                    Some((o as isize + delta) as usize)
+                } else {
+                    None // the anchor line was edited → fold no longer meaningful
                 }
-                let shifted = o as isize + delta;
-                (shifted >= anchor as isize).then_some(shifted as usize)
             })
             .collect();
     }
@@ -709,6 +727,7 @@ impl Editor {
     pub fn hidden_line_ranges(&self) -> Vec<Range<usize>> {
         fold::hidden_line_ranges(
             self.state.buffer.headings(),
+            self.state.buffer.list_items(),
             &self.folded_headings,
             self.state.buffer.line_count(),
         )
@@ -716,6 +735,16 @@ impl Editor {
 
     pub fn is_heading_folded(&self, byte_offset: usize) -> bool {
         self.folded_headings.contains(&byte_offset)
+    }
+
+    /// Whether `byte_offset` anchors a list-item fold (vs a heading) — lets the shell
+    /// route list-chevron clicks to the item semantics instead of the heading level ones.
+    pub fn is_list_fold_offset(&self, byte_offset: usize) -> bool {
+        self.state
+            .buffer
+            .list_items()
+            .iter()
+            .any(|i| i.byte_offset == byte_offset)
     }
 
     /// Toggle the fold on the heading anchored at `byte_offset` (a gutter-chevron click).
@@ -731,25 +760,9 @@ impl Editor {
     /// the descendants too so unfolding the parent later reveals a still-collapsed subtree,
     /// matching the TextMate/VS Code "fold recursively" convention.
     pub fn toggle_fold_recursive(&mut self, byte_offset: usize) {
-        let line_count = self.state.buffer.line_count();
-        let headings = self.state.buffer.headings();
-        let Some(idx) = headings.iter().position(|h| h.byte_offset == byte_offset) else {
+        let offs = self.recursive_fold_set(byte_offset);
+        if offs.is_empty() {
             return;
-        };
-        if !fold::heading_is_foldable(headings, idx, line_count) {
-            return;
-        }
-        // The heading plus every foldable heading nested inside its extent (all deeper,
-        // since the extent stops at the next same-or-higher heading).
-        let extent = fold::heading_extent(headings, idx, line_count);
-        let mut offs = vec![byte_offset];
-        for (j, h) in headings.iter().enumerate().skip(idx + 1) {
-            if h.line >= extent.end {
-                break;
-            }
-            if fold::heading_is_foldable(headings, j, line_count) {
-                offs.push(h.byte_offset);
-            }
         }
         let folding = !self.folded_headings.contains(&byte_offset);
         for off in offs {
@@ -762,10 +775,115 @@ impl Editor {
         self.clamp_cursor_to_visible();
     }
 
-    /// Fold the section the cursor is in (the nearest heading at or above the caret).
+    /// The anchor `byte_offset` plus every foldable descendant nested inside its extent:
+    /// deeper headings under a heading, or nested items under a list item. Empty if the
+    /// offset isn't a foldable anchor. Kind is resolved from the offset (heading vs list).
+    fn recursive_fold_set(&self, byte_offset: usize) -> Vec<usize> {
+        let line_count = self.state.buffer.line_count();
+        let headings = self.state.buffer.headings();
+        if let Some(idx) = headings.iter().position(|h| h.byte_offset == byte_offset) {
+            if !fold::heading_is_foldable(headings, idx, line_count) {
+                return Vec::new();
+            }
+            let extent = fold::heading_extent(headings, idx, line_count);
+            let mut offs = vec![byte_offset];
+            for (j, h) in headings.iter().enumerate().skip(idx + 1) {
+                if h.line >= extent.end {
+                    break;
+                }
+                if fold::heading_is_foldable(headings, j, line_count) {
+                    offs.push(h.byte_offset);
+                }
+            }
+            return offs;
+        }
+        let items = self.state.buffer.list_items();
+        if let Some(idx) = items.iter().position(|i| i.byte_offset == byte_offset) {
+            if !fold::list_item_is_foldable(items, idx) {
+                return Vec::new();
+            }
+            let extent = fold::list_item_extent(items, idx);
+            let mut offs = vec![byte_offset];
+            for (j, it) in items.iter().enumerate().skip(idx + 1) {
+                if it.line >= extent.end {
+                    break;
+                }
+                if fold::list_item_is_foldable(items, j) {
+                    offs.push(it.byte_offset);
+                }
+            }
+            return offs;
+        }
+        Vec::new()
+    }
+
+    /// Ctrl+click a list chevron: fold every foldable list item at the clicked item's
+    /// nesting depth (the list analogue of [`toggle_fold_level_at`] for headings). Additive
+    /// — leaves heading folds and other-depth list folds alone; toggles the group off if the
+    /// clicked item is already folded.
+    pub fn toggle_fold_list_level_at(&mut self, byte_offset: usize) {
+        self.toggle_list_level(byte_offset, false);
+    }
+
+    /// Ctrl+Shift+click a list chevron: like [`toggle_fold_list_level_at`] but folds this
+    /// depth AND every deeper one, so expanding a peer reveals its children collapsed.
+    pub fn toggle_fold_list_level_deep_at(&mut self, byte_offset: usize) {
+        self.toggle_list_level(byte_offset, true);
+    }
+
+    fn toggle_list_level(&mut self, byte_offset: usize, deep: bool) {
+        let items = self.state.buffer.list_items();
+        let Some(depth) = items
+            .iter()
+            .find(|i| i.byte_offset == byte_offset)
+            .map(|i| i.depth)
+        else {
+            return;
+        };
+        let offs: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(i, it)| {
+                fold::list_item_is_foldable(items, *i)
+                    && if deep {
+                        it.depth >= depth
+                    } else {
+                        it.depth == depth
+                    }
+            })
+            .map(|(_, it)| it.byte_offset)
+            .collect();
+        let folding = !self.folded_headings.contains(&byte_offset);
+        for off in offs {
+            if folding {
+                self.folded_headings.insert(off);
+            } else {
+                self.folded_headings.remove(&off);
+            }
+        }
+        self.clamp_cursor_to_visible();
+    }
+
+    /// Fold the thing the cursor is in: the innermost foldable list item the caret sits
+    /// inside, else the nearest heading section at or above the caret.
     pub fn fold_at_cursor(&mut self) {
         let line = self.line_of(self.cursor_position());
         let line_count = self.state.buffer.line_count();
+        let items = self.state.buffer.list_items();
+        let list_off = items
+            .iter()
+            .enumerate()
+            .filter(|(i, it)| {
+                fold::list_item_is_foldable(items, *i)
+                    && (it.line..fold::list_item_extent(items, *i).end).contains(&line)
+            })
+            .max_by_key(|(_, it)| it.line)
+            .map(|(_, it)| it.byte_offset);
+        if let Some(off) = list_off {
+            self.folded_headings.insert(off);
+            self.clamp_cursor_to_visible();
+            return;
+        }
         let headings = self.state.buffer.headings();
         let Some(idx) = fold::section_heading(headings, line) else {
             return;
@@ -884,15 +1002,14 @@ impl Editor {
         let line_count = self.state.buffer.line_count();
         let to_remove: Vec<usize> = {
             let headings = self.state.buffer.headings();
+            let items = self.state.buffer.list_items();
             self.folded_headings
                 .iter()
                 .copied()
                 .filter(
-                    |&off| match headings.iter().position(|h| h.byte_offset == off) {
-                        Some(idx) => {
-                            fold::heading_extent(headings, idx, line_count).contains(&cursor_line)
-                        }
-                        None => true,
+                    |&off| match fold::extent_for_offset(headings, items, off, line_count) {
+                        Some(ext) => ext.contains(&cursor_line),
+                        None => true, // stale offset (heading/item edited away): drop
                     },
                 )
                 .collect()
@@ -1922,6 +2039,153 @@ let code = target(); // fenced block line
         // Recursive toggle again (now A unfolded) folds the whole A subtree back down.
         editor.toggle_fold_recursive(a);
         assert!(editor.is_heading_folded(a) && editor.is_heading_folded(c));
+    }
+
+    #[test]
+    fn list_folding_task_list_children_survive_checkbox_and_reveal() {
+        // A nested task list (the primary fold use case):
+        //   0 - [ ] parent   1   - [ ] child1   2   - [ ] child2   3 - [ ] sibling
+        let mut editor =
+            Editor::new("- [ ] parent\n  - [ ] child1\n  - [ ] child2\n- [ ] sibling\n");
+        let items = editor.state.buffer.list_items().to_vec();
+        let parent = items
+            .iter()
+            .find(|i| i.line == 0)
+            .expect("parent")
+            .byte_offset;
+        let sibling = items
+            .iter()
+            .find(|i| i.line == 3)
+            .expect("sibling")
+            .byte_offset;
+
+        // Folding the parent hides its two child items; the sibling is untouched.
+        editor.toggle_fold(parent);
+        assert_eq!(editor.hidden_line_ranges(), vec![1..3]);
+        assert!(editor.is_list_fold_offset(parent) && !editor.is_list_fold_offset(999));
+        assert!(!editor.is_heading_folded(sibling));
+
+        // The parent checkbox still toggles while its children are folded (checking a task
+        // also strikes it through), and the fold offset survives the edit — kids stay hidden.
+        editor.toggle_checkbox(0);
+        assert_eq!(editor.text().lines().next(), Some("- [x] ~~parent~~"));
+        assert_eq!(
+            editor.hidden_line_ranges(),
+            vec![1..3],
+            "fold survived the toggle"
+        );
+
+        // Moving the caret into a hidden child auto-reveals the fold.
+        editor.set_cursor(editor.state.buffer.line_to_byte(1));
+        assert!(editor.reveal_cursor());
+        assert!(editor.hidden_line_ranges().is_empty());
+    }
+
+    #[test]
+    fn list_folding_only_items_with_sublists_are_foldable() {
+        // Leaves must NOT be foldable — regression for tree-sitter extending a leaf's
+        // range into a trailing blank line (`- c`) or the next sibling's indent (`- c1`).
+        //   0 - a  1 - b  2 - c  3 (blank)  4 - p  5   - c1  6   - c2  7 - q
+        let mut editor = Editor::new("- a\n- b\n- c\n\n- p\n  - c1\n  - c2\n- q\n");
+        let items = editor.state.buffer.list_items().to_vec();
+        let foldable = |line: usize| -> bool {
+            let idx = items.iter().position(|i| i.line == line).unwrap();
+            crate::fold::list_item_is_foldable(&items, idx)
+        };
+        for leaf in [0, 1, 2, 5, 6, 7] {
+            assert!(!foldable(leaf), "line {leaf} is a leaf, must not fold");
+        }
+        assert!(foldable(4), "`- p` has a sublist, must fold");
+
+        // Folding `- p` hides only its two children (5,6) — not the blank, not `- q`.
+        let p = items.iter().find(|i| i.line == 4).unwrap().byte_offset;
+        editor.toggle_fold(p);
+        assert_eq!(editor.hidden_line_ranges(), vec![5..7]);
+    }
+
+    #[test]
+    fn click_snaps_out_of_list_marker_prefix() {
+        // Line 1 "  - [ ] child": indent 4..6, bullet 6..8, `[` at 8, content 12.
+        let mut editor = Editor::new("- p\n  - [ ] child\n");
+        // Click in the indent → snaps back to the line start (nearer boundary).
+        editor.click(5, false, 1);
+        assert_eq!(editor.cursor_position(), 4);
+        // Click just after the bullet → snaps forward to the checkbox `[`.
+        editor.click(7, false, 1);
+        assert_eq!(editor.cursor_position(), 8);
+        // The boundaries themselves are reachable; a plain paragraph is untouched.
+        editor.click(4, false, 1);
+        assert_eq!(editor.cursor_position(), 4);
+        editor.click(8, false, 1);
+        assert_eq!(editor.cursor_position(), 8);
+        let mut para = Editor::new("hello world\n");
+        para.click(3, false, 1);
+        assert_eq!(para.cursor_position(), 3);
+    }
+
+    #[test]
+    fn list_folding_ctrl_click_folds_all_at_depth() {
+        // Two top-level items with sublists, plus a deeper level:
+        //   0 - p   1   - a   2     - x   3   - b   4 - q   5   - c
+        let mut editor = Editor::new("- p\n  - a\n    - x\n  - b\n- q\n  - c\n");
+        let items = editor.state.buffer.list_items().to_vec();
+        let off = |line: usize| items.iter().find(|i| i.line == line).unwrap().byte_offset;
+
+        // Ctrl+click a top-level (depth-1) item folds BOTH top-level foldable items (p, q),
+        // not the deeper `- a`. Additive; doesn't touch depth-2.
+        editor.toggle_fold_list_level_at(off(0));
+        assert!(editor.is_heading_folded(off(0)) && editor.is_heading_folded(off(4)));
+        assert!(
+            !editor.is_heading_folded(off(1)),
+            "depth-2 item `- a` untouched"
+        );
+
+        // Toggling the same group off clears it.
+        editor.toggle_fold_list_level_at(off(0));
+        assert!(editor.hidden_line_ranges().is_empty());
+
+        // Deep variant folds this depth and deeper: p, q (depth 1) AND a (depth 2).
+        editor.toggle_fold_list_level_deep_at(off(0));
+        assert!(
+            editor.is_heading_folded(off(0))
+                && editor.is_heading_folded(off(4))
+                && editor.is_heading_folded(off(1))
+        );
+    }
+
+    #[test]
+    fn list_folding_recursive_and_survives_edit() {
+        // 3-deep nested list: 0 a  1  b  2   c  3 d(sibling)
+        let mut editor = Editor::new("- a\n  - b\n    - c\n- d\n");
+        let items = editor.state.buffer.list_items().to_vec();
+        let a = items.iter().find(|i| i.line == 0).unwrap().byte_offset;
+        let b = items.iter().find(|i| i.line == 1).unwrap().byte_offset;
+
+        // Recursive fold on the root folds the whole subtree (a's descendant b too).
+        editor.toggle_fold_recursive(a);
+        assert!(editor.is_heading_folded(a) && editor.is_heading_folded(b));
+
+        // Plain-unfolding a reveals b, which stays folded underneath.
+        editor.toggle_fold(a);
+        assert!(editor.is_heading_folded(b));
+        assert_eq!(editor.hidden_line_ranges(), vec![2..3]); // c still hidden under b
+
+        // Fold survives an edit above it: insert a new first line, offsets remap.
+        editor.toggle_fold_recursive(a);
+        editor.set_cursor(0);
+        editor.insert_str("- z\n");
+        let b2 = editor
+            .state
+            .buffer
+            .list_items()
+            .iter()
+            .find(|i| i.line == 2)
+            .unwrap()
+            .byte_offset;
+        assert!(
+            editor.is_heading_folded(b2),
+            "fold tracked the shifted item"
+        );
     }
 
     #[test]

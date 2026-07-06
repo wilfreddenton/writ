@@ -51,6 +51,23 @@ pub struct HeadingInfo {
     pub byte_offset: usize,
 }
 
+/// A list item (`- `, `* `, `1. `, incl. task items `- [ ]`), collected for folding.
+/// Its foldable body is the lines nested beneath the bullet.
+#[derive(Debug, Clone)]
+pub struct ListItemInfo {
+    /// 0-based line of the bullet (the `list_item` node's start).
+    pub line: usize,
+    /// Byte offset of the bullet line's start (fold anchor — same convention as
+    /// [`HeadingInfo`], so edit-remap treats headings and list items identically).
+    pub byte_offset: usize,
+    /// First line NOT part of this item. Hidden range when folded = `(line+1)..fold_end_line`;
+    /// foldable iff `fold_end_line > line + 1` (the item has nested/continuation lines).
+    pub fold_end_line: usize,
+    /// Nesting depth = number of ancestor `list` nodes (top-level items = 1). Groups
+    /// items for the "fold all at this level" (Ctrl+click) gesture.
+    pub depth: usize,
+}
+
 /// Collected parse information from a tree traversal.
 /// Contains both the node list and extracted structural info.
 #[derive(Debug, Clone, Default)]
@@ -64,6 +81,8 @@ pub struct ParsedNodes {
     /// ATX headings in document order, for the outline panel. Setext headings
     /// (`===`/`---`) are a separate node kind and are not collected (known gap).
     pub headings: Vec<HeadingInfo>,
+    /// List items in document order (parent before child), for list folding.
+    pub list_items: Vec<ListItemInfo>,
 }
 
 /// The unordered list marker character.
@@ -771,6 +790,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
     let mut code_blocks = Vec::new();
     let mut tables = Vec::new();
     let mut headings = Vec::new();
+    let mut list_items = Vec::new();
     let mut checked_task_stack: Vec<(usize, bool)> = Vec::new();
     let mut code_block_end: Option<usize> = None;
     // Ancestor kinds, pushed on descent and popped on ascent, so the current node's
@@ -801,6 +821,35 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
         if node.kind() == "list_item" {
             let is_checked = list_item_is_checked_task(&node);
             checked_task_stack.push((node.end_byte(), is_checked));
+
+            let line = rope.char_to_line(rope.byte_to_char(node.start_byte()));
+            let byte_offset = rope.char_to_byte(rope.line_to_char(line));
+            // An item is foldable only if it contains a nested `list`; the fold hides that
+            // sublist (and any lines between the bullet and it). We take the extent from the
+            // CHILD list's range, NOT the list_item's own `end_byte` — tree-sitter-md extends
+            // a list_item's end into the next sibling's indent / a trailing blank line, which
+            // would make leaves look foldable and swallow the following line.
+            let mut child_cursor = node.walk();
+            let nested_list_end = node
+                .children(&mut child_cursor)
+                .find(|c| c.kind() == "list")
+                .map(|c| c.end_byte());
+            let fold_end_line = match nested_list_end {
+                Some(end) => {
+                    let last = end.saturating_sub(1).max(node.start_byte());
+                    rope.char_to_line(rope.byte_to_char(last)) + 1
+                }
+                None => line + 1, // no sublist → not foldable
+            };
+            // Ancestor `list` nodes are already on `kind_stack` (parent pushed on descent),
+            // so their count is this item's nesting depth.
+            let depth = kind_stack.iter().filter(|k| **k == "list").count();
+            list_items.push(ListItemInfo {
+                line,
+                byte_offset,
+                fold_end_line,
+                depth,
+            });
         }
 
         if node.kind() == "fenced_code_block" {
@@ -919,6 +968,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
                     code_blocks,
                     tables,
                     headings,
+                    list_items,
                 };
             }
             kind_stack.pop();
