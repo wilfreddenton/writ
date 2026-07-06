@@ -27,6 +27,8 @@ use crate::inline::{
     GitHubContext, NakedUrl, RawGitHubMatch, StyledRegion, github_refs_to_styled_regions,
     naked_urls_to_styled_regions,
 };
+#[cfg(feature = "mermaid")]
+use crate::mermaid;
 use crate::render::{
     ImageRef, InlineImageRef, LineRender, TableCtx, build_cell_render, build_line_render,
 };
@@ -883,6 +885,10 @@ pub struct DocLayout {
     /// Distinct image URLs across the materialized lines, for the shell to kick off
     /// loads (diffed against the shared cache).
     image_urls: Vec<String>,
+    /// `(cache key, source)` of each materialized mermaid diagram, for the shell to
+    /// kick off off-thread rendering (mirrors `image_urls`).
+    #[cfg(feature = "mermaid")]
+    mermaid_sources: Vec<(String, String)>,
     /// Vertical padding (device px) above/below an image block, and the placeholder
     /// box colors — baked from `scale`/theme at build so the draw pass is self-contained.
     img_vpad: f32,
@@ -969,6 +975,11 @@ impl DocLayout {
         // lines are skipped: never materialized, `heights[i] = 0`, so the prefix-sum `tops`
         // ties across them and the whole virtualization stack excludes them for free.
         folds: &[Range<usize>],
+        // The current selection (collapsed = an empty range at the caret). A mermaid fold
+        // reveals its raw source whenever the selection OVERLAPS it, so a highlight dragged
+        // through the diagram shows (and copies) the source, and reveal doesn't flip-flop as
+        // the drag head enters/leaves.
+        selection: &Range<usize>,
     ) -> Self {
         let LayoutParams {
             content_x0,
@@ -1046,6 +1057,9 @@ impl DocLayout {
         // per-line `styles_in_range` scan — the dominant per-keystroke cost on large
         // docs. (Ghost lines style themselves lazily; see `build_ghosts_before`.)
         let line_styles = snapshot.inline_styles_by_line();
+        // Scan mermaid fences once, not per line (a per-line info-string check allocates).
+        #[cfg(feature = "mermaid")]
+        let mermaid_blocks = snapshot.mermaid_blocks();
         let mut layouts = Vec::with_capacity(n);
         let mut renders = Vec::with_capacity(n);
         let mut line_ranges = Vec::with_capacity(n);
@@ -1057,6 +1071,8 @@ impl DocLayout {
         let mut inline_draws: Vec<Vec<InlineImageDraw>> = Vec::with_capacity(n);
         let mut table_lines: Vec<Option<(Rc<TableLayout>, RowKind)>> = Vec::with_capacity(n);
         let mut image_urls: Vec<String> = Vec::new();
+        #[cfg(feature = "mermaid")]
+        let mut mermaid_sources: Vec<(String, String)> = Vec::new();
         // Content width available to an image (device px), same basis as `max_advance`.
         let content_w = max_advance;
         let img_vpad = IMG_VPAD * scale;
@@ -1106,6 +1122,39 @@ impl DocLayout {
                 table_lines.push(None);
                 continue;
             }
+            // Mermaid fence (diagram mode = caret outside the fence). Its non-anchor lines
+            // collapse to zero height like a fold; the anchor line draws the diagram
+            // (handled in the materialize path below). Inside the fence the caret reveals
+            // the raw code — `mermaid` is `None` then and the line renders normally.
+            #[cfg(feature = "mermaid")]
+            let mermaid = {
+                let ls = snapshot.line_byte_range(i).start;
+                mermaid_blocks
+                    .iter()
+                    .find(|m| m.block.contains(&ls))
+                    .filter(|m| {
+                        let selected =
+                            m.block.start < selection.end && selection.start < m.block.end;
+                        !selected && !m.block.contains(&cursor_line_start)
+                    })
+            };
+            #[cfg(feature = "mermaid")]
+            if let Some(m) = &mermaid
+                && i != m.anchor_line
+            {
+                heights.push(0.0);
+                layouts.push(empty_layout.clone());
+                renders.push(empty_render.clone());
+                line_ranges.push(snapshot.line_byte_range(i));
+                line_diffs.push(LineDiff::default());
+                ghosts.push(Vec::new());
+                ghost_height.push(0.0);
+                quote_bars.push(Vec::new());
+                image_blocks.push(None);
+                inline_draws.push(Vec::new());
+                table_lines.push(None);
+                continue;
+            }
             // Estimate the head (above the band) and the tail (once the band has covered
             // the viewport + overscan); materialize only the band in between.
             if i >= measure_from_line && !past_band && measured_start == n {
@@ -1135,6 +1184,49 @@ impl DocLayout {
                 ghost_height.push(gh);
                 quote_bars.push(Vec::new());
                 image_blocks.push(None);
+                inline_draws.push(Vec::new());
+                table_lines.push(None);
+                continue;
+            }
+            // Mermaid anchor (materialized): draw the diagram (or placeholder) in place of
+            // the fence text, collect its source for off-thread rendering, and account its
+            // height in the band. Non-anchor fence lines were already zero-heighted above.
+            #[cfg(feature = "mermaid")]
+            if let Some(m) = &mermaid {
+                let source = snapshot
+                    .rope
+                    .slice(
+                        snapshot.rope.byte_to_char(m.content.start)
+                            ..snapshot.rope.byte_to_char(m.content.end),
+                    )
+                    .to_string();
+                let key = mermaid::key_for(&source);
+                if !mermaid_sources.iter().any(|(k, _)| k == &key) {
+                    mermaid_sources.push((key.clone(), source));
+                }
+                let img = ImageRef {
+                    url: key,
+                    alt: "mermaid diagram".to_string(),
+                };
+                let (block, block_h) = build_image_block(images, &img, content_w, scale, img_vpad);
+                let range = snapshot.line_byte_range(i);
+                height_cache.set(render_key(version, i, cursor_component(i, &range)), block_h);
+                if i >= anchor_line {
+                    band_y += block_h;
+                    if band_y >= band_span {
+                        past_band = true;
+                        measured_count = i + 1;
+                    }
+                }
+                heights.push(block_h);
+                layouts.push(empty_layout.clone());
+                renders.push(empty_render.clone());
+                quote_bars.push(Vec::new());
+                line_ranges.push(range);
+                line_diffs.push(LineDiff::default());
+                ghosts.push(Vec::new());
+                ghost_height.push(0.0);
+                image_blocks.push(Some(block));
                 inline_draws.push(Vec::new());
                 table_lines.push(None);
                 continue;
@@ -1381,6 +1473,8 @@ impl DocLayout {
             image_blocks,
             inline_draws,
             image_urls,
+            #[cfg(feature = "mermaid")]
+            mermaid_sources,
             img_vpad,
             img_label_size: 14.0 * scale,
             image_border: peniko_color(theme.comment),
@@ -1560,6 +1654,13 @@ impl DocLayout {
             && let Some(off) = tl.hit_test(*kind, lx, self.table_cell_pad_x)
         {
             return Some(off);
+        }
+        // Image block (standalone image or a mermaid diagram): the text layout is empty,
+        // so land the caret at the line's start — for a mermaid fence that reveals the
+        // raw source. (The shared empty render's map is anchored at offset 0, so it can't
+        // be trusted here.)
+        if self.image_blocks[line].is_some() {
+            return Some(self.line_ranges[line].start);
         }
         let display_off = Cursor::from_point(layout, lx, ly).index();
         Some(self.renders[line].map.display_to_buffer(display_off))
@@ -1939,6 +2040,13 @@ impl DocLayout {
         &self.image_urls
     }
 
+    /// `(cache key, source)` of each materialized mermaid diagram, for the shell to
+    /// kick off off-thread rendering (mirrors `image_urls`).
+    #[cfg(feature = "mermaid")]
+    pub fn mermaid_sources(&self) -> &[(String, String)] {
+        &self.mermaid_sources
+    }
+
     /// Paint standalone-image blocks: a loaded image at its fitted device rect, or a
     /// bordered placeholder box with an alt/status label (pending/broken). Left-aligned
     /// at `pad_x`, inset by `img_vpad`. Call BEFORE `draw` (glyphs, if any, sit on top).
@@ -2229,6 +2337,8 @@ mod tests {
             image_blocks: heights.iter().map(|_| None).collect(),
             inline_draws: heights.iter().map(|_| Vec::new()).collect(),
             image_urls: Vec::new(),
+            #[cfg(feature = "mermaid")]
+            mermaid_sources: Vec::new(),
             img_vpad: 0.0,
             img_label_size: 14.0,
             image_border: Color::TRANSPARENT,
@@ -2319,6 +2429,7 @@ mod tests {
             0,
             f32::INFINITY,
             &[],
+            &(0..0),
         );
         // Several buffer offsets (incl. second line) should map to a caret rect
         // whose center hit-tests back to the same offset.
@@ -2362,6 +2473,7 @@ mod tests {
                 0,
                 f32::INFINITY,
                 folds,
+                &(0..0),
             )
         };
         let full = build(&mut engine, &[]);
@@ -2425,6 +2537,7 @@ mod tests {
                 0,
                 f32::INFINITY,
                 &[],
+                &(0..0),
             )
         };
         let doc = build(&params);
@@ -2487,6 +2600,7 @@ mod tests {
             0,
             f32::INFINITY,
             &[],
+            &(0..0),
         );
 
         // A mid-document line: its top pins to the viewport top exactly.
@@ -2538,6 +2652,7 @@ mod tests {
             0,
             f32::INFINITY,
             &[],
+            &(0..0),
         );
         // Line 0's changed version has a deleted ghost stacked above it.
         assert!(doc.ghost_height[0] > 0.0, "expected a ghost above line 0");
@@ -2585,6 +2700,7 @@ mod tests {
             0,
             f32::INFINITY,
             &[],
+            &(0..0),
         );
         assert!(
             !doc.trailing_ghosts.is_empty(),
@@ -2631,6 +2747,7 @@ mod tests {
                 0,
                 f32::INFINITY,
                 &[],
+                &(0..0),
             )
         };
         let t0 = Instant::now();
@@ -2686,6 +2803,7 @@ mod tests {
                     0,
                     f32::INFINITY,
                     &[],
+                    &(0..0),
                 )
             };
 
@@ -2739,6 +2857,7 @@ mod tests {
             0, // anchor at the top
             viewport_h,
             &[],
+            &(0..0),
         );
         let n = doc.line_count();
         assert!(n >= 3000);
@@ -2805,6 +2924,7 @@ mod tests {
             anchor,
             viewport_h,
             &[],
+            &(0..0),
         );
         let n = doc.line_count();
         // Head virtualized: the band starts near the anchor, not at line 0.
@@ -2997,6 +3117,7 @@ mod tests {
             0,
             f32::INFINITY,
             &[],
+            &(0..0),
         );
         // Table lines are the header/delimiter/body rows.
         for (line, want) in [
@@ -3061,6 +3182,7 @@ mod tests {
                 0,
                 f32::INFINITY,
                 &[],
+                &(0..0),
             )
         };
         // Cursor off the table (past the end): grid mode, header row hidden + flagged.
@@ -3108,6 +3230,7 @@ mod tests {
             0,
             f32::INFINITY,
             &[],
+            &(0..0),
         )
     }
 

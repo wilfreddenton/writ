@@ -56,6 +56,8 @@ use crate::github::{GitHubClient, ValidationResult};
 use crate::image_cache::ImageCache;
 use crate::image_load::{RepaintSignal, load_local_images_blocking, spawn_image_loads};
 use crate::inline::{GitHubContext, GitHubRef};
+#[cfg(feature = "mermaid")]
+use crate::mermaid;
 use crate::outline::{current_heading_index, draw_outline};
 use crate::overlay::{
     HoverTarget, draw_autocomplete, draw_hover_popover, find_hover_target, hover_target_at_offset,
@@ -329,6 +331,10 @@ struct App {
     /// Timestamp of the last auto-scroll tick, so scrolling integrates against real
     /// elapsed time (frame-rate independent) rather than a fixed amount per tick.
     last_drag_tick: Option<std::time::Instant>,
+    /// The pointer moved during a drag; the next redraw extends the selection once.
+    /// Coalesces a flood of `CursorMoved` events (mice poll far faster than 60 Hz) into
+    /// one relayout per frame instead of one per event — a drag was doing hundreds.
+    drag_pending: bool,
     /// Set by async completions (validation/image); the next redraw does a single
     /// rebuild, coalescing many same-frame completions into one relayout.
     pending_rebuild: bool,
@@ -411,6 +417,7 @@ impl App {
             click_count: 0,
             drag_scroll_dy: 0.0,
             last_drag_tick: None,
+            drag_pending: false,
             pending_rebuild: false,
             reload_slot: Arc::new(Mutex::new(None)),
             clipboard: arboard::Clipboard::new().ok(),
@@ -461,6 +468,18 @@ fn sync_image_loads(
     let Some(doc) = doc_engine.doc.as_ref() else {
         return;
     };
+    // Mermaid diagrams render off-thread into the same image cache; kick off any new ones
+    // (does nothing for sources already loading/loaded/failed).
+    #[cfg(feature = "mermaid")]
+    {
+        let sources = doc.mermaid_sources();
+        if !sources.is_empty() {
+            let proxy = proxy.clone();
+            mermaid::spawn_mermaid_renders(sources, &doc_engine.images, move || {
+                let _ = proxy.send_event(WritEvent::ImageLoaded);
+            });
+        }
+    }
     let urls = doc.image_urls();
     if urls.is_empty() {
         return;
@@ -921,6 +940,10 @@ impl DocEngine {
             cursor: p.cursor,
         });
         let folds = self.editor.hidden_line_ranges();
+        let selection = self.editor.selection_range().unwrap_or_else(|| {
+            let c = self.editor.cursor_position();
+            c..c
+        });
         DocLayout::build(
             &mut self.text_engine,
             &mut self.line_cache,
@@ -939,6 +962,7 @@ impl DocEngine {
             anchor_line,
             viewport_h,
             &folds,
+            &selection,
         )
     }
 }
@@ -1550,6 +1574,12 @@ impl ApplicationHandler<WritEvent> for App {
                     state.window.request_redraw();
                     return;
                 }
+                // Some IMEs (GNOME/IBus on Wayland) spam empty preedit events at idle. An
+                // empty preedit with nothing to clear is a no-op — skip it, or every frame
+                // would trigger a full relayout (murder on an expensive doc, e.g. mermaid).
+                if text.is_empty() && self.doc_engine.preedit.is_none() {
+                    return;
+                }
                 self.doc_engine.preedit = (!text.is_empty()).then_some(Preedit { text, cursor });
                 let (w, vh, _) = state.viewport();
                 self.doc_engine
@@ -1658,19 +1688,14 @@ impl ApplicationHandler<WritEvent> for App {
                     state.window.request_redraw();
                 }
                 if self.mouse_down {
-                    let (w, vh, _) = state.viewport();
+                    let (_, vh, _) = state.viewport();
                     // Record the edge auto-scroll velocity for the timer tick; the move
                     // itself only extends the selection (dy=0), so scroll speed stays
                     // fixed to the tick cadence rather than the mouse-move rate.
                     self.drag_scroll_dy = drag_edge_velocity(self.mouse_pos.1, vh, state.scale);
-                    drag_extend_step(
-                        &mut self.doc_engine,
-                        self.mouse_pos,
-                        0.0,
-                        w,
-                        state.scale,
-                        vh,
-                    );
+                    // Don't relayout per event — mice fire far faster than the display
+                    // refreshes. Mark it and let the next redraw extend the selection once.
+                    self.drag_pending = true;
                     state.window.request_redraw();
                 } else if self.doc_engine.editor.autocomplete().is_some() {
                     // Autocomplete popup open: the highlighted row follows the pointer.
@@ -2315,6 +2340,12 @@ impl ApplicationHandler<WritEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Apply a coalesced drag move once per frame (see `drag_pending`).
+                if self.drag_pending {
+                    self.drag_pending = false;
+                    let (w, vh, scale) = state.viewport();
+                    drag_extend_step(&mut self.doc_engine, self.mouse_pos, 0.0, w, scale, vh);
+                }
                 self.scene.reset();
 
                 // Keep the native title bar's text current (filename + dirty marker).
@@ -2675,6 +2706,8 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         .file_path()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()));
     load_local_images_blocking(img_dir.as_deref(), doc.image_urls(), &de.images);
+    #[cfg(feature = "mermaid")]
+    mermaid::render_mermaid_blocking(doc.mermaid_sources(), &de.images);
     doc = de.rebuild(width as f32, 1.0, 0, f32::INFINITY);
     doc.scroll_by(scroll_y, editor_h);
     let mut scene = Scene::new();
