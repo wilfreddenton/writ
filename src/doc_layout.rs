@@ -1538,6 +1538,15 @@ impl DocLayout {
         self.clamp_scroll(viewport_h);
     }
 
+    /// Pin `line`'s top to the viewport top (clamped to the document end). Reads better
+    /// than `scroll_to`'s minimal scroll for outline navigation, where the user expects
+    /// the clicked heading to jump to the top.
+    pub fn scroll_line_to_top(&mut self, line: usize, viewport_h: f32) {
+        let idx = line.min(self.tops.len().saturating_sub(1));
+        self.scroll_y = self.tops[idx];
+        self.clamp_scroll(viewport_h);
+    }
+
     pub fn line_count(&self) -> usize {
         self.layouts.len()
     }
@@ -2353,6 +2362,52 @@ mod tests {
             let (x0, _, x1, _) = doc.caret_rect(off, 2.0).expect("caret rect");
             assert!(x0 >= doc.pad_x as f64 - 1.0 && x1 <= doc.width as f64);
         }
+    }
+
+    #[test]
+    fn scroll_line_to_top_pins_and_clamps() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let src = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut buffer: Buffer = src.parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+        let params = test_params(&theme, 800.0);
+        let viewport_h = 200.0;
+        let mut doc = DocLayout::build(
+            &mut engine,
+            &mut LineCache::new(),
+            &mut RenderCache::new(),
+            &mut HeightCache::new(),
+            &mut TableCache::new(),
+            0,
+            &snapshot,
+            &theme,
+            None,
+            None,
+            &ImageCache::new(),
+            0,
+            &params,
+            None,
+            0,
+            f32::INFINITY,
+        );
+
+        // A mid-document line: its top pins to the viewport top exactly.
+        doc.scroll_line_to_top(10, viewport_h);
+        assert_eq!(doc.scroll_y, doc.tops[10]);
+
+        // Scrolling to a line near the end clamps to `max_scroll` (can't scroll past
+        // the document bottom), so `scroll_y` never exceeds the clamp.
+        doc.scroll_line_to_top(39, viewport_h);
+        assert_eq!(doc.scroll_y, doc.max_scroll(viewport_h));
+
+        // An out-of-range line index saturates to the last entry rather than panicking.
+        doc.scroll_line_to_top(9999, viewport_h);
+        assert_eq!(doc.scroll_y, doc.max_scroll(viewport_h));
     }
 
     /// Ghost (deleted) rows offset the real line below them, and clicks in a ghost

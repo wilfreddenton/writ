@@ -42,7 +42,7 @@ use crate::chrome::{BarRect, FindButtonRects, StatusInfo, draw_find_bar, draw_st
 use crate::config::Config;
 use crate::consts::{
     CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, OUTLINE_WIDTH, PADDING, STATUS_BAR_H,
-    UI_LINE_HEIGHT, WHEEL_LINE_STEP,
+    WHEEL_LINE_STEP,
 };
 use crate::core::{AutocompleteSuggestion, AutocompleteTrigger, Editor, FieldFocus, FindMode};
 use crate::doc_layout::{
@@ -55,7 +55,7 @@ use crate::github::{GitHubClient, ValidationResult};
 use crate::image_cache::ImageCache;
 use crate::image_load::{RepaintSignal, load_local_images_blocking, spawn_image_loads};
 use crate::inline::{GitHubContext, GitHubRef};
-use crate::marker::MarkerKind;
+use crate::outline::{current_heading_index, draw_outline};
 use crate::overlay::{
     HoverTarget, draw_autocomplete, draw_hover_popover, find_hover_target, hover_target_at_offset,
 };
@@ -118,14 +118,8 @@ fn window_title(editor: &Editor) -> String {
 
 /// Nearest heading level at or above `line`, if any.
 fn heading_at(buffer: &Buffer, line: usize) -> Option<u8> {
-    for i in (0..=line).rev() {
-        for m in &buffer.line_markers(i).markers {
-            if let MarkerKind::Heading(level) = m.kind {
-                return Some(level);
-            }
-        }
-    }
-    None
+    let headings = buffer.headings();
+    current_heading_index(headings, line).map(|i| headings[i].level)
 }
 
 /// Gather the status-bar inputs from the editor + viewport.
@@ -350,6 +344,10 @@ struct App {
     hovered: Option<HoverTarget>,
     /// Screen rects of the currently-drawn autocomplete rows (for click routing).
     ac_row_rects: Vec<ScreenRect>,
+    /// Screen rects of the currently-drawn outline rows (for click-to-scroll routing).
+    outline_row_rects: Vec<ScreenRect>,
+    /// Outline row under the pointer, if any (drives the hover tint).
+    outline_hover: Option<usize>,
     /// Screen rects of the find bar's Replace/All buttons (for click routing), when the
     /// bar is open in Replace mode.
     find_btn_rects: Option<FindButtonRects>,
@@ -413,6 +411,8 @@ impl App {
             title,
             hovered: None,
             ac_row_rects: Vec::new(),
+            outline_row_rects: Vec::new(),
+            outline_hover: None,
             find_btn_rects: None,
             ac_gen: Arc::new(AtomicU64::new(0)),
             ac_slot: Arc::new(Mutex::new(None)),
@@ -1067,7 +1067,8 @@ fn paint_document(
     width: f32,
     height: f32,
     scale: f32,
-) -> Option<FindButtonRects> {
+    outline_hover: Option<usize>,
+) -> (Option<FindButtonRects>, Vec<ScreenRect>) {
     // The outline panel (when open) reserves a right strip; clip the document body to the
     // reduced region so glyphs/backgrounds never draw under the panel.
     let outline_w = outline_width(editor, scale);
@@ -1154,44 +1155,32 @@ fn paint_document(
     }
     scene.pop_layer();
 
-    // Placeholder outline panel: a right strip in `theme.surface` down to the status bar,
-    // with a `theme.selection` vertical hairline on its left edge (mirrors the status
-    // bar's fill+top-rule, rotated). No rows yet — this spike only proves the reserved
-    // space and the reflowed document; the panel UI lands later.
-    if outline_w > 0.0 {
-        let panel_x = (width - outline_w) as f64;
-        let panel_bottom = (content_top + editor_h + find_h) as f64;
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            peniko_color(theme.surface),
-            None,
-            &Rect::new(panel_x, content_top as f64, width as f64, panel_bottom),
-        );
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            peniko_color(theme.selection),
-            None,
-            &Rect::new(
-                panel_x,
-                content_top as f64,
-                panel_x + scale as f64,
-                panel_bottom,
-            ),
-        );
-        let label = engine.build_line(
-            "Outline",
+    // The right-docked outline panel: the document's heading list with the current
+    // section highlighted. Rects (one per row) route clicks back to a scroll.
+    let outline_rects = if outline_w > 0.0 {
+        let panel = BarRect {
+            x0: (width - outline_w) as f64,
+            y0: content_top as f64,
+            x1: width as f64,
+            y1: (content_top + editor_h) as f64,
+        };
+        let buffer = &editor.state.buffer;
+        let headings = buffer.headings();
+        let cursor_line = buffer.byte_to_line(editor.cursor_position());
+        let current = current_heading_index(headings, cursor_line);
+        draw_outline(
+            engine,
+            scene,
+            theme,
+            headings,
+            current,
+            outline_hover,
+            &panel,
             scale,
-            14.0,
-            UI_LINE_HEIGHT,
-            peniko_color(theme.comment),
-            None,
-            &[],
-        );
-        let lx = panel_x + (outline_w as f64 - label.width() as f64) / 2.0;
-        engine.draw_line(scene, &label, (lx as f32, content_top + PADDING * scale));
-    }
+        )
+    } else {
+        Vec::new()
+    };
 
     // Chrome (bottom, above the OS-native title bar): the find bar sits in the gap
     // between the document and the status bar, so the status bar starts below it.
@@ -1230,7 +1219,7 @@ fn paint_document(
         &info,
         scale,
     );
-    btn_rects
+    (btn_rects, outline_rects)
 }
 
 impl ApplicationHandler<WritEvent> for App {
@@ -1523,6 +1512,19 @@ impl ApplicationHandler<WritEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x as f32, position.y as f32);
+                // Outline panel hover: highlight the row under the pointer (independent of
+                // the document/autocomplete hover machinery below).
+                let panel_left = state.surface.config.width as f32 - OUTLINE_WIDTH * state.scale;
+                let new_outline_hover =
+                    if self.doc_engine.editor.outline_open() && self.mouse_pos.0 >= panel_left {
+                        ac_row_at(&self.outline_row_rects, self.mouse_pos)
+                    } else {
+                        None
+                    };
+                if new_outline_hover != self.outline_hover {
+                    self.outline_hover = new_outline_hover;
+                    state.window.request_redraw();
+                }
                 if self.mouse_down {
                     let (w, vh, _) = state.viewport();
                     // Record the edge auto-scroll velocity for the timer tick; the move
@@ -1663,6 +1665,44 @@ impl ApplicationHandler<WritEvent> for App {
                             vh,
                         );
                     }
+                    return;
+                }
+
+                // Outline panel click: jump to the clicked heading (pin it to the top).
+                // A click anywhere in the strip returns without placing the doc caret,
+                // even if it missed a row (the strip isn't part of the document).
+                if self.doc_engine.editor.outline_open()
+                    && self.mouse_pos.0 >= w - OUTLINE_WIDTH * state.scale
+                {
+                    if let Some(i) = ac_row_at(&self.outline_row_rects, self.mouse_pos) {
+                        let off = self
+                            .doc_engine
+                            .editor
+                            .state
+                            .buffer
+                            .headings()
+                            .get(i)
+                            .map(|h| h.byte_offset);
+                        if let Some(off) = off {
+                            self.doc_engine.editor.set_cursor(off);
+                            let mut remeasure = false;
+                            if let Some(doc) = self.doc_engine.doc.as_mut() {
+                                doc.scroll_line_to_top(doc.line_of(off), vh);
+                                remeasure = doc.needs_remeasure(vh);
+                            }
+                            // If the heading sits outside the materialized band, rebuild
+                            // around the new scroll anchor so it lays out, then re-pin.
+                            if remeasure {
+                                self.doc_engine
+                                    .rebuild_preserving_scroll(w, state.scale, vh);
+                                if let Some(doc) = self.doc_engine.doc.as_mut() {
+                                    doc.scroll_line_to_top(doc.line_of(off), vh);
+                                }
+                            }
+                            sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                        }
+                    }
+                    state.window.request_redraw();
                     return;
                 }
 
@@ -2083,7 +2123,7 @@ impl ApplicationHandler<WritEvent> for App {
                 }
 
                 if let Some(doc) = self.doc_engine.doc.as_ref() {
-                    self.find_btn_rects = paint_document(
+                    let (btn_rects, outline_rects) = paint_document(
                         &mut self.scene,
                         &mut self.doc_engine.text_engine,
                         &self.doc_engine.theme,
@@ -2095,7 +2135,10 @@ impl ApplicationHandler<WritEvent> for App {
                         width,
                         height,
                         state.scale,
+                        self.outline_hover,
                     );
+                    self.find_btn_rects = btn_rects;
+                    self.outline_row_rects = outline_rects;
 
                     // Overlays on top of everything (unclipped): the autocomplete
                     // dropdown takes priority over the hover popover.
@@ -2431,6 +2474,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         width as f32,
         height as f32,
         1.0,
+        None,
     );
 
     // Optional hover-popover golden image: WRIT_SHELL_HOVER=<byte offset> anchors the

@@ -12,8 +12,8 @@ static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
 use crate::highlight::{HighlightSpan, Highlighter};
 use crate::inline::{StyledRegion, extract_all_inline_styles, styles_in_range};
 use crate::marker::{
-    LineMarkers, ParsedNodes, collect_node_infos, is_line_in_checked_task, is_line_in_code_block,
-    markers_at_from_infos,
+    HeadingInfo, LineMarkers, ParsedNodes, collect_node_infos, is_line_in_checked_task,
+    is_line_in_code_block, markers_at_from_infos,
 };
 use crate::parser::{MarkdownParser, MarkdownTree};
 use crate::table::{RowKind, TableInfo};
@@ -666,6 +666,12 @@ impl BufferContent {
     /// Get a reference to the parsed nodes for structural queries.
     pub fn parsed(&self) -> &ParsedNodes {
         &self.parsed
+    }
+
+    /// ATX headings in document order (for the outline panel). Rc-cached with the
+    /// parse tree, so this is auto-invalidated on edit.
+    pub fn headings(&self) -> &[HeadingInfo] {
+        &self.parsed().headings
     }
 
     /// Compute LineMarkers for a specific line on demand.

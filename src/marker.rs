@@ -38,6 +38,19 @@ pub struct CodeBlockInfo {
     pub info_string_range: Option<Range<usize>>,
 }
 
+/// An ATX heading (`#`..`######`), collected for the document outline.
+#[derive(Debug, Clone)]
+pub struct HeadingInfo {
+    /// Heading level 1..=6 (number of leading `#`).
+    pub level: u8,
+    /// Heading text: the line content after the `#` marker(s), trimmed.
+    pub text: String,
+    /// 0-based line index of the heading.
+    pub line: usize,
+    /// Byte offset of the heading line's start.
+    pub byte_offset: usize,
+}
+
 /// Collected parse information from a tree traversal.
 /// Contains both the node list and extracted structural info.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +61,9 @@ pub struct ParsedNodes {
     pub code_blocks: Vec<CodeBlockInfo>,
     /// GFM tables, sorted by `block.start` (traversal order)
     pub tables: Vec<TableInfo>,
+    /// ATX headings in document order, for the outline panel. Setext headings
+    /// (`===`/`---`) are a separate node kind and are not collected (known gap).
+    pub headings: Vec<HeadingInfo>,
 }
 
 /// The unordered list marker character.
@@ -734,6 +750,19 @@ fn list_item_is_checked_task(node: &Node) -> bool {
     false
 }
 
+/// Level 1..=6 for an `atx_h{n}_marker` node kind, else None.
+fn atx_marker_level(kind: &str) -> Option<u8> {
+    match kind {
+        "atx_h1_marker" => Some(1),
+        "atx_h2_marker" => Some(2),
+        "atx_h3_marker" => Some(3),
+        "atx_h4_marker" => Some(4),
+        "atx_h5_marker" => Some(5),
+        "atx_h6_marker" => Some(6),
+        _ => None,
+    }
+}
+
 /// Collect all nodes as owned NodeInfo structs (no lifetimes).
 /// Used for lazy LineMarkers computation during rendering.
 pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
@@ -741,6 +770,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
     let mut nodes = Vec::new();
     let mut code_blocks = Vec::new();
     let mut tables = Vec::new();
+    let mut headings = Vec::new();
     let mut checked_task_stack: Vec<(usize, bool)> = Vec::new();
     let mut code_block_end: Option<usize> = None;
     // Ancestor kinds, pushed on descent and popped on ascent, so the current node's
@@ -825,6 +855,30 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
             tables.push(table);
         }
 
+        // ATX heading markers only appear at block level; tree-sitter never emits them
+        // inside a fenced code block (its body is opaque `code_fence_content`), so
+        // headings inside fences are naturally excluded.
+        if let Some(level) = atx_marker_level(node.kind()) {
+            let marker_start = node.start_byte();
+            let char_start = rope.byte_to_char(marker_start);
+            let line = rope.char_to_line(char_start);
+            let line_start_byte = rope.char_to_byte(rope.line_to_char(line));
+            let line_end_byte = if line + 1 < rope.len_lines() {
+                rope.char_to_byte(rope.line_to_char(line + 1))
+            } else {
+                rope.len_bytes()
+            };
+            let text = rope_slice_cow(rope, node.end_byte(), line_end_byte)
+                .trim()
+                .to_string();
+            headings.push(HeadingInfo {
+                level,
+                text,
+                line,
+                byte_offset: line_start_byte,
+            });
+        }
+
         let in_checked_task = checked_task_stack.iter().any(|(_, checked)| *checked);
         let in_code_block = code_block_end.is_some();
         let parent_kind = kind_stack.last().copied();
@@ -864,6 +918,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
                     nodes,
                     code_blocks,
                     tables,
+                    headings,
                 };
             }
             kind_stack.pop();
@@ -1055,6 +1110,7 @@ pub fn is_line_in_code_block(nodes: &[NodeInfo], line_start: usize) -> bool {
 mod tests {
     use super::*;
     use crate::buffer::Buffer;
+    use crate::outline::current_heading_index;
 
     fn kinds(markers: &[Marker]) -> Vec<&MarkerKind> {
         markers.iter().map(|m| &m.kind).collect()
@@ -1342,6 +1398,62 @@ mod tests {
         let buf: Buffer = "## Heading\n".parse().unwrap();
         let lines = buf.lines();
         assert_eq!(kinds(&lines[0].markers), vec![&MarkerKind::Heading(2)]);
+    }
+
+    #[test]
+    fn test_headings_extraction_all_levels() {
+        let src = "# One\n\n## Two\n\n### Three\n\n#### Four\n\n##### Five\n\n###### Six\n";
+        let buf: Buffer = src.parse().unwrap();
+        let hs = buf.headings();
+        assert_eq!(hs.len(), 6);
+        let expected = [
+            (1u8, "One", 0usize),
+            (2, "Two", 2),
+            (3, "Three", 4),
+            (4, "Four", 6),
+            (5, "Five", 8),
+            (6, "Six", 10),
+        ];
+        for (h, (level, text, line)) in hs.iter().zip(expected) {
+            assert_eq!(h.level, level);
+            assert_eq!(h.text, text);
+            assert_eq!(h.line, line);
+            // byte_offset points at the heading line's first byte.
+            assert_eq!(h.byte_offset, buf.line_to_byte(line));
+        }
+    }
+
+    #[test]
+    fn test_heading_trailing_space_trimmed() {
+        let buf: Buffer = "#   Spaced heading   \n".parse().unwrap();
+        let hs = buf.headings();
+        assert_eq!(hs.len(), 1);
+        assert_eq!(hs[0].text, "Spaced heading");
+        assert_eq!(hs[0].level, 1);
+    }
+
+    #[test]
+    fn test_heading_excluded_inside_code_fence() {
+        let src = "# Real\n\n```\n# Not a heading\n## Also not\n```\n\n## After\n";
+        let buf: Buffer = src.parse().unwrap();
+        let texts: Vec<&str> = buf.headings().iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, vec!["Real", "After"]);
+    }
+
+    #[test]
+    fn test_current_heading_index() {
+        let src = "intro line\n\n# First\n\nbody\n\n## Second\n\nmore\n";
+        let buf: Buffer = src.parse().unwrap();
+        let hs = buf.headings();
+        // Cursor before the first heading: None.
+        assert_eq!(current_heading_index(hs, 0), None);
+        assert_eq!(current_heading_index(hs, 1), None);
+        // On / inside the first section.
+        assert_eq!(current_heading_index(hs, 2), Some(0));
+        assert_eq!(current_heading_index(hs, 4), Some(0));
+        // Inside the second section.
+        assert_eq!(current_heading_index(hs, 6), Some(1));
+        assert_eq!(current_heading_index(hs, 8), Some(1));
     }
 
     #[test]

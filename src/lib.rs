@@ -45,6 +45,7 @@ pub mod image_load;
 pub mod inline;
 pub mod markdown_view;
 pub mod marker;
+pub mod outline;
 #[cfg(feature = "app")]
 pub mod overlay;
 pub mod parser;
