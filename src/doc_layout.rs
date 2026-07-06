@@ -217,6 +217,9 @@ struct CellSlot {
     /// For an empty cell, the caret offset just inside the opening pipe (so a click lands
     /// off the pipe); `None` for a non-empty cell, which hit-tests via `layout`/`map`.
     empty_landing: Option<usize>,
+    /// Display-byte ranges of the cell's inline-code spans, used to paint the translucent
+    /// chip behind the code glyphs (mirrors body lines' `code_ranges`).
+    code_ranges: Vec<Range<usize>>,
 }
 type CellLayout = Option<CellSlot>;
 type GridLayouts = Vec<Vec<CellLayout>>;
@@ -228,6 +231,7 @@ struct MeasuredCell {
     runs: Vec<StyleRun>,
     map: SegmentMap,
     empty_landing: Option<usize>,
+    code_ranges: Vec<Range<usize>>,
 }
 type CellData = Option<MeasuredCell>;
 type GridCells = Vec<Vec<CellData>>;
@@ -414,7 +418,7 @@ fn build_table_layout(
         for c in 0..ncols {
             match row.cells.get(c) {
                 Some(cell) => {
-                    let (text, mut runs, map) =
+                    let (text, mut runs, map, code_ranges) =
                         build_cell_render(snapshot, theme, cell.content.clone(), styles);
                     if is_header && !text.is_empty() {
                         // Bold the whole header cell; content color runs still win their spans.
@@ -433,6 +437,7 @@ fn build_table_layout(
                         runs,
                         map,
                         empty_landing,
+                        code_ranges,
                     }));
                 }
                 None => rowdata.push(None),
@@ -476,6 +481,7 @@ fn build_table_layout(
                     runs,
                     map,
                     empty_landing,
+                    code_ranges,
                 }) => {
                     let layout = Rc::new(engine.build_line(
                         &text,
@@ -491,6 +497,7 @@ fn build_table_layout(
                         layout,
                         map,
                         empty_landing,
+                        code_ranges,
                     }));
                 }
                 None => layouts.push(None),
@@ -1585,13 +1592,15 @@ impl DocLayout {
         (first, last.max(first))
     }
 
-    /// Fill the word-change rects of `ranges` within `layout`, offset to `top_y`.
-    fn fill_word_ranges(
+    /// Fill the display-byte rects of `ranges` within `layout`, offset by `(origin_x,
+    /// origin_y)` — the top-left where the layout's glyphs are painted.
+    fn fill_display_ranges(
         &self,
         scene: &mut Scene,
         layout: &parley::Layout<Brush>,
         ranges: &[Range<usize>],
-        top_y: f64,
+        origin_x: f64,
+        origin_y: f64,
         color: Color,
     ) {
         for r in ranges {
@@ -1603,14 +1612,27 @@ impl DocLayout {
                     color,
                     None,
                     &Rect::new(
-                        bb.x0 + self.pad_x as f64,
-                        bb.y0 + top_y,
-                        bb.x1 + self.pad_x as f64,
-                        bb.y1 + top_y,
+                        bb.x0 + origin_x,
+                        bb.y0 + origin_y,
+                        bb.x1 + origin_x,
+                        bb.y1 + origin_y,
                     ),
                 );
             }
         }
+    }
+
+    /// Fill the word-change rects of `ranges` within `layout`, offset to `top_y`. Body
+    /// lines are drawn at `self.pad_x`, so that is the x origin.
+    fn fill_word_ranges(
+        &self,
+        scene: &mut Scene,
+        layout: &parley::Layout<Brush>,
+        ranges: &[Range<usize>],
+        top_y: f64,
+        color: Color,
+    ) {
+        self.fill_display_ranges(scene, layout, ranges, self.pad_x as f64, top_y, color);
     }
 
     /// Paint line `i`'s inline images at their laid-out inline-box positions. `gy` is
@@ -1828,6 +1850,17 @@ impl DocLayout {
                     };
                     let gx = cx as f32 + cell_pad_x + shift;
                     let gy = top as f32 + cell_pad_y;
+                    // Chip behind inline code, over the cell bg but under the glyphs.
+                    if !slot.code_ranges.is_empty() {
+                        self.fill_display_ranges(
+                            scene,
+                            layout,
+                            &slot.code_ranges,
+                            gx as f64,
+                            gy as f64,
+                            self.code_bg,
+                        );
+                    }
                     engine.draw_line(scene, layout, (gx, gy));
                 }
             }
@@ -2630,6 +2663,36 @@ mod tests {
         // Header + two body rows → three row heights, all positive.
         assert_eq!(tl.row_heights.len(), 3);
         assert!(tl.row_heights.iter().all(|&h| h > 0.0));
+    }
+
+    /// A cell containing inline `` `code` `` carries its display-byte code ranges into the
+    /// `CellSlot`, so the draw pass can paint the translucent chip behind the code glyphs.
+    #[test]
+    fn table_cell_inline_code_reaches_slot() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let mut buf: Buffer = "| a | b |\n|---|---|\n| plain | `code` |\n"
+            .parse()
+            .unwrap();
+        let snap = buf.render_snapshot();
+        let styles = snap.inline_styles_by_line();
+        let params = test_params(&theme, 1200.0);
+        let table = snap.table_containing_offset(0).unwrap();
+        let tl = build_table_layout(&mut engine, &snap, &theme, table, &styles, &params, 1000.0);
+
+        // row_layouts[1] is the single body row; col 1 holds `code`, col 0 is plain.
+        let body = &tl.row_layouts[1];
+        let code_cell = body[1].as_ref().expect("body code cell present");
+        assert!(
+            !code_cell.code_ranges.is_empty(),
+            "inline-code cell must carry code ranges for the chip"
+        );
+        let plain_cell = body[0].as_ref().expect("body plain cell present");
+        assert!(
+            plain_cell.code_ranges.is_empty(),
+            "a plain cell has no code ranges"
+        );
     }
 
     /// The size cap: a table exceeding the body-row limit is not grid-rendered
