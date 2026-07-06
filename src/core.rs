@@ -33,6 +33,7 @@ use crate::inline::{
 };
 use crate::marker::MarkerKind;
 use crate::paste::{PasteContext, transform_paste};
+use crate::text_input::TextField;
 use crate::validation::{GitHubValidationCache, IssueStatus};
 
 /// The kind of autocomplete triggered at the cursor.
@@ -75,6 +76,12 @@ pub struct AutocompleteState {
     pub fetched_prefix: Option<String>,
 }
 
+/// State for the find bar. Minimal for the routing spike: just the search field.
+/// Match list, current-match index, and replace field come later.
+pub struct FindState {
+    pub search: TextField,
+}
+
 pub struct Editor {
     pub state: EditorState,
     file_path: Option<PathBuf>,
@@ -97,6 +104,9 @@ pub struct Editor {
     detection_key: Option<(u64, Range<usize>)>,
     /// Active `#`/`@` autocomplete popup, if the cursor is inside a trigger token.
     autocomplete: Option<AutocompleteState>,
+    /// Active find bar, if find (Ctrl+F) is open. While `Some`, the shell routes all
+    /// keystrokes to it instead of the document.
+    find: Option<FindState>,
 
     // --- inline git diff against HEAD ---
     /// (raw HEAD text, rendered snapshot of it) reused as the diff base.
@@ -126,6 +136,7 @@ impl Editor {
             github_refs_by_line: HashMap::new(),
             detection_key: None,
             autocomplete: None,
+            find: None,
             head_base: None,
             diff_state: None,
             file_watcher: None,
@@ -561,6 +572,26 @@ impl Editor {
         self.detection_key = Some((version, lines));
     }
 
+    // --- find bar -----------------------------------------------------------
+
+    pub fn open_find(&mut self) {
+        self.find = Some(FindState {
+            search: TextField::new(),
+        });
+    }
+
+    pub fn close_find(&mut self) {
+        self.find = None;
+    }
+
+    pub fn find_state(&self) -> Option<&FindState> {
+        self.find.as_ref()
+    }
+
+    pub fn find_state_mut(&mut self) -> Option<&mut FindState> {
+        self.find.as_mut()
+    }
+
     // --- GitHub autocomplete (#/@) ------------------------------------------
 
     pub fn autocomplete(&self) -> Option<&AutocompleteState> {
@@ -936,6 +967,44 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    /// Secondary find-feature spike: measure whether a full-document scan per keystroke
+    /// (rope→String, then `match_indices`) is cheap enough to run live. Not asserted on
+    /// (timings are flaky in CI); run with `--ignored --nocapture` to see the numbers.
+    #[test]
+    #[ignore = "manual measurement; prints timing, no assertions"]
+    fn find_scan_cost_on_large_document() {
+        // ~10k lines of representative markdown (headings, prose, lists, code).
+        let unit = "\
+# Heading with a searchable word target here
+Some prose paragraph mentioning target and other words in a sentence.
+- a list item with target inside it
+- another item, plainer
+```
+let code = target(); // fenced block line
+```
+> a blockquote line about targets and things
+";
+        let reps = 10_000 / unit.lines().count();
+        let mut src = String::with_capacity(unit.len() * reps);
+        for _ in 0..reps {
+            src.push_str(unit);
+        }
+        let mut buffer = Buffer::new();
+        buffer.insert(0, &src, 0);
+        let line_count = buffer.text().lines().count();
+
+        for query in ["target", "the", "nonexistent_zzz"] {
+            let t = Instant::now();
+            let text = buffer.text();
+            let count = text.match_indices(query).count();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "scan {line_count} lines for {query:?}: {count} hits in {ms:.3} ms (text()+match_indices)",
+            );
+        }
+    }
 
     /// Autosave (used by the GhostText daemon via `--autosave`) writes every edit back to
     /// the file with no explicit save — the daemon relays that to the browser.

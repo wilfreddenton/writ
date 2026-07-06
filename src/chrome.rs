@@ -57,6 +57,20 @@ pub fn draw_panel(
     scene.stroke(&Stroke::new(stroke_w), Affine::IDENTITY, border, None, &rr);
 }
 
+/// The shared chrome-panel look: a `theme.surface` fill with a `theme.selection`
+/// hairline border, rounded. Reused by floating in-editor UI (the find bar now;
+/// doc map / folding later) so they share one tone with the status bar.
+pub fn draw_chrome_panel(scene: &mut Scene, theme: &EditorTheme, rect: &Rect, scale: f32) {
+    draw_panel(
+        scene,
+        peniko_color(theme.surface),
+        peniko_color(theme.selection),
+        rect,
+        6.0 * scale as f64,
+        scale as f64,
+    );
+}
+
 fn hline(scene: &mut Scene, color: Color, x0: f64, x1: f64, y: f64, width: f64) {
     scene.stroke(
         &Stroke::new(width),

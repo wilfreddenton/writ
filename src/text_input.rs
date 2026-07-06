@@ -9,6 +9,17 @@
 
 use std::ops::Range;
 
+use parley::{Affinity, Cursor};
+use vello::Scene;
+use vello::kurbo::{Affine, Rect};
+use vello::peniko::Fill;
+use winit::event::KeyEvent;
+use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+use crate::consts::{CARET_WIDTH, UI_LINE_HEIGHT};
+use crate::editor::EditorTheme;
+use crate::text_engine::{StyleRun, TextEngine, display_range_selection, peniko_color};
+
 pub struct TextField {
     text: String,
     caret: usize,          // byte offset into `text`, always on a char boundary
@@ -186,6 +197,128 @@ impl TextField {
 impl Default for TextField {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Font size (logical px) for text-field content. Matches the chrome bars' tone.
+const FIELD_FONT_SIZE: f32 = 15.0;
+
+/// Render a `TextField` inside `rect` (device px): its text, selection highlight,
+/// and — when `focused` — a caret. Left-aligned within a small inset; horizontal
+/// scroll-within-field for long text is a v2 concern.
+pub fn draw_text_field(
+    engine: &mut TextEngine,
+    scene: &mut Scene,
+    theme: &EditorTheme,
+    field: &TextField,
+    rect: &Rect,
+    scale: f32,
+    focused: bool,
+) {
+    // A small inset inside the field — NOT the document's large PADDING, which pushed
+    // the text/caret far from the field's left edge.
+    let pad = (4.0 * scale) as f64;
+    let layout = engine.build_line(
+        field.text(),
+        scale,
+        FIELD_FONT_SIZE,
+        UI_LINE_HEIGHT,
+        peniko_color(theme.foreground),
+        None,
+        &[] as &[StyleRun],
+    );
+    let origin_x = rect.x0 + pad;
+    let origin_y = rect.y0 + (rect.height() - layout.height() as f64) / 2.0;
+
+    if let Some(range) = field.selected_range() {
+        let sel = display_range_selection(&layout, range);
+        for (bb, _) in sel.geometry(&layout) {
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                peniko_color(theme.selection),
+                None,
+                &Rect::new(
+                    bb.x0 + origin_x,
+                    bb.y0 + origin_y,
+                    bb.x1 + origin_x,
+                    bb.y1 + origin_y,
+                ),
+            );
+        }
+    }
+
+    engine.draw_line(scene, &layout, (origin_x as f32, origin_y as f32));
+
+    if focused {
+        let cursor = Cursor::from_byte_index(&layout, field.caret(), Affinity::Downstream);
+        let bb = cursor.geometry(&layout, CARET_WIDTH * scale);
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            peniko_color(theme.foreground),
+            None,
+            &Rect::new(
+                bb.x0 + origin_x,
+                bb.y0 + origin_y,
+                bb.x1 + origin_x,
+                bb.y1 + origin_y,
+            ),
+        );
+    }
+}
+
+/// Map a winit key event to a `TextField` mutation, returning whether it was
+/// consumed. This is the winit boundary, kept out of the tested core. Enter, Tab,
+/// and Escape are intentionally *not* handled here — the shell owns those (submit /
+/// dismiss). Ctrl+V (paste) is also the shell's job, since it holds the clipboard.
+pub fn apply_key(field: &mut TextField, event: &KeyEvent, mods: ModifiersState) -> bool {
+    let shift = mods.shift_key();
+    let ctrl = mods.control_key() || mods.super_key();
+    match &event.logical_key {
+        Key::Named(NamedKey::Backspace) => {
+            field.backspace();
+            true
+        }
+        Key::Named(NamedKey::Delete) => {
+            field.delete_forward();
+            true
+        }
+        Key::Named(NamedKey::ArrowLeft) => {
+            field.move_left(shift);
+            true
+        }
+        Key::Named(NamedKey::ArrowRight) => {
+            field.move_right(shift);
+            true
+        }
+        Key::Named(NamedKey::Home) => {
+            field.home(shift);
+            true
+        }
+        Key::Named(NamedKey::End) => {
+            field.end(shift);
+            true
+        }
+        Key::Character(c) if ctrl && c.as_str().eq_ignore_ascii_case("a") => {
+            field.select_all();
+            true
+        }
+        _ => {
+            // Insert typed text, but never control chars (Enter/Tab arrive as "\r"/"\t"
+            // in `event.text`) and never while a modifier that isn't Shift is held (so
+            // Ctrl+<key> chords don't leak literal characters into the field).
+            if ctrl {
+                return false;
+            }
+            match event.text.as_ref() {
+                Some(t) if !t.is_empty() && !t.chars().any(|ch| ch.is_control()) => {
+                    field.insert(t);
+                    true
+                }
+                _ => false,
+            }
+        }
     }
 }
 

@@ -38,9 +38,11 @@ use winit::window::{Theme, Window, WindowId};
 use winit::event_loop::ControlFlow;
 
 use crate::buffer::Buffer;
-use crate::chrome::{BarRect, StatusInfo, draw_status_bar};
+use crate::chrome::{BarRect, StatusInfo, draw_chrome_panel, draw_status_bar};
 use crate::config::Config;
-use crate::consts::{CARET_WIDTH, FONT_SIZE, LINE_HEIGHT, PADDING, STATUS_BAR_H, WHEEL_LINE_STEP};
+use crate::consts::{
+    CARET_WIDTH, FONT_SIZE, LINE_HEIGHT, PADDING, STATUS_BAR_H, UI_LINE_HEIGHT, WHEEL_LINE_STEP,
+};
 use crate::core::{AutocompleteSuggestion, AutocompleteTrigger, Editor};
 use crate::doc_layout::{
     DocLayout, GithubRenderData, HeightCache, LayoutParams, LineCache, PreeditView, RenderCache,
@@ -58,6 +60,7 @@ use crate::overlay::{
 };
 use crate::raster::rasterize_scene_to_png;
 use crate::text_engine::{TextEngine, peniko_color};
+use crate::text_input::{self, draw_text_field};
 use crate::validation::{GitHubValidationCache, IssueOrPr, MentionableUser, ValidatedRefData};
 
 /// Chrome layout in device px: y where editor content begins, and its height.
@@ -1466,6 +1469,45 @@ impl ApplicationHandler<WritEvent> for App {
                 }
                 let (w, vh, _) = state.viewport();
 
+                // Find bar (Ctrl+F). This intercept sits ABOVE clipboard/autocomplete/
+                // apply_key so, while the bar is open, it captures EVERY keystroke —
+                // even ones it doesn't act on — so nothing leaks into the document.
+                if cmd
+                    && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("f"))
+                {
+                    self.doc_engine.editor.open_find();
+                    state.window.request_redraw();
+                    return;
+                }
+                if self.doc_engine.editor.find_state().is_some() {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => self.doc_engine.editor.close_find(),
+                        _ => {
+                            let ctrl_v = cmd
+                                && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("v"));
+                            if ctrl_v {
+                                // Read the clipboard first, then insert — keeps the
+                                // clipboard borrow disjoint from the editor's.
+                                let text = self
+                                    .clipboard
+                                    .as_mut()
+                                    .and_then(|cb| cb.get_text().ok())
+                                    .filter(|t| !t.is_empty());
+                                if let Some(text) = text
+                                    && let Some(find) = self.doc_engine.editor.find_state_mut()
+                                {
+                                    find.search.insert(&text);
+                                }
+                            } else if let Some(find) = self.doc_engine.editor.find_state_mut() {
+                                text_input::apply_key(&mut find.search, &event, self.modifiers);
+                            }
+                        }
+                    }
+                    // Swallow unconditionally: no key reaches the buffer while open.
+                    state.window.request_redraw();
+                    return;
+                }
+
                 // Clipboard: Ctrl/Super + C copy, X cut, V paste.
                 if cmd && let Key::Character(c) = &event.logical_key {
                     match c.as_str().to_ascii_lowercase().as_str() {
@@ -1647,6 +1689,61 @@ impl ApplicationHandler<WritEvent> for App {
                                 width,
                                 height,
                                 state.scale,
+                            );
+                        }
+                    }
+
+                    // Find bar: a chrome panel near the editor's top-right with a
+                    // "Find:" label and the search field.
+                    if self.doc_engine.editor.find_state().is_some() {
+                        // The bar's OWN internal spacing is small UI padding — not the
+                        // document's much larger PADDING, which pushed the field far right.
+                        let margin = PADDING * state.scale;
+                        let inner = 8.0 * state.scale;
+                        let bar_w = 320.0 * state.scale;
+                        let bar_h = 32.0 * state.scale;
+                        let x1 = width - margin;
+                        let x0 = (x1 - bar_w).max(margin);
+                        let y0 = content_top + margin;
+                        let rect = Rect::new(x0 as f64, y0 as f64, x1 as f64, (y0 + bar_h) as f64);
+                        draw_chrome_panel(
+                            &mut self.scene,
+                            &self.doc_engine.theme,
+                            &rect,
+                            state.scale,
+                        );
+                        let label = self.doc_engine.text_engine.build_line(
+                            "Find:",
+                            state.scale,
+                            15.0,
+                            UI_LINE_HEIGHT,
+                            peniko_color(self.doc_engine.theme.comment),
+                            None,
+                            &[],
+                        );
+                        let label_w = label.width();
+                        let label_y =
+                            rect.y0 as f32 + (rect.height() as f32 - label.height()) / 2.0;
+                        self.doc_engine.text_engine.draw_line(
+                            &mut self.scene,
+                            &label,
+                            (rect.x0 as f32 + inner, label_y),
+                        );
+                        let field_rect = Rect::new(
+                            rect.x0 + (inner + label_w + inner) as f64,
+                            rect.y0,
+                            rect.x1 - inner as f64,
+                            rect.y1,
+                        );
+                        if let Some(find) = self.doc_engine.editor.find_state() {
+                            draw_text_field(
+                                &mut self.doc_engine.text_engine,
+                                &mut self.scene,
+                                &self.doc_engine.theme,
+                                &find.search,
+                                &field_rect,
+                                state.scale,
+                                true,
                             );
                         }
                     }
