@@ -19,7 +19,7 @@ pub use app::draw_outline;
 mod app {
     use parley::Layout;
     use vello::Scene;
-    use vello::kurbo::{Affine, Rect};
+    use vello::kurbo::{Affine, BezPath, Point, Rect};
     use vello::peniko::{Brush, Fill};
 
     use crate::chrome::BarRect;
@@ -59,6 +59,9 @@ mod app {
         headings: &[HeadingInfo],
         current: Option<usize>,
         hover: Option<usize>,
+        // Parallel to `headings`: whether each heading's own fold is active in the
+        // document, so the outline can mark collapsed sections with a ▸.
+        folded: &[bool],
         panel: &BarRect,
         scale: f32,
     ) -> Vec<ScreenRect> {
@@ -99,6 +102,19 @@ mod app {
             let tx = panel.x0 as f32 + pad_x + level_indent;
             let max_text = (panel.x1 as f32 - tx - pad_x).max(4.0 * scale);
             let color = peniko_color(level_color(theme, h.level));
+            // A collapsed section gets a small ▸ in the gap left of its text (mirroring
+            // the editor gutter), so the map shows folded state at a glance.
+            if folded.get(i).copied().unwrap_or(false) {
+                let cy = (row_top + row_bottom) / 2.0;
+                let cx = (tx - 8.0 * scale) as f64;
+                let g = (6.0 * scale) as f64;
+                let mut tri = BezPath::new();
+                tri.move_to(Point::new(cx - g * 0.3, cy - g * 0.5));
+                tri.line_to(Point::new(cx - g * 0.3, cy + g * 0.5));
+                tri.line_to(Point::new(cx + g * 0.45, cy));
+                tri.close_path();
+                scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &tri);
+            }
             let layout = ellipsize(engine, &h.text, scale, color, max_text);
             engine.draw_line(scene, &layout, (tx, row_top as f32 + pad_y));
 

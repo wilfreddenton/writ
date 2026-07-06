@@ -130,6 +130,7 @@ impl MarkdownView {
             None,
             0,
             f32::INFINITY,
+            &[],
         );
         self.doc = Some(doc);
         self.laid_out = Some((width, scale));

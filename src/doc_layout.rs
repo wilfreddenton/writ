@@ -965,6 +965,10 @@ impl DocLayout {
         // whole document (the headless/first-open path).
         anchor_line: usize,
         viewport_h: f32,
+        // Sorted, disjoint line ranges to collapse to zero height (heading folds). Hidden
+        // lines are skipped: never materialized, `heights[i] = 0`, so the prefix-sum `tops`
+        // ties across them and the whole virtualization stack excludes them for free.
+        folds: &[Range<usize>],
     ) -> Self {
         let LayoutParams {
             content_x0,
@@ -1036,6 +1040,7 @@ impl DocLayout {
         let mut past_band = false; // true once the band is tall enough; tail is estimated
         let mut measured_start = n; // first materialized line (n = none materialized yet)
         let mut measured_count = n; // first estimated tail line (n = materialized to end)
+        let mut fold_idx = 0usize; // moving cursor into the sorted `folds` ranges
         let mut preedit_caret: Option<(usize, usize)> = None;
         // Bucket inline styles per line once (O(n + styles)) instead of the O(n²)
         // per-line `styles_in_range` scan — the dominant per-keystroke cost on large
@@ -1082,6 +1087,25 @@ impl DocLayout {
         // `i` indexes several parallel per-line inputs (styles, markers, diff).
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
+            // Folded line: zero height, no materialization, no band accounting. Placed
+            // before the estimate/band logic so a fold never perturbs the measured band.
+            while fold_idx < folds.len() && folds[fold_idx].end <= i {
+                fold_idx += 1;
+            }
+            if fold_idx < folds.len() && folds[fold_idx].start <= i {
+                heights.push(0.0);
+                layouts.push(empty_layout.clone());
+                renders.push(empty_render.clone());
+                line_ranges.push(snapshot.line_byte_range(i));
+                line_diffs.push(LineDiff::default());
+                ghosts.push(Vec::new());
+                ghost_height.push(0.0);
+                quote_bars.push(Vec::new());
+                image_blocks.push(None);
+                inline_draws.push(Vec::new());
+                table_lines.push(None);
+                continue;
+            }
             // Estimate the head (above the band) and the tail (once the band has covered
             // the viewport + overscan); materialize only the band in between.
             if i >= measure_from_line && !past_band && measured_start == n {
@@ -1401,6 +1425,23 @@ impl DocLayout {
             .partition_point(|r| r.start <= buffer_off)
             .saturating_sub(1)
             .min(n - 1)
+    }
+
+    /// Screen-space top y (device px) of line `i`'s real text, or `None` if out of
+    /// range. Used to place fold chevrons in the gutter beside heading lines.
+    pub fn line_top_screen(&self, line: usize) -> Option<f32> {
+        (line < self.layouts.len()).then(|| self.real_top(line) - self.scroll_y)
+    }
+
+    /// Height (device px) of line `i`'s laid-out text block, for vertically centering
+    /// gutter affordances against it. Zero for estimated/hidden lines.
+    pub fn line_text_height(&self, line: usize) -> f32 {
+        self.layouts.get(line).map(|l| l.height()).unwrap_or(0.0)
+    }
+
+    /// Left draw origin (device px) of the document body — the gutter ends here.
+    pub fn body_left(&self) -> f32 {
+        self.pad_x
     }
 
     /// Top y (device px, before scroll) of the *real* text of line `i` — i.e. below
@@ -2277,6 +2318,7 @@ mod tests {
             None,
             0,
             f32::INFINITY,
+            &[],
         );
         // Several buffer offsets (incl. second line) should map to a caret rect
         // whose center hit-tests back to the same offset.
@@ -2287,6 +2329,55 @@ mod tests {
             let got = doc.hit_test(cx, cy).expect("hit test");
             assert_eq!(got, off, "offset {off} round-trip (got {got})");
         }
+    }
+
+    /// Folding integration: hidden lines get zero height, so `tops` ties across the
+    /// folded run, `content_height` drops by exactly the folded lines' heights, and a
+    /// click just below the fold resolves to the first visible line after it. This is
+    /// the load-bearing virtualization invariant the plan flags as riskiest.
+    #[test]
+    fn folded_lines_are_zero_height() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let mut buffer: Buffer = "line0\nline1\nline2\nline3\nline4\n".parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+        let params = test_params(&theme, 1200.0);
+        let build = |engine: &mut TextEngine, folds: &[Range<usize>]| {
+            DocLayout::build(
+                engine,
+                &mut LineCache::new(),
+                &mut RenderCache::new(),
+                &mut HeightCache::new(),
+                &mut TableCache::new(),
+                0,
+                &snapshot,
+                &theme,
+                None,
+                None,
+                &ImageCache::new(),
+                0,
+                &params,
+                None,
+                0,
+                f32::INFINITY,
+                folds,
+            )
+        };
+        let full = build(&mut engine, &[]);
+        let folded = build(&mut engine, &[1..3]); // hide lines 1 and 2
+
+        // Lines 1 and 2 collapse: their tops tie, and content height drops by exactly
+        // the height those two lines occupied in the unfolded layout.
+        assert_eq!(folded.tops[1], folded.tops[2]);
+        assert_eq!(folded.tops[2], folded.tops[3]);
+        let hidden_h = full.tops[3] - full.tops[1];
+        assert!((full.content_height() - folded.content_height() - hidden_h).abs() < 1e-3);
+
+        // A click at the y where line 3 now sits resolves to line 3 (not a hidden line).
+        let y3 = folded.line_top_screen(3).expect("line 3 visible") + 1.0;
+        let hit = folded.hit_test(folded.pad_x + 1.0, y3).expect("hit");
+        assert_eq!(folded.line_of(hit), 3);
     }
 
     /// The outline-panel inset: shrinking the horizontal content region to
@@ -2333,6 +2424,7 @@ mod tests {
                 None,
                 0,
                 f32::INFINITY,
+                &[],
             )
         };
         let doc = build(&params);
@@ -2394,6 +2486,7 @@ mod tests {
             None,
             0,
             f32::INFINITY,
+            &[],
         );
 
         // A mid-document line: its top pins to the viewport top exactly.
@@ -2444,6 +2537,7 @@ mod tests {
             None,
             0,
             f32::INFINITY,
+            &[],
         );
         // Line 0's changed version has a deleted ghost stacked above it.
         assert!(doc.ghost_height[0] > 0.0, "expected a ghost above line 0");
@@ -2490,6 +2584,7 @@ mod tests {
             None,
             0,
             f32::INFINITY,
+            &[],
         );
         assert!(
             !doc.trailing_ghosts.is_empty(),
@@ -2535,6 +2630,7 @@ mod tests {
                 None,
                 0,
                 f32::INFINITY,
+                &[],
             )
         };
         let t0 = Instant::now();
@@ -2589,6 +2685,7 @@ mod tests {
                     None,
                     0,
                     f32::INFINITY,
+                    &[],
                 )
             };
 
@@ -2641,6 +2738,7 @@ mod tests {
             None,
             0, // anchor at the top
             viewport_h,
+            &[],
         );
         let n = doc.line_count();
         assert!(n >= 3000);
@@ -2706,6 +2804,7 @@ mod tests {
             None,
             anchor,
             viewport_h,
+            &[],
         );
         let n = doc.line_count();
         // Head virtualized: the band starts near the anchor, not at line 0.
@@ -2897,6 +2996,7 @@ mod tests {
             None,
             0,
             f32::INFINITY,
+            &[],
         );
         // Table lines are the header/delimiter/body rows.
         for (line, want) in [
@@ -2960,6 +3060,7 @@ mod tests {
                 None,
                 0,
                 f32::INFINITY,
+                &[],
             )
         };
         // Cursor off the table (past the end): grid mode, header row hidden + flagged.
@@ -3006,6 +3107,7 @@ mod tests {
             None,
             0,
             f32::INFINITY,
+            &[],
         )
     }
 
