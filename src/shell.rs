@@ -41,7 +41,8 @@ use crate::buffer::Buffer;
 use crate::chrome::{BarRect, FindButtonRects, StatusInfo, draw_find_bar, draw_status_bar};
 use crate::config::Config;
 use crate::consts::{
-    CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, PADDING, STATUS_BAR_H, WHEEL_LINE_STEP,
+    CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, OUTLINE_WIDTH, PADDING, STATUS_BAR_H,
+    UI_LINE_HEIGHT, WHEEL_LINE_STEP,
 };
 use crate::core::{AutocompleteSuggestion, AutocompleteTrigger, Editor, FieldFocus, FindMode};
 use crate::doc_layout::{
@@ -72,6 +73,16 @@ fn chrome_metrics(scale: f32, height_dev: f32, find_h: f32) -> (f32, f32) {
     let content_top = 0.0;
     let editor_h = (height_dev - STATUS_BAR_H * scale - find_h).max(1.0);
     (content_top, editor_h)
+}
+
+/// Device-px width of the right-docked outline panel (0 when closed). Mirrors
+/// `find_bar_height`: the document region insets by this so it never draws under the panel.
+fn outline_width(editor: &Editor, scale: f32) -> f32 {
+    if editor.outline_open() {
+        OUTLINE_WIDTH * scale
+    } else {
+        0.0
+    }
 }
 
 /// Device-px height of the bottom find bar for the current find state (0 when closed):
@@ -879,8 +890,13 @@ impl DocEngine {
             cache: self.editor.github_validation_cache(),
             context: self.editor.github_context(),
         };
+        // The outline panel (when open) claims a right strip, so the doc region is
+        // `[0, device_width - outline_w]`. `device_width` stays the full surface width;
+        // the inset is applied here so every rebuild call site keeps passing it whole.
+        let outline_w = outline_width(&self.editor, scale);
         let params = LayoutParams {
-            device_width,
+            content_x0: 0.0,
+            content_w: (device_width - outline_w).max(1.0),
             scale,
             pad_x: PADDING,
             pad_top: PADDING,
@@ -1052,10 +1068,14 @@ fn paint_document(
     height: f32,
     scale: f32,
 ) -> Option<FindButtonRects> {
+    // The outline panel (when open) reserves a right strip; clip the document body to the
+    // reduced region so glyphs/backgrounds never draw under the panel.
+    let outline_w = outline_width(editor, scale);
+    let doc_w = (width - outline_w).max(0.0);
     let clip = Rect::new(
         0.0,
         content_top as f64,
-        width as f64,
+        doc_w as f64,
         (content_top + editor_h) as f64,
     );
     scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
@@ -1133,6 +1153,45 @@ fn paint_document(
         );
     }
     scene.pop_layer();
+
+    // Placeholder outline panel: a right strip in `theme.surface` down to the status bar,
+    // with a `theme.selection` vertical hairline on its left edge (mirrors the status
+    // bar's fill+top-rule, rotated). No rows yet — this spike only proves the reserved
+    // space and the reflowed document; the panel UI lands later.
+    if outline_w > 0.0 {
+        let panel_x = (width - outline_w) as f64;
+        let panel_bottom = (content_top + editor_h + find_h) as f64;
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            peniko_color(theme.surface),
+            None,
+            &Rect::new(panel_x, content_top as f64, width as f64, panel_bottom),
+        );
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            peniko_color(theme.selection),
+            None,
+            &Rect::new(
+                panel_x,
+                content_top as f64,
+                panel_x + scale as f64,
+                panel_bottom,
+            ),
+        );
+        let label = engine.build_line(
+            "Outline",
+            scale,
+            14.0,
+            UI_LINE_HEIGHT,
+            peniko_color(theme.comment),
+            None,
+            &[],
+        );
+        let lx = panel_x + (outline_w as f64 - label.width() as f64) / 2.0;
+        engine.draw_line(scene, &label, (lx as f32, content_top + PADDING * scale));
+    }
 
     // Chrome (bottom, above the OS-native title bar): the find bar sits in the gap
     // between the document and the status bar, so the status bar starts below it.
@@ -1721,6 +1780,21 @@ impl ApplicationHandler<WritEvent> for App {
                     return;
                 }
 
+                // Outline panel (Ctrl+Shift+O): the panel claims a right strip and the
+                // document reflows into the remaining width (a pure inset — the window /
+                // surface size is untouched, so no framebuffer scaling).
+                let shift = self.modifiers.shift_key();
+                if cmd
+                    && shift
+                    && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("o"))
+                {
+                    self.doc_engine.editor.toggle_outline();
+                    let (ow, oeh, oscale) = state.viewport();
+                    self.doc_engine.rebuild_preserving_scroll(ow, oscale, oeh);
+                    state.window.request_redraw();
+                    return;
+                }
+
                 // Escape closes the find bar regardless of which pane holds focus (so it
                 // works even after clicking into the document unfocuses the bar).
                 if self.doc_engine.editor.find_state().is_some()
@@ -2288,6 +2362,11 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     // (green) + a word-level change render. Exercises the inline-diff path.
     if std::env::var("WRIT_SHELL_DIFF").is_ok() {
         editor.set_head_base(DEMO_BASE);
+    }
+    // WRIT_SHELL_OUTLINE reserves the right outline strip so the golden frame shows the
+    // reflowed document beside the placeholder panel.
+    if std::env::var("WRIT_SHELL_OUTLINE").is_ok() {
+        editor.set_outline_open(true);
     }
     // Optional GitHub golden-image check: wire a client from GITHUB_TOKEN +
     // WRIT_SHELL_GITHUB_REPO, then *synchronously* validate every ref so the single

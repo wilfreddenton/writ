@@ -585,12 +585,18 @@ struct DiffColors {
     deleted_inline: Color,
 }
 
-/// Stable per-frame layout constants: padding and font in logical px, plus
-/// `device_width`, `scale`, and the theme foreground baked to a `Color`. Bundled
-/// so `DocLayout::build` isn't a wall of `f32`s; all are fixed for a given surface
-/// and theme. Viewport state (`measure_to_y`) is deliberately kept a separate arg.
+/// Stable per-frame layout constants: padding and font in logical px, plus the doc's
+/// horizontal region (`content_x0`/`content_w`), `scale`, and the theme foreground baked
+/// to a `Color`. Bundled so `DocLayout::build` isn't a wall of `f32`s; all are fixed for a
+/// given surface and theme. Viewport state (`measure_to_y`) is deliberately kept a
+/// separate arg.
 pub struct LayoutParams {
-    pub device_width: f32,
+    /// Left edge (device px) of the document region within the surface. `0.0` unless a
+    /// panel (e.g. the outline) claims a strip; the body centers within
+    /// `[content_x0, content_x0 + content_w]` and every glyph/caret/hit-test inherits it.
+    pub content_x0: f32,
+    /// Width (device px) of the document region — the surface width minus any panel inset.
+    pub content_w: f32,
     pub scale: f32,
     pub pad_x: f32,
     pub pad_top: f32,
@@ -921,7 +927,9 @@ pub struct DocLayout {
     quote_bar_width: f32,
     quote_bar_color: Color,
     pub scroll_y: f32,
-    /// Surface width in device px (for full-width diff row backgrounds).
+    /// Right edge of the document region in device px (`content_x0 + content_w`, the
+    /// surface width unless a panel claims a strip). Full-width diff row backgrounds fill
+    /// to here so they stop at the panel edge, not the window edge.
     width: f32,
     pad_top: f32,
     pad_bottom: f32,
@@ -959,7 +967,8 @@ impl DocLayout {
         viewport_h: f32,
     ) -> Self {
         let LayoutParams {
-            device_width,
+            content_x0,
+            content_w,
             scale,
             pad_x,
             pad_top,
@@ -968,11 +977,18 @@ impl DocLayout {
             line_height,
             fg,
         } = *params;
-        // Cap the body width for readability and center it: the left margin is the base
-        // padding, widened to a centering inset once the window exceeds MAX_CONTENT_WIDTH
-        // plus that padding. `left` is the draw origin and both margins for `max_advance`.
-        let left = (pad_x * scale).max((device_width - MAX_CONTENT_WIDTH * scale) / 2.0);
-        let max_advance = (device_width - 2.0 * left).max(1.0);
+        // Cap the body width for readability and center it *within the content region*
+        // `[content_x0, content_x0 + content_w]`: the left margin is the base padding,
+        // widened to a centering inset once the region exceeds MAX_CONTENT_WIDTH plus that
+        // padding. `left` is the draw origin and both margins for `max_advance`; because
+        // caret/hit-test/draw all read `self.pad_x = left`, shrinking/shifting the region
+        // moves them for free.
+        let inset = (content_w - MAX_CONTENT_WIDTH * scale).max(0.0) / 2.0;
+        let left = content_x0 + inset.max(pad_x * scale);
+        let max_advance = (content_w - 2.0 * (left - content_x0)).max(1.0);
+        // Right edge of the doc region (stored as `self.width`), captured before the local
+        // `content_w` below is rebound to the image content width (= max_advance).
+        let content_right = content_x0 + content_w;
         let n = snapshot.line_count();
         cache.begin();
         render_cache.begin();
@@ -1363,7 +1379,7 @@ impl DocLayout {
             measured_count,
             preedit_caret,
             scroll_y: 0.0,
-            width: device_width,
+            width: content_right,
             pad_top: pad_top * scale,
             pad_bottom: pad_bottom * scale,
             pad_x: left,
@@ -1980,7 +1996,7 @@ impl DocLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consts::{FONT_SIZE, LINE_HEIGHT, PADDING};
+    use crate::consts::{FONT_SIZE, LINE_HEIGHT, OUTLINE_WIDTH, PADDING};
     use crate::text_engine::peniko_color;
 
     /// Device-px content width shared by the image-sizing tests (scale 1.0).
@@ -1990,7 +2006,8 @@ mod tests {
     /// so the tests track any change to the real frame rather than duplicating literals.
     fn test_params(theme: &EditorTheme, device_width: f32) -> LayoutParams {
         LayoutParams {
-            device_width,
+            content_x0: 0.0,
+            content_w: device_width,
             scale: 1.0,
             pad_x: PADDING,
             pad_top: PADDING,
@@ -2260,6 +2277,81 @@ mod tests {
             let cy = ((y0 + y1) / 2.0) as f32;
             let got = doc.hit_test(cx, cy).expect("hit test");
             assert_eq!(got, off, "offset {off} round-trip (got {got})");
+        }
+    }
+
+    /// The outline-panel inset: shrinking the horizontal content region to
+    /// `content_w = W - OUTLINE_WIDTH` narrows the doc's draw origin / body width and
+    /// caps `self.width` at the region edge (not the window edge), so full-width diff
+    /// backgrounds stop at the panel. Caret geometry still round-trips within the region.
+    #[test]
+    fn content_region_inset_narrows_layout() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let mut buffer: Buffer = "hello world\nsecond line here\n".parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+
+        let window_w = 1100.0f32;
+        let scale = 1.0f32;
+        let content_w = window_w - OUTLINE_WIDTH * scale; // 860, below MAX_CONTENT_WIDTH
+        let params = LayoutParams {
+            content_x0: 0.0,
+            content_w,
+            scale,
+            pad_x: PADDING,
+            pad_top: PADDING,
+            pad_bottom: PADDING * 2.0,
+            base_font_size: FONT_SIZE,
+            line_height: LINE_HEIGHT,
+            fg: peniko_color(theme.foreground),
+        };
+        let mut build = |params: &LayoutParams| {
+            DocLayout::build(
+                &mut engine,
+                &mut LineCache::new(),
+                &mut RenderCache::new(),
+                &mut HeightCache::new(),
+                &mut TableCache::new(),
+                0,
+                &snapshot,
+                &theme,
+                None,
+                None,
+                &ImageCache::new(),
+                0,
+                params,
+                None,
+                0,
+                f32::INFINITY,
+            )
+        };
+        let doc = build(&params);
+        // `self.width` is the region edge, not the window edge — diff backgrounds fill
+        // to here so they stop at the panel.
+        assert_eq!(doc.width, content_w);
+        // Region narrower than MAX_CONTENT_WIDTH → the body just uses base padding.
+        assert_eq!(doc.pad_x, PADDING * scale);
+        // The drawable body is inset symmetrically inside the region, never past its edge.
+        let body_right = doc.width - doc.pad_x;
+        assert!(body_right <= content_w);
+
+        // The full-width case (panel closed) keeps the window edge and centers the body.
+        let full = LayoutParams {
+            content_w: window_w,
+            ..params
+        };
+        let doc_full = build(&full);
+        assert_eq!(doc_full.width, window_w);
+        assert!(
+            doc_full.pad_x > doc.pad_x,
+            "wider region → larger centering inset"
+        );
+
+        // Caret still round-trips within the narrowed region.
+        for &off in &[0usize, 6, 11] {
+            let (x0, _, x1, _) = doc.caret_rect(off, 2.0).expect("caret rect");
+            assert!(x0 >= doc.pad_x as f64 - 1.0 && x1 <= doc.width as f64);
         }
     }
 

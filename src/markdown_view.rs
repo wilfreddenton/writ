@@ -100,7 +100,8 @@ impl MarkdownView {
         let version = self.buffer.version();
         let snapshot = self.buffer.render_snapshot();
         let params = LayoutParams {
-            device_width: width,
+            content_x0: 0.0,
+            content_w: width,
             scale,
             pad_x: PADDING,
             pad_top: PADDING,
