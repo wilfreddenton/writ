@@ -103,11 +103,16 @@ impl Highlighter {
             }
         };
 
-        // Tree-sitter grammars.
-        if let Some(config) = Self::create_rust_config() {
+        // Tree-sitter grammars. Rust uses Zed's highlights.scm (broader coverage than the
+        // upstream query); Bash uses its crate's bundled query.
+        let rust = tree_sitter_rust::LANGUAGE.into();
+        if let Some(config) =
+            Self::create_config(rust, "rust", include_str!("../queries/rust/highlights.scm"))
+        {
             register(&["rust", "rs"], Backend::TreeSitter(Box::new(config)));
         }
-        if let Some(config) = Self::create_bash_config() {
+        let bash = tree_sitter_bash::LANGUAGE.into();
+        if let Some(config) = Self::create_config(bash, "bash", tree_sitter_bash::HIGHLIGHT_QUERY) {
             register(
                 &["bash", "sh", "shell"],
                 Backend::TreeSitter(Box::new(config)),
@@ -129,47 +134,22 @@ impl Highlighter {
         Self { inner, languages }
     }
 
-    fn create_rust_config() -> Option<HighlightConfiguration> {
-        let language = tree_sitter_rust::LANGUAGE.into();
-
-        // Zed's highlights.scm — broader Rust coverage than the upstream query.
-        let highlights_query = include_str!("../queries/rust/highlights.scm");
-
-        let mut config = match HighlightConfiguration::new(
-            language,
-            "rust",
-            highlights_query,
-            "", // injection query (not used)
-            "", // locals query (not used for now)
-        ) {
+    /// Build a tree-sitter highlight config from a grammar + `highlights.scm`, configured to
+    /// the shared [`HIGHLIGHT_NAMES`]. `None` (with a log) if the query fails to compile.
+    fn create_config(
+        language: tree_sitter::Language,
+        name: &str,
+        highlights_query: &str,
+    ) -> Option<HighlightConfiguration> {
+        let mut config = match HighlightConfiguration::new(language, name, highlights_query, "", "")
+        {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Failed to create Rust highlight config: {}", e);
+                eprintln!("Failed to create {name} highlight config: {e}");
                 return None;
             }
         };
-
-        // Configure which highlight names we recognize
         config.configure(HIGHLIGHT_NAMES);
-
-        Some(config)
-    }
-
-    fn create_bash_config() -> Option<HighlightConfiguration> {
-        let language = tree_sitter_bash::LANGUAGE.into();
-        let highlights_query = tree_sitter_bash::HIGHLIGHT_QUERY;
-
-        let mut config =
-            match HighlightConfiguration::new(language, "bash", highlights_query, "", "") {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to create Bash highlight config: {}", e);
-                    return None;
-                }
-            };
-
-        config.configure(HIGHLIGHT_NAMES);
-
         Some(config)
     }
 

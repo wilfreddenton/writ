@@ -595,11 +595,8 @@ pub fn github_refs_to_styled_regions(
         .map(|m| StyledRegion {
             full_range: m.byte_range.clone(),
             content_range: m.byte_range.clone(),
-            style: TextStyle::default(),
             link_url: Some(m.reference.url()),
-            is_image: false,
-            checkbox: None,
-            display_text: None,
+            ..Default::default()
         })
         .collect()
 }
@@ -626,11 +623,9 @@ pub fn naked_urls_to_styled_regions(
             StyledRegion {
                 full_range: u.byte_range.clone(),
                 content_range: u.byte_range.clone(),
-                style: TextStyle::default(),
                 link_url: Some(u.url.clone()),
-                is_image: false,
-                checkbox: None,
                 display_text,
+                ..Default::default()
             }
         })
         .collect()
@@ -695,7 +690,7 @@ impl TextStyle {
 }
 
 /// A styled region of inline text with its delimiters.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct StyledRegion {
     /// The full range including delimiters (e.g., `**bold**` → 0..8)
     pub full_range: Range<usize>,
@@ -829,10 +824,7 @@ fn extract_emphasis_region(node: &Node, style: TextStyle) -> Option<StyledRegion
         full_range: full_start..full_end,
         content_range: content_start..content_end,
         style,
-        link_url: None,
-        is_image: false,
-        checkbox: None,
-        display_text: None,
+        ..Default::default()
     })
 }
 
@@ -858,10 +850,7 @@ fn extract_code_span_region(node: &Node) -> Option<StyledRegion> {
         full_range: full_start..full_end,
         content_range: content_start..content_end,
         style: TextStyle::code(),
-        link_url: None,
-        is_image: false,
-        checkbox: None,
-        display_text: None,
+        ..Default::default()
     })
 }
 
@@ -916,11 +905,8 @@ fn extract_link_region(node: &Node, rope: &Rope) -> Option<StyledRegion> {
     Some(StyledRegion {
         full_range: full_start..full_end,
         content_range: content_start..content_end,
-        style: TextStyle::default(),
         link_url: url,
-        is_image: false,
-        checkbox: None,
-        display_text: None,
+        ..Default::default()
     })
 }
 
@@ -953,11 +939,9 @@ fn extract_image_region(node: &Node, rope: &Rope) -> Option<StyledRegion> {
     Some(StyledRegion {
         full_range: full_start..full_end,
         content_range: alt_start..alt_end,
-        style: TextStyle::default(),
         link_url: Some(url),
         is_image: true,
-        checkbox: None,
-        display_text: None,
+        ..Default::default()
     })
 }
 
@@ -997,11 +981,7 @@ mod tests {
         StyledRegion {
             content_range: full.clone(),
             full_range: full,
-            style: TextStyle::default(),
-            link_url: None,
-            is_image: false,
-            checkbox: None,
-            display_text: None,
+            ..Default::default()
         }
     }
 

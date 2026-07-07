@@ -30,11 +30,6 @@ pub fn key_for(source: &str) -> String {
     format!("mermaid:{:016x}", h.finish())
 }
 
-/// Longest error string kept for the placeholder — enough for a mermaid parse error like
-/// "unexpected token '…' at L:C; expected …" without letting a pathological message blow up
-/// the box.
-const MAX_ERR_LEN: usize = 200;
-
 /// Render mermaid source to a paintable image: source → SVG string → `decode`. `Ok(img)` on
 /// success; `Err(Some(msg))` on a parse/render error (the message is shown in the placeholder
 /// so the author sees what's wrong); `Err(None)` on a panic or an SVG that won't decode.
@@ -47,17 +42,8 @@ fn render_to_image(source: &str) -> Result<LoadedImage, Option<String>> {
     };
     match catch_unwind(AssertUnwindSafe(|| render_with_options(source, opts))) {
         Ok(Ok(svg)) => decode(svg.as_bytes()).ok_or(None),
-        Ok(Err(e)) => Err(Some(truncate_err(&e.to_string()))),
+        Ok(Err(e)) => Err(Some(e.to_string())),
         Err(_) => Err(None), // renderer panicked on adversarial input
-    }
-}
-
-/// Collapse whitespace/newlines and cap the length so a render error fits the placeholder.
-fn truncate_err(msg: &str) -> String {
-    let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
-    match one_line.char_indices().nth(MAX_ERR_LEN) {
-        Some((byte, _)) => format!("{}…", &one_line[..byte]),
-        None => one_line,
     }
 }
 
@@ -81,11 +67,7 @@ pub fn spawn_mermaid_renders(
         let key = key.clone();
         let source = source.clone();
         std::thread::spawn(move || {
-            match render_to_image(&source) {
-                Ok(img) => cache.set_loaded(&key, img),
-                Err(Some(msg)) => cache.set_failed_with(&key, msg),
-                Err(None) => cache.set_failed(&key),
-            }
+            cache.store_render(&key, render_to_image(&source));
             notify();
         });
     }
@@ -97,11 +79,7 @@ pub fn render_mermaid_blocking(sources: &[(String, String)], cache: &ImageCache)
         if cache.contains(key) {
             continue;
         }
-        match render_to_image(source) {
-            Ok(img) => cache.set_loaded(key, img),
-            Err(Some(msg)) => cache.set_failed_with(key, msg),
-            Err(None) => cache.set_failed(key),
-        }
+        cache.store_render(key, render_to_image(source));
     }
 }
 

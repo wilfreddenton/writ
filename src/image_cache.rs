@@ -58,6 +58,19 @@ pub enum ImageState {
     Failed(Option<Arc<str>>),
 }
 
+/// Longest render-error reason kept for the placeholder — enough for a mermaid/LaTeX parse
+/// error without letting a pathological message blow up the box.
+const MAX_ERR_LEN: usize = 200;
+
+/// Collapse whitespace/newlines and cap length so a render error fits the placeholder box.
+fn truncate_reason(msg: &str) -> String {
+    let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one_line.char_indices().nth(MAX_ERR_LEN) {
+        Some((byte, _)) => format!("{}…", &one_line[..byte]),
+        None => one_line,
+    }
+}
+
 /// Thread-safe cache of image load states, shared across clones (like the GitHub
 /// caches). Cheap to clone: just bumps the inner `Arc`.
 #[derive(Clone, Default)]
@@ -79,33 +92,36 @@ impl ImageCache {
         self.inner.lock().unwrap().contains_key(url)
     }
 
+    fn insert(&self, url: &str, state: ImageState) {
+        self.inner.lock().unwrap().insert(url.to_string(), state);
+    }
+
     pub fn mark_loading(&self, url: &str) {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert(url.to_string(), ImageState::Loading);
+        self.insert(url, ImageState::Loading);
     }
 
     pub fn set_loaded(&self, url: &str, image: LoadedImage) {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert(url.to_string(), ImageState::Loaded(Arc::new(image)));
+        self.insert(url, ImageState::Loaded(Arc::new(image)));
     }
 
     pub fn set_failed(&self, url: &str) {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert(url.to_string(), ImageState::Failed(None));
+        self.insert(url, ImageState::Failed(None));
     }
 
     /// Mark failed with a short reason (mermaid/LaTeX syntax error) shown in the placeholder.
     pub fn set_failed_with(&self, url: &str, reason: impl Into<Arc<str>>) {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert(url.to_string(), ImageState::Failed(Some(reason.into())));
+        self.insert(url, ImageState::Failed(Some(reason.into())));
+    }
+
+    /// Store the outcome of an off-thread render: `Ok` → loaded, `Err(Some)` → failed with a
+    /// reason shown in the placeholder (collapsed + length-capped), `Err(None)` → generic
+    /// failure. Shared by the mermaid and math render paths.
+    pub fn store_render(&self, url: &str, result: Result<LoadedImage, Option<String>>) {
+        match result {
+            Ok(img) => self.set_loaded(url, img),
+            Err(Some(reason)) => self.set_failed_with(url, truncate_reason(&reason)),
+            Err(None) => self.set_failed(url),
+        }
     }
 }
 

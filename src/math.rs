@@ -59,19 +59,6 @@ pub fn key_for(job: &MathJob) -> String {
     format!("math:{:016x}", h.finish())
 }
 
-/// Longest error kept for the placeholder — enough for a RaTeX parse error without letting a
-/// pathological message blow up the box.
-const MAX_ERR_LEN: usize = 200;
-
-/// Collapse whitespace and cap length so a parse error fits the placeholder box.
-fn truncate_err(msg: &str) -> String {
-    let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
-    match one_line.char_indices().nth(MAX_ERR_LEN) {
-        Some((byte, _)) => format!("{}…", &one_line[..byte]),
-        None => one_line,
-    }
-}
-
 /// Render math to a paintable image. `Ok(img)` on success; `Err(Some(msg))` on a LaTeX parse
 /// error (shown in the block-math placeholder so the author sees the mistake); `Err(None)` on
 /// a panic, empty result, or decode/render failure. The returned image's `display_w/display_h`
@@ -81,7 +68,7 @@ fn truncate_err(msg: &str) -> String {
 fn render_to_image(job: &MathJob) -> Result<LoadedImage, Option<String>> {
     let out = catch_unwind(AssertUnwindSafe(
         || -> Result<LoadedImage, Option<String>> {
-            let nodes = parse(&job.latex).map_err(|e| Some(truncate_err(&e.to_string())))?;
+            let nodes = parse(&job.latex).map_err(|e| Some(e.to_string()))?;
             let (r, g, b) = job.fg;
             let opts = LayoutOptions {
                 style: if job.display {
@@ -146,11 +133,7 @@ pub fn spawn_math_renders(
         let key = key.clone();
         let job = job.clone();
         std::thread::spawn(move || {
-            match render_to_image(&job) {
-                Ok(img) => cache.set_loaded(&key, img),
-                Err(Some(msg)) => cache.set_failed_with(&key, msg),
-                Err(None) => cache.set_failed(&key),
-            }
+            cache.store_render(&key, render_to_image(&job));
             notify();
         });
     }
@@ -162,11 +145,7 @@ pub fn render_math_blocking(jobs: &[(String, MathJob)], cache: &ImageCache) {
         if cache.contains(key) {
             continue;
         }
-        match render_to_image(job) {
-            Ok(img) => cache.set_loaded(key, img),
-            Err(Some(msg)) => cache.set_failed_with(key, msg),
-            Err(None) => cache.set_failed(key),
-        }
+        cache.store_render(key, render_to_image(job));
     }
 }
 

@@ -48,7 +48,6 @@ impl EditorTheme {
         match capture {
             "variable.special" => return self.purple,
             "variable.parameter" => return self.orange,
-            "punctuation.bracket" => return self.foreground,
             "punctuation.special" => return self.pink,
             "string.escape" => return self.pink,
             "lifetime" => return self.pink,
