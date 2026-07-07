@@ -682,6 +682,7 @@ fn build_ghosts_before(
             &[],
             None,
             &[],
+            &[],
         );
         let layout = engine.build_line_hanging(
             &lr.text,
@@ -1446,6 +1447,40 @@ impl DocLayout {
                 });
 
             let extra = github.map(|g| g.extra_regions(i)).unwrap_or_default();
+            // Byte ranges on this line to LaTeX-highlight: the content of a revealed inline
+            // `$…$` span (caret inside it) or a revealed `$$…$$` block line (caret in the
+            // block / a selection overlapping it — the same predicate that stops the block
+            // from collapsing to an image). Empty when the `math` feature is off.
+            #[cfg(feature = "math")]
+            let latex_ranges: Vec<Range<usize>> = {
+                let mut lr = Vec::new();
+                if let Some(spans) = math_spans.get(&i) {
+                    for s in spans {
+                        if cursor_offset >= s.full_range.start && cursor_offset <= s.full_range.end
+                        {
+                            let a = s.content_range.start.max(range.start);
+                            let b = s.content_range.end.min(range.end);
+                            if a < b {
+                                lr.push(a..b);
+                            }
+                        }
+                    }
+                }
+                for m in &math_blocks {
+                    let revealed = (m.block.start < selection.end && selection.start < m.block.end)
+                        || m.block.contains(&cursor_line_start);
+                    if revealed {
+                        let a = m.content.start.max(range.start);
+                        let b = m.content.end.min(range.end);
+                        if a < b {
+                            lr.push(a..b);
+                        }
+                    }
+                }
+                lr
+            };
+            #[cfg(not(feature = "math"))]
+            let latex_ranges: Vec<Range<usize>> = Vec::new();
             // Reuse the cached render when nothing about this line changed. Lines with
             // GitHub extra regions bypass the cache (validation can change them without
             // a version bump); all others key on (version, line, cursor-on-line).
@@ -1462,6 +1497,7 @@ impl DocLayout {
                         &[],
                         tc,
                         math_spans.get(&i).map_or(&[][..], |v| v.as_slice()),
+                        &latex_ranges,
                     ))
                 })
             } else {
@@ -1475,6 +1511,7 @@ impl DocLayout {
                     &extra,
                     table_ctx.clone(),
                     math_spans.get(&i).map_or(&[][..], |v| v.as_slice()),
+                    &latex_ranges,
                 ))
             };
             #[cfg_attr(not(feature = "math"), allow(unused_mut))]
