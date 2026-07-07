@@ -8,11 +8,10 @@ pub fn build_context_display(markers: &[MarkerKind]) -> Vec<(String, usize)> {
     let mut prev_was_checkbox = false;
 
     for (i, marker) in markers.iter().enumerate() {
-        // Skip list marker if previous was checkbox (they're grouped together)
+        // Skip a list marker grouped with a preceding checkbox. `prev_was_checkbox` implies
+        // a prior iteration ran, so `i > 0` here always holds.
         if marker.is_list_item() && prev_was_checkbox {
-            if i > 0 {
-                depth += 1;
-            }
+            depth += 1;
             continue;
         }
 

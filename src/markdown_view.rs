@@ -22,6 +22,8 @@
 //! // ... hand `scene` to a vello::Renderer to rasterize onto your own surface.
 //! ```
 
+use std::collections::HashMap;
+
 use vello::Scene;
 use vello::kurbo::{Affine, Rect};
 use vello::peniko::Fill;
@@ -132,7 +134,7 @@ impl MarkdownView {
             f32::INFINITY,
             &[],
             &(0..0),
-            &std::collections::HashMap::new(),
+            &HashMap::new(),
         );
         self.doc = Some(doc);
         self.laid_out = Some((width, scale));

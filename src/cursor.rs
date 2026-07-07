@@ -36,13 +36,9 @@ pub fn next_grapheme_boundary(buffer: &Buffer, offset: usize) -> usize {
     if rope.get_byte(offset) == Some(b'\n') {
         return offset + 1;
     }
+    // `line_byte_range` already excludes the trailing '\n'.
     let range = buffer.line_byte_range(buffer.byte_to_line(offset));
-    let content_end = if range.end > range.start && rope.get_byte(range.end - 1) == Some(b'\n') {
-        range.end - 1
-    } else {
-        range.end
-    };
-    let chunk = buffer.slice_cow(offset..content_end);
+    let chunk = buffer.slice_cow(offset..range.end);
     match chunk.graphemes(true).next() {
         Some(g) => offset + g.len(),
         None => offset + 1,

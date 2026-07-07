@@ -21,9 +21,6 @@ pub struct IssueOrPr {
     /// For issues: reason for closure (COMPLETED, NOT_PLANNED, REOPENED, or null)
     #[serde(rename = "stateReason")]
     pub state_reason: Option<String>,
-    /// For PRs: whether it was merged
-    #[serde(default)]
-    pub merged: bool,
     /// For PRs: whether it's a draft
     #[serde(rename = "isDraft", default)]
     pub is_draft: bool,
@@ -223,7 +220,6 @@ mod tests {
             title: "Test issue".to_string(),
             state: "OPEN".to_string(),
             state_reason: None,
-            merged: false,
             is_draft: false,
         });
         cache.set_valid(ref_.clone(), Some(issue_data.clone()));
@@ -277,7 +273,6 @@ mod tests {
             title: "Test issue".to_string(),
             state: "OPEN".to_string(),
             state_reason: None,
-            merged: false,
             is_draft: false,
         });
         cache.set_valid(ref_.clone(), Some(issue_data));

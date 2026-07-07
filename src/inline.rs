@@ -794,7 +794,7 @@ fn extract_emphasis_region(node: &Node, style: TextStyle) -> Option<StyledRegion
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             let kind = child.kind();
-            if kind == "emphasis_delimiter" || kind.ends_with("_delimiter") {
+            if kind.ends_with("_delimiter") {
                 delimiters.push((child.start_byte(), child.end_byte()));
             }
             // Recurse into nested emphasis/strikethrough of the same type

@@ -210,20 +210,15 @@ fn draw_find_search_row(
     let left = bar.x0 as f32 + pad;
     let right = bar.x1 as f32 - pad;
 
-    draw_find_label(
-        engine, scene, theme, "Find", left, slot, row_top, row_h, scale,
-    );
+    draw_find_label(engine, scene, theme, "Find", left, row_top, row_h, scale);
 
-    // Right block, laid out right-to-left: match count, then case + regex chips.
-    let count_str = if find.matches.is_empty() {
-        "0 / 0".to_string()
-    } else {
-        format!(
-            "{} / {}",
-            find.active.map(|i| i + 1).unwrap_or(0),
-            find.matches.len()
-        )
-    };
+    // Right block, laid out right-to-left: match count, then case + regex chips. With no
+    // matches this reads "0 / 0" (active None → 0, len 0).
+    let count_str = format!(
+        "{} / {}",
+        find.active.map(|i| i + 1).unwrap_or(0),
+        find.matches.len()
+    );
     let mut run = StyleRun::new(0..count_str.len(), peniko_color(theme.comment));
     run.mono = true;
     let count = engine.build_line(
@@ -291,9 +286,7 @@ fn draw_find_replace_row(
     let slot = FIND_LABEL_SLOT * scale;
     let left = bar.x0 as f32 + pad;
     let right = bar.x1 as f32 - pad;
-    draw_find_label(
-        engine, scene, theme, "Replace", left, slot, row_top, row_h, scale,
-    );
+    draw_find_label(engine, scene, theme, "Replace", left, row_top, row_h, scale);
 
     // Right block, laid out right-to-left: `All` (primary), then `Replace`.
     let (all_left, all) = draw_find_button(
@@ -389,7 +382,7 @@ fn draw_find_button(
 }
 
 /// A row label left-aligned at `left` (so `Find`/`Replace` line up with the document's
-/// left text edge). `slot` is unused here; the caller reserves it so the fields align.
+/// left text edge).
 #[allow(clippy::too_many_arguments)]
 fn draw_find_label(
     engine: &mut TextEngine,
@@ -397,7 +390,6 @@ fn draw_find_label(
     theme: &EditorTheme,
     text: &str,
     left: f32,
-    _slot: f32,
     row_top: f32,
     row_h: f32,
     scale: f32,

@@ -338,10 +338,10 @@ pub fn build_line_render(
                 });
             }
         }
-        for (i, region) in inline.iter().enumerate() {
-            if is_standalone_image {
-                break; // the whole line is hidden; the image block is drawn instead
-            }
+        // A standalone-image line is fully hidden (the image block draws in its place), so
+        // skip the whole inline-collapse pass rather than testing the flag every iteration.
+        let collapse_regions: &[StyledRegion] = if is_standalone_image { &[] } else { &inline };
+        for (i, region) in collapse_regions.iter().enumerate() {
             if cursor_inside[i] {
                 continue; // reveal the whole region (markers included) for editing
             }
