@@ -569,6 +569,9 @@ pub fn detect_github_references_in_line(
             if overlaps_matched(&abs_range, &matched_ranges) {
                 continue;
             }
+            // Record the span (like the issue pass) so any future pass added after this one
+            // won't double-match a SHA; harmless today as SHAs are the last pass.
+            matched_ranges.push(abs_range.clone());
             matches.push(RawGitHubMatch {
                 reference: GitHubRef::from_sha_capture(&cap, ctx),
                 byte_range: abs_range,

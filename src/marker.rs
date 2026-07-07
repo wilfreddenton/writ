@@ -1017,31 +1017,26 @@ pub fn markers_at_from_infos(
                     });
                 }
             }
-            "list_marker_minus" | "list_marker_plus" | "list_marker_star" => {
+            "list_marker_minus"
+            | "list_marker_plus"
+            | "list_marker_star"
+            | "list_marker_dot"
+            | "list_marker_parenthesis" => {
                 let (marker, indent) = marker_from_node(kind, rope, start, end);
 
                 if let Some(ind) = indent {
                     markers.push(ind);
                 }
 
-                // If there's a pending checkbox, add it as a separate Checkbox marker
+                // Attach a pending checkbox (from a task_list_marker seen earlier in this
+                // reverse walk) to its list marker. Runs for ordered markers too, so an
+                // ordered task item like `1. [ ] x` keeps its checkbox; `take()` on `None`
+                // is a no-op for a plain (non-task) list item.
                 if let Some((checked, checkbox_range)) = pending_task.take() {
                     markers.push(Marker {
                         kind: MarkerKind::Checkbox { checked },
                         range: checkbox_range,
                     });
-                }
-
-                // Always add the list item marker
-                if let Some(m) = marker {
-                    markers.push(m);
-                }
-            }
-            "list_marker_dot" | "list_marker_parenthesis" => {
-                let (marker, indent) = marker_from_node(kind, rope, start, end);
-
-                if let Some(ind) = indent {
-                    markers.push(ind);
                 }
 
                 if let Some(m) = marker {
@@ -1344,6 +1339,21 @@ mod tests {
         // Line 2: nested paragraph with 2-space indent
         assert_eq!(kinds(&lines[2].markers), vec![&MarkerKind::Indent]);
         assert_eq!(lines[2].markers[0].range.len(), 2);
+    }
+
+    #[test]
+    fn ordered_task_item_keeps_checkbox() {
+        // Regression: `1. [ ] x` must yield Checkbox + ListItem. The ordered list-marker
+        // arm used to omit the `pending_task.take()`, silently dropping the checkbox.
+        let buf: Buffer = "1. [ ] task\n".parse().unwrap();
+        let lines = buf.lines();
+        assert_eq!(
+            lines[0].markers.len(),
+            2,
+            "ordered task item = Checkbox + ListItem"
+        );
+        assert!(is_checkbox_unchecked(&lines[0].markers[0].kind));
+        assert!(lines[0].markers[1].kind.is_list_item());
     }
 
     #[test]

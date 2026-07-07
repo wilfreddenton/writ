@@ -20,35 +20,26 @@ pub fn detect_github_context(start_path: &Path) -> Option<GitHubContext> {
     parse_github_url(url.to_bstring().to_string().as_str())
 }
 
-/// Parse a GitHub URL (SSH or HTTPS) into GitHubContext.
+/// Parse a GitHub URL (SSH `git@github.com:owner/repo.git` or HTTPS
+/// `https://github.com/owner/repo(.git)`) into a `GitHubContext`.
 fn parse_github_url(url: &str) -> Option<GitHubContext> {
-    // SSH format: git@github.com:owner/repo.git
-    if let Some(rest) = url.strip_prefix("git@github.com:") {
-        let repo_path = rest.strip_suffix(".git").unwrap_or(rest);
-        let (owner, repo) = repo_path.split_once('/')?;
-        return Some(GitHubContext {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-        });
-    }
-
-    // HTTPS format: https://github.com/owner/repo.git
-    if url.contains("github.com") {
-        let url = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))?;
-        let url = url.strip_prefix("github.com/")?;
-        let repo_path = url.strip_suffix(".git").unwrap_or(url);
-        let (owner, repo) = repo_path.split_once('/')?;
-        // Handle URLs with trailing path components (e.g., .../owner/repo/pulls)
-        let repo = repo.split('/').next()?;
-        return Some(GitHubContext {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-        });
-    }
-
-    None
+    let repo_path = if let Some(rest) = url.strip_prefix("git@github.com:") {
+        rest
+    } else if url.contains("github.com") {
+        url.strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))?
+            .strip_prefix("github.com/")?
+    } else {
+        return None;
+    };
+    let repo_path = repo_path.strip_suffix(".git").unwrap_or(repo_path);
+    let (owner, repo) = repo_path.split_once('/')?;
+    // Trim trailing path components (e.g. `.../owner/repo/pulls`) — applies to SSH too.
+    let repo = repo.split('/').next()?;
+    Some(GitHubContext {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    })
 }
 
 /// Read the git HEAD version of the file at `path` as a UTF-8 string.
@@ -94,6 +85,11 @@ mod tests {
 
         // Without .git suffix
         let ctx = parse_github_url("git@github.com:wilfred/writ").unwrap();
+        assert_eq!(ctx.owner, "wilfred");
+        assert_eq!(ctx.repo, "writ");
+
+        // Trailing path components are trimmed on the SSH branch too (regression).
+        let ctx = parse_github_url("git@github.com:wilfred/writ/extra").unwrap();
         assert_eq!(ctx.owner, "wilfred");
         assert_eq!(ctx.repo, "writ");
     }
