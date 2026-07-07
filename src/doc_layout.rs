@@ -176,6 +176,12 @@ pub type LineCache = SweptCache<Rc<parley::Layout<Brush>>>;
 /// cursor sits on it (`cursor_key` = the offset when on-line, else a sentinel — an
 /// off-line render is cursor-independent). Lines carrying GitHub `extra_regions`
 /// bypass the cache (those can change without a version bump, on validation).
+/// Half-open range overlap: do `a` and `b` share at least one offset?
+#[cfg(any(feature = "mermaid", feature = "math"))]
+fn ranges_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
 fn render_key(version: u64, line_idx: usize, cursor_key: usize) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     version.hash(&mut h);
@@ -1249,8 +1255,7 @@ impl DocLayout {
                     .iter()
                     .find(|m| m.block.contains(&ls))
                     .filter(|m| {
-                        let selected =
-                            m.block.start < selection.end && selection.start < m.block.end;
+                        let selected = ranges_overlap(&m.block, selection);
                         !selected && !m.block.contains(&cursor_line_start)
                     })
             };
@@ -1281,8 +1286,7 @@ impl DocLayout {
                     .iter()
                     .find(|m| m.block.contains(&ls))
                     .filter(|m| {
-                        let selected =
-                            m.block.start < selection.end && selection.start < m.block.end;
+                        let selected = ranges_overlap(&m.block, selection);
                         !selected && !m.block.contains(&cursor_line_start)
                     })
             };
@@ -1470,7 +1474,7 @@ impl DocLayout {
                     }
                 }
                 for m in &math_blocks {
-                    let revealed = (m.block.start < selection.end && selection.start < m.block.end)
+                    let revealed = (ranges_overlap(&m.block, selection))
                         || m.block.contains(&cursor_line_start);
                     if revealed {
                         let a = m.content.start.max(range.start);

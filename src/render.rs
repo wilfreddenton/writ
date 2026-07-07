@@ -13,6 +13,8 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
+use vello::peniko::Color;
+
 use crate::buffer::RenderSnapshot;
 use crate::editor::EditorTheme;
 use crate::inline::{MathSpan, StyledRegion, TextStyle};
@@ -147,6 +149,36 @@ fn heading_scale(level: u8) -> f32 {
 /// injects those from `markers`). Passing them in avoids the O(n²) per-line
 /// `styles_in_range` scan when laying out a whole document.
 #[allow(clippy::too_many_arguments)]
+/// The style run + a "this is an inline-code chip" flag for one inline region's display
+/// range. `fallback` colors plain content (foreground, or dimmed on a completed task).
+/// Shared by `build_line_render` and `build_cell_render`; the line path layers heading/
+/// checkbox bold on top of the returned run.
+fn styled_run_for(
+    region: &StyledRegion,
+    theme: &EditorTheme,
+    display: Range<usize>,
+    fallback: Color,
+) -> (StyleRun, bool) {
+    let style = &region.style;
+    let color = match region.checkbox {
+        // A checked box reads as "done" (green); an empty box is muted.
+        Some(true) => peniko_color(theme.green),
+        Some(false) => peniko_color(theme.comment),
+        None if region.link_url.is_some() => peniko_color(theme.cyan),
+        None if style.code => peniko_color(theme.green),
+        None => fallback,
+    };
+    // Inline code (not a link/checkbox) gets a background chip behind its span.
+    let is_code_chip = style.code && region.checkbox.is_none() && region.link_url.is_none();
+    let mut run = StyleRun::new(display, color);
+    run.bold = style.bold;
+    run.italic = style.italic;
+    run.mono = style.code;
+    run.strikethrough = style.strikethrough;
+    run.underline = region.link_url.is_some();
+    (run, is_code_chip)
+}
+
 pub fn build_line_render(
     snapshot: &RenderSnapshot,
     line_idx: usize,
@@ -510,25 +542,12 @@ pub fn build_line_render(
             if r.is_empty() {
                 continue;
             }
-            let style = &region.style;
-            let color = match region.checkbox {
-                // A checked box reads as "done" (green); an empty box is muted.
-                Some(true) => peniko_color(theme.green),
-                Some(false) => peniko_color(theme.comment),
-                None if region.link_url.is_some() => peniko_color(theme.cyan),
-                None if style.code => peniko_color(theme.green),
-                None => content_color, // dimmed on a completed task, else fg
-            };
-            // Inline code (not a link/checkbox) gets a background chip behind its span.
-            if style.code && region.checkbox.is_none() && region.link_url.is_none() {
-                code_ranges.push(r.clone());
+            let (mut run, is_code_chip) = styled_run_for(region, theme, r.clone(), content_color);
+            if is_code_chip {
+                code_ranges.push(r);
             }
-            let mut run = StyleRun::new(r, color);
-            run.bold = style.bold || heading_level > 0 || region.checkbox == Some(true);
-            run.italic = style.italic;
-            run.mono = style.code;
-            run.strikethrough = style.strikethrough;
-            run.underline = region.link_url.is_some();
+            // A heading's inline content and a checked task's content read bold.
+            run.bold = run.bold || heading_level > 0 || region.checkbox == Some(true);
             runs.push(run);
         }
     }
@@ -635,23 +654,10 @@ pub fn build_cell_render(
         if dr.is_empty() {
             continue;
         }
-        let style = &r.style;
-        if style.code && r.checkbox.is_none() && r.link_url.is_none() {
-            code_ranges.push(dr.clone());
+        let (run, is_code_chip) = styled_run_for(r, theme, dr.clone(), fg);
+        if is_code_chip {
+            code_ranges.push(dr);
         }
-        let color = match r.checkbox {
-            Some(true) => peniko_color(theme.green),
-            Some(false) => peniko_color(theme.comment),
-            None if r.link_url.is_some() => peniko_color(theme.cyan),
-            None if style.code => peniko_color(theme.green),
-            None => fg,
-        };
-        let mut run = StyleRun::new(dr, color);
-        run.bold = style.bold;
-        run.italic = style.italic;
-        run.mono = style.code;
-        run.strikethrough = style.strikethrough;
-        run.underline = r.link_url.is_some();
         runs.push(run);
     }
     (text, runs, map, code_ranges)
