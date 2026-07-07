@@ -1098,31 +1098,72 @@ fn ac_row_at(rects: &[ScreenRect], pos: (f32, f32)) -> Option<usize> {
     rects.iter().position(|r| rect_contains(r, pos))
 }
 
-/// Point the OS cursor at whatever's under the pointer: a hand (`Pointer`) when Ctrl/Cmd
-/// is held over a Ctrl-clickable link (same hit-test → `link_at` path as the click), else
-/// the default arrow. Only calls `set_cursor` on a change. Gated on the modifier first so
-/// the (snapshot-building) `link_at` lookup runs only during an actual Ctrl-hover.
-fn update_link_cursor(
+/// The OS cursor for whatever's under the pointer: a hand (`Pointer`) when Ctrl/Cmd is
+/// held over a Ctrl-clickable link (same hit-test → `link_at` path as the click); the
+/// arrow (`Default`) over a clickable gutter chevron / autocomplete row and the chrome
+/// around the body (outline panel, find bar, status bar); otherwise the I-beam (`Text`)
+/// over the editable document body. The modifier is checked first so the (snapshot-
+/// building) `link_at` lookup only runs during an actual Ctrl-hover.
+fn pointer_cursor(
     doc_engine: &mut DocEngine,
+    state: &ActiveSurface,
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
-    current: &mut CursorIcon,
-    window: &Window,
-) {
-    let over_link = (modifiers.control_key() || modifiers.super_key())
+    fold_chevrons: &[(usize, ScreenRect)],
+    ac_rows: &[ScreenRect],
+) -> CursorIcon {
+    if (modifiers.control_key() || modifiers.super_key())
         && doc_engine
             .doc
             .as_ref()
             .and_then(|d| d.hit_test(mouse_pos.0, mouse_pos.1))
-            .is_some_and(|off| doc_engine.editor.link_at(off).is_some());
-    let icon = if over_link {
-        CursorIcon::Pointer
+            .is_some_and(|off| doc_engine.editor.link_at(off).is_some())
+    {
+        return CursorIcon::Pointer;
+    }
+    if fold_chevrons
+        .iter()
+        .any(|(_, r)| rect_contains(r, mouse_pos))
+        || ac_rows.iter().any(|r| rect_contains(r, mouse_pos))
+    {
+        return CursorIcon::Default;
+    }
+    // The editable body is the editor content minus the right-docked outline panel; the
+    // find bar and status bar sit below `editor_h`. I-beam inside, arrow over the chrome.
+    let width = state.surface.config.width as f32;
+    let height = state.surface.config.height as f32;
+    let outline_w = outline_width(&doc_engine.editor, state.scale);
+    let (_, editor_h) = chrome_metrics(state.scale, height, state.find_bar_h);
+    let body: ScreenRect = (0.0, 0.0, (width - outline_w) as f64, editor_h as f64);
+    if rect_contains(&body, mouse_pos) {
+        CursorIcon::Text
     } else {
         CursorIcon::Default
-    };
+    }
+}
+
+/// Recompute the pointer cursor and apply it, but only call `set_cursor` on a real change.
+#[allow(clippy::too_many_arguments)]
+fn update_pointer_cursor(
+    doc_engine: &mut DocEngine,
+    state: &ActiveSurface,
+    modifiers: ModifiersState,
+    mouse_pos: (f32, f32),
+    fold_chevrons: &[(usize, ScreenRect)],
+    ac_rows: &[ScreenRect],
+    current: &mut CursorIcon,
+) {
+    let icon = pointer_cursor(
+        doc_engine,
+        state,
+        modifiers,
+        mouse_pos,
+        fold_chevrons,
+        ac_rows,
+    );
     if icon != *current {
         *current = icon;
-        window.set_cursor(icon);
+        state.window.set_cursor(icon);
     }
 }
 
@@ -1597,12 +1638,14 @@ impl ApplicationHandler<WritEvent> for App {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
                 // Pressing/releasing Ctrl while stationary over a link flips the pointer.
-                update_link_cursor(
+                update_pointer_cursor(
                     &mut self.doc_engine,
+                    state,
                     self.modifiers,
                     self.mouse_pos,
+                    &self.fold_chevron_rects,
+                    &self.ac_row_rects,
                     &mut self.cursor_icon,
-                    &state.window,
                 );
             }
             WindowEvent::Ime(winit::event::Ime::Enabled) => {
@@ -1769,14 +1812,17 @@ impl ApplicationHandler<WritEvent> for App {
                         state.window.request_redraw();
                     }
                 }
-                // Ctrl-hover over a link shows the pointer cursor (skip while drag-selecting).
+                // I-beam over the body, hand on Ctrl-hover over a link, arrow over chrome
+                // and clickable gutter/popup widgets (skip while drag-selecting).
                 if !self.mouse_down {
-                    update_link_cursor(
+                    update_pointer_cursor(
                         &mut self.doc_engine,
+                        state,
                         self.modifiers,
                         self.mouse_pos,
+                        &self.fold_chevron_rects,
+                        &self.ac_row_rects,
                         &mut self.cursor_icon,
-                        &state.window,
                     );
                 }
             }
