@@ -364,10 +364,22 @@ pub fn highlight_mermaid(src: &str) -> Vec<HighlightSpan> {
         // arrowhead (`--x`, `--o`) when it's not the start of an identifier.
         if is_arrow_char(c) {
             let start = i;
-            while i < b.len() && is_arrow_char(b[i]) {
-                i += 1;
+            // A `|` joins the run only as part of a class relation edge — right after a `<`
+            // (`<|--`, `<|..`) or right before `>`/`-`/`.`/`=` (`--|>`, `..|>`). A normal edge
+            // label `-->|yes|` has the `|` followed by label text, so it stays a separate token.
+            while i < b.len() {
+                let relation_pipe = b[i] == b'|'
+                    && ((i > start && b[i - 1] == b'<')
+                        || (i + 1 < b.len() && matches!(b[i + 1], b'>' | b'-' | b'.' | b'=')));
+                if is_arrow_char(b[i]) || relation_pipe {
+                    i += 1;
+                } else {
+                    break;
+                }
             }
-            let connector = b[start..i].iter().any(|&x| matches!(x, b'-' | b'=' | b'>'));
+            let connector = b[start..i]
+                .iter()
+                .any(|&x| matches!(x, b'-' | b'=' | b'>' | b'.'));
             if connector
                 && i < b.len()
                 && matches!(b[i], b'x' | b'o')
@@ -574,6 +586,21 @@ mod tests {
         assert_eq!(cat_of(&c, "[*]"), Some("constant"));
         assert_eq!(cat_of(&c, "--x"), Some("operator")); // arrowhead re-attached
         assert_eq!(cat_of(&c, "<<fork>>"), Some("type"));
+    }
+
+    #[test]
+    fn mermaid_class_relation_arrows() {
+        // Class relations with `|` color as one operator token...
+        let src = "classDiagram\n  A <|-- B\n  C --|> D\n  E ..|> F";
+        let c = cats(src, &highlight_mermaid(src));
+        assert_eq!(cat_of(&c, "<|--"), Some("operator"));
+        assert_eq!(cat_of(&c, "--|>"), Some("operator"));
+        assert_eq!(cat_of(&c, "..|>"), Some("operator"));
+        // ...but a flowchart edge label keeps the arrow and label separate.
+        let flow = "flowchart LR\n  A -->|yes| B";
+        let c = cats(flow, &highlight_mermaid(flow));
+        assert_eq!(cat_of(&c, "-->"), Some("operator"));
+        assert_eq!(cat_of(&c, "|yes|"), Some("string"));
     }
 
     #[test]
