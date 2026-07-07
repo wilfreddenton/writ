@@ -759,6 +759,82 @@ impl EditorState {
 
     /// Build full nested context markers by walking up the tree-sitter tree.
     /// Returns markers from outermost to innermost (e.g., `> - [x] - [ ]`).
+    /// The `(list_marker, checkbox)` markers of a `list_item` node (each `None` if
+    /// absent), from its direct children. Ordered/unordered marker style and the ordinal
+    /// number are read off the marker token.
+    fn list_item_markers(
+        &self,
+        item: tree_sitter::Node,
+    ) -> (Option<MarkerKind>, Option<MarkerKind>) {
+        let mut list_marker: Option<MarkerKind> = None;
+        let mut checkbox: Option<MarkerKind> = None;
+        let mut cursor = item.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                match child.kind() {
+                    "task_list_marker_checked" => {
+                        checkbox = Some(MarkerKind::Checkbox { checked: true });
+                    }
+                    "task_list_marker_unchecked" => {
+                        checkbox = Some(MarkerKind::Checkbox { checked: false });
+                    }
+                    "list_marker_minus" => {
+                        list_marker = Some(MarkerKind::ListItem {
+                            ordered: false,
+                            unordered_marker: Some(UnorderedMarker::Minus),
+                            ordered_marker: None,
+                            number: None,
+                        });
+                    }
+                    "list_marker_star" => {
+                        list_marker = Some(MarkerKind::ListItem {
+                            ordered: false,
+                            unordered_marker: Some(UnorderedMarker::Star),
+                            ordered_marker: None,
+                            number: None,
+                        });
+                    }
+                    "list_marker_plus" => {
+                        list_marker = Some(MarkerKind::ListItem {
+                            ordered: false,
+                            unordered_marker: Some(UnorderedMarker::Plus),
+                            ordered_marker: None,
+                            number: None,
+                        });
+                    }
+                    "list_marker_dot" | "list_marker_parenthesis" => {
+                        let marker_text =
+                            self.buffer.slice_cow(child.start_byte()..child.end_byte());
+                        let number = marker_text
+                            .trim()
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                            .parse::<u32>()
+                            .ok();
+                        let ordered_marker = Some(if child.kind() == "list_marker_dot" {
+                            OrderedMarker::Dot
+                        } else {
+                            OrderedMarker::Parenthesis
+                        });
+                        list_marker = Some(MarkerKind::ListItem {
+                            ordered: true,
+                            unordered_marker: None,
+                            ordered_marker,
+                            number,
+                        });
+                    }
+                    _ => {}
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        (list_marker, checkbox)
+    }
+
     pub fn build_nested_context(&self, cursor_offset: usize) -> Vec<MarkerKind> {
         let Some(tree) = self.buffer.tree() else {
             return Vec::new();
@@ -792,81 +868,9 @@ impl EditorState {
                     markers_reversed.push(MarkerKind::BlockQuote);
                 }
                 "list_item" => {
-                    // Scan direct children for list marker and checkbox
-                    // Collect in reverse order (checkbox then list_marker) because
-                    // we reverse the whole list at the end, so we want: - [x]
-                    let mut list_marker: Option<MarkerKind> = None;
-                    let mut checkbox: Option<MarkerKind> = None;
-
-                    let mut cursor = n.walk();
-                    if cursor.goto_first_child() {
-                        loop {
-                            let child = cursor.node();
-                            match child.kind() {
-                                "task_list_marker_checked" => {
-                                    checkbox = Some(MarkerKind::Checkbox { checked: true });
-                                }
-                                "task_list_marker_unchecked" => {
-                                    checkbox = Some(MarkerKind::Checkbox { checked: false });
-                                }
-                                "list_marker_minus" => {
-                                    list_marker = Some(MarkerKind::ListItem {
-                                        ordered: false,
-                                        unordered_marker: Some(UnorderedMarker::Minus),
-                                        ordered_marker: None,
-                                        number: None,
-                                    });
-                                }
-                                "list_marker_star" => {
-                                    list_marker = Some(MarkerKind::ListItem {
-                                        ordered: false,
-                                        unordered_marker: Some(UnorderedMarker::Star),
-                                        ordered_marker: None,
-                                        number: None,
-                                    });
-                                }
-                                "list_marker_plus" => {
-                                    list_marker = Some(MarkerKind::ListItem {
-                                        ordered: false,
-                                        unordered_marker: Some(UnorderedMarker::Plus),
-                                        ordered_marker: None,
-                                        number: None,
-                                    });
-                                }
-                                "list_marker_dot" | "list_marker_parenthesis" => {
-                                    // Extract the number from the marker text
-                                    let marker_text =
-                                        self.buffer.slice_cow(child.start_byte()..child.end_byte());
-                                    let number = marker_text
-                                        .trim()
-                                        .chars()
-                                        .take_while(|c| c.is_ascii_digit())
-                                        .collect::<String>()
-                                        .parse::<u32>()
-                                        .ok();
-                                    let ordered_marker =
-                                        Some(if child.kind() == "list_marker_dot" {
-                                            OrderedMarker::Dot
-                                        } else {
-                                            OrderedMarker::Parenthesis
-                                        });
-                                    list_marker = Some(MarkerKind::ListItem {
-                                        ordered: true,
-                                        unordered_marker: None,
-                                        ordered_marker,
-                                        number,
-                                    });
-                                }
-                                _ => {}
-                            }
-                            if !cursor.goto_next_sibling() {
-                                break;
-                            }
-                        }
-                    }
-
-                    // Add in reverse order: checkbox first, then list_marker
-                    // After final reverse, this becomes: list_marker, checkbox (i.e., "- [x]")
+                    // Reversed order (checkbox then list_marker); the whole vec is
+                    // reversed at the end, yielding list_marker then checkbox (i.e. "- [x]").
+                    let (list_marker, checkbox) = self.list_item_markers(n);
                     if let Some(cb) = checkbox {
                         markers_reversed.push(cb);
                     }

@@ -800,6 +800,22 @@ impl Editor {
             .any(|i| i.byte_offset == byte_offset)
     }
 
+    /// Apply a fold-gutter click at `byte_offset`, dispatching on the modifier scope and
+    /// the fold kind (heading vs list item). Ctrl = breadth (all at this heading level /
+    /// list depth), Shift = depth (recursive: this item + everything nested), Ctrl+Shift =
+    /// both, plain = just this one. The recursive/plain cases are kind-agnostic.
+    pub fn apply_fold_gesture(&mut self, byte_offset: usize, ctrl: bool, shift: bool) {
+        let is_list = self.is_list_fold_offset(byte_offset);
+        match (ctrl, shift) {
+            (true, true) if is_list => self.toggle_fold_list_level_deep_at(byte_offset),
+            (true, false) if is_list => self.toggle_fold_list_level_at(byte_offset),
+            (true, true) => self.toggle_fold_level_deep_at(byte_offset),
+            (true, false) => self.toggle_fold_level_at(byte_offset),
+            (false, true) => self.toggle_fold_recursive(byte_offset),
+            (false, false) => self.toggle_fold(byte_offset),
+        }
+    }
+
     /// Toggle the fold on the heading anchored at `byte_offset` (a gutter-chevron click).
     pub fn toggle_fold(&mut self, byte_offset: usize) {
         if !self.folded_headings.remove(&byte_offset) {

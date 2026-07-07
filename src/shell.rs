@@ -1958,17 +1958,7 @@ impl ApplicationHandler<WritEvent> for App {
                     // depth, plain = just this one.
                     let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
                     let shift = self.modifiers.shift_key();
-                    let editor = &mut self.doc_engine.editor;
-                    match (editor.is_list_fold_offset(off), ctrl, shift) {
-                        (true, true, true) => editor.toggle_fold_list_level_deep_at(off),
-                        (true, true, false) => editor.toggle_fold_list_level_at(off),
-                        (true, false, true) => editor.toggle_fold_recursive(off),
-                        (true, false, false) => editor.toggle_fold(off),
-                        (false, true, true) => editor.toggle_fold_level_deep_at(off),
-                        (false, true, false) => editor.toggle_fold_level_at(off),
-                        (false, false, true) => editor.toggle_fold_recursive(off),
-                        (false, false, false) => editor.toggle_fold(off),
-                    }
+                    self.doc_engine.editor.apply_fold_gesture(off, ctrl, shift);
                     self.doc_engine
                         .rebuild_preserving_scroll(w, state.scale, vh);
                     state.window.request_redraw();
