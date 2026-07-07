@@ -6,6 +6,8 @@ use tree_sitter_highlight::{
     Highlight, HighlightConfiguration, HighlightEvent, Highlighter as TSHighlighter,
 };
 
+use crate::tokenize;
+
 pub const HIGHLIGHT_NAMES: &[&str] = &[
     "attribute",
     "boolean",
@@ -43,6 +45,18 @@ pub struct HighlightSpan {
     pub highlight_id: usize,
 }
 
+/// Resolve a capture name (e.g. `"keyword"`, `"operator"`) to its `highlight_id` — the
+/// index into [`HIGHLIGHT_NAMES`] that [`EditorTheme::color_for_highlight`] maps to a
+/// color. For the hand-written tokenizers (mermaid, latex), which emit categories by name
+/// rather than via a tree-sitter query. An unknown name resolves to a sentinel that renders
+/// as the plain foreground.
+pub fn highlight_id(name: &str) -> usize {
+    HIGHLIGHT_NAMES
+        .iter()
+        .position(|&n| n == name)
+        .unwrap_or(usize::MAX)
+}
+
 /// Language keys are stored lowercase. Only allocate when the input actually has an
 /// uppercase byte — the overwhelmingly common case (already-lowercase fence infos)
 /// borrows unchanged.
@@ -54,13 +68,21 @@ fn normalized_lang(lang: &str) -> Cow<'_, str> {
     }
 }
 
-struct LanguageConfig {
-    config: HighlightConfiguration,
+/// How a registered language produces highlight spans. Most languages use a tree-sitter
+/// grammar + query; a few (mermaid, latex) have no publishable grammar crate and are
+/// lexed by a pure-Rust tokenizer instead. Both go through the same `highlight()` entry
+/// point, so callers (the code-block highlight cache, revealed-math styling) never
+/// special-case which backend a language uses.
+enum Backend {
+    /// Boxed — a `HighlightConfiguration` is large, and it lives behind an `Arc` anyway.
+    TreeSitter(Box<HighlightConfiguration>),
+    /// `fn(source) -> spans`, each span's `highlight_id` from [`highlight_id`].
+    Tokenizer(fn(&str) -> Vec<HighlightSpan>),
 }
 
 pub struct Highlighter {
     inner: TSHighlighter,
-    languages: HashMap<String, Arc<LanguageConfig>>,
+    languages: HashMap<String, Arc<Backend>>,
 }
 
 impl Default for Highlighter {
@@ -74,25 +96,40 @@ impl Highlighter {
         let inner = TSHighlighter::new();
         let mut languages = HashMap::new();
 
-        // Register Rust
+        let mut register = |aliases: &[&str], backend: Backend| {
+            let backend = Arc::new(backend);
+            for a in aliases {
+                languages.insert((*a).to_string(), Arc::clone(&backend));
+            }
+        };
+
+        // Tree-sitter grammars.
         if let Some(config) = Self::create_rust_config() {
-            let config = Arc::new(config);
-            languages.insert("rust".to_string(), Arc::clone(&config));
-            languages.insert("rs".to_string(), Arc::clone(&config));
+            register(&["rust", "rs"], Backend::TreeSitter(Box::new(config)));
+        }
+        if let Some(config) = Self::create_bash_config() {
+            register(
+                &["bash", "sh", "shell"],
+                Backend::TreeSitter(Box::new(config)),
+            );
         }
 
-        // Register Bash
-        if let Some(config) = Self::create_bash_config() {
-            let config = Arc::new(config);
-            languages.insert("bash".to_string(), Arc::clone(&config));
-            languages.insert("sh".to_string(), Arc::clone(&config));
-            languages.insert("shell".to_string(), Arc::clone(&config));
-        }
+        // Tokenizer-backed languages (no publishable grammar crate). Registered ungated:
+        // a ```mermaid / ```latex code fence highlights through the normal code-block path,
+        // and revealed `$…$` math styles via `highlight(content, "latex")`.
+        register(
+            &["mermaid"],
+            Backend::Tokenizer(tokenize::highlight_mermaid),
+        );
+        register(
+            &["latex", "tex"],
+            Backend::Tokenizer(tokenize::highlight_latex),
+        );
 
         Self { inner, languages }
     }
 
-    fn create_rust_config() -> Option<LanguageConfig> {
+    fn create_rust_config() -> Option<HighlightConfiguration> {
         let language = tree_sitter_rust::LANGUAGE.into();
 
         // Use Zed's highlights.scm for better Rust coverage
@@ -116,10 +153,10 @@ impl Highlighter {
         // Configure which highlight names we recognize
         config.configure(HIGHLIGHT_NAMES);
 
-        Some(LanguageConfig { config })
+        Some(config)
     }
 
-    fn create_bash_config() -> Option<LanguageConfig> {
+    fn create_bash_config() -> Option<HighlightConfiguration> {
         let language = tree_sitter_bash::LANGUAGE.into();
         let highlights_query = tree_sitter_bash::HIGHLIGHT_QUERY;
 
@@ -134,7 +171,7 @@ impl Highlighter {
 
         config.configure(HIGHLIGHT_NAMES);
 
-        Some(LanguageConfig { config })
+        Some(config)
     }
 
     pub fn supports_language(&self, lang: &str) -> bool {
@@ -142,13 +179,18 @@ impl Highlighter {
     }
 
     pub fn highlight(&mut self, code: &str, language: &str) -> Vec<HighlightSpan> {
-        let Some(lang_config) = self.languages.get(normalized_lang(language).as_ref()) else {
+        let Some(backend) = self.languages.get(normalized_lang(language).as_ref()) else {
             return Vec::new();
+        };
+
+        let config = match backend.as_ref() {
+            Backend::Tokenizer(f) => return f(code),
+            Backend::TreeSitter(config) => config.as_ref(),
         };
 
         // Run the highlighter
         let highlights = match self.inner.highlight(
-            &lang_config.config,
+            config,
             code.as_bytes(),
             None,     // cancellation flag
             |_| None, // injection callback (not used)

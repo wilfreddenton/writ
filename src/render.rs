@@ -20,6 +20,7 @@ use crate::marker::MarkerKind;
 use crate::segment_map::{SegmentMap, Special};
 use crate::table::RowKind;
 use crate::text_engine::{StyleRun, peniko_color};
+use crate::tokenize;
 
 /// Half-open-on-the-left, closed-on-the-right containment: the cursor is "in" a
 /// region when sitting anywhere from its start through its end (so a cursor at the
@@ -161,6 +162,11 @@ pub fn build_line_render(
     // Inline `$…$` math spans on this line (empty when the `math` feature is off). Each is
     // collapsed to an inline box unless the caret is inside it (then the raw `$…$` shows).
     math_spans: &[MathSpan],
+    // Buffer byte ranges on this line whose text should be LaTeX-syntax-highlighted: the
+    // content of a revealed inline `$…$` span or a revealed `$$…$$` block line. Empty when
+    // no math is revealed here (and always when the `math` feature is off). Computed by the
+    // caller, which knows the reveal state; this just tokenizes + colors them.
+    latex_ranges: &[Range<usize>],
 ) -> LineRender {
     let markers = snapshot.line_markers(line_idx);
     let range = markers.range.clone();
@@ -525,6 +531,34 @@ pub fn build_line_render(
         }
     }
 
+    // Revealed math: overlay LaTeX-token colors on the raw source (mono, on top of the
+    // base runs). Routed through the same `latex` tokenizer + theme color map as a
+    // ```latex code fence, so revealed inline/block math reads like the other languages.
+    for lr in latex_ranges {
+        let (Some(rel_start), Some(rel_end)) = (
+            lr.start.checked_sub(line_start),
+            lr.end.checked_sub(line_start),
+        ) else {
+            continue;
+        };
+        let Some(slice) = line_text.get(rel_start..rel_end.min(line_text.len())) else {
+            continue;
+        };
+        for span in tokenize::highlight_latex(slice) {
+            let buf = (lr.start + span.range.start)..(lr.start + span.range.end);
+            let r = map.buffer_range_to_display(buf);
+            if r.is_empty() {
+                continue;
+            }
+            let mut run = StyleRun::new(
+                r,
+                peniko_color(theme.color_for_highlight(span.highlight_id)),
+            );
+            run.mono = true;
+            runs.push(run);
+        }
+    }
+
     // Display column where content begins (after markers) — drives the hanging indent
     // so wrapped rows align under it. Hidden markers (e.g. heading `# `) collapse to 0.
     let content_start = map.buffer_to_display(markers.content_start());
@@ -659,6 +693,7 @@ mod tests {
             &extra,
             None,
             &[],
+            &[],
         );
         let link_run = lr
             .runs
@@ -679,7 +714,18 @@ mod tests {
         let mut buffer: Buffer = "See #1 today\n".parse().unwrap();
         let snapshot = buffer.render_snapshot();
         let theme = EditorTheme::dracula();
-        let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[]);
+        let lr = build_line_render(
+            &snapshot,
+            0,
+            &theme,
+            18.0,
+            usize::MAX,
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+        );
         assert!(!lr.runs.iter().any(|r| r.underline));
     }
 
@@ -692,7 +738,7 @@ mod tests {
         let mut buf: Buffer = "- [x] done\n- [ ] todo\n".parse().unwrap();
         let snap = buf.render_snapshot();
 
-        let done = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[]);
+        let done = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[], &[]);
         assert!(
             done.runs
                 .iter()
@@ -706,7 +752,7 @@ mod tests {
             "the checkbox itself stays green"
         );
 
-        let todo = build_line_render(&snap, 1, &theme, 18.0, usize::MAX, &[], &[], None, &[]);
+        let todo = build_line_render(&snap, 1, &theme, 18.0, usize::MAX, &[], &[], None, &[], &[]);
         assert!(
             !todo
                 .runs
@@ -735,6 +781,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
         );
         assert_eq!(coded.code_ranges.len(), 1, "one code span");
         // The chip covers the visible `foo()` (backticks hidden off-cursor).
@@ -751,6 +798,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
         );
         assert!(plain.code_ranges.is_empty(), "no code span, no chip");
     }
@@ -766,13 +814,13 @@ mod tests {
         let snap = buffer.render_snapshot();
 
         // Cursor off the `---` line: text hidden, rule flagged.
-        let lr = build_line_render(&snap, 2, &theme, 18.0, 0, &[], &[], None, &[]);
+        let lr = build_line_render(&snap, 2, &theme, 18.0, 0, &[], &[], None, &[], &[]);
         assert!(lr.is_hr, "off-line thematic break renders as a rule");
         assert!(lr.text.is_empty(), "the `---` text is hidden");
 
         // Cursor on the `---` line: text revealed, no rule.
         let on = snap.line_markers(2).range.start;
-        let lr = build_line_render(&snap, 2, &theme, 18.0, on, &[], &[], None, &[]);
+        let lr = build_line_render(&snap, 2, &theme, 18.0, on, &[], &[], None, &[], &[]);
         assert!(!lr.is_hr, "revealed for editing when cursor is on it");
         assert_eq!(lr.text, "---");
     }
@@ -797,6 +845,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
         );
         let img = off
             .image
@@ -807,7 +856,7 @@ mod tests {
         assert!(off.text.is_empty(), "the `![alt](url)` markdown is hidden");
 
         // Cursor on the line: reveal the raw markdown, no image block.
-        let on = build_line_render(&snap, 0, &theme, 18.0, 0, &styles[0], &[], None, &[]);
+        let on = build_line_render(&snap, 0, &theme, 18.0, 0, &styles[0], &[], None, &[], &[]);
         assert!(
             on.image.is_none(),
             "cursor on the line reveals raw markdown"
@@ -832,6 +881,7 @@ mod tests {
             &styles[0],
             &[],
             None,
+            &[],
             &[],
         );
         assert!(
@@ -862,6 +912,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
         );
         assert_eq!(off.inline_images.len(), 2, "both inline images detected");
         assert!(
@@ -876,7 +927,8 @@ mod tests {
         assert!(off.image.is_none(), "not a standalone image");
 
         // Caret inside the first image: it reveals, the second stays a box.
-        let in_first = build_line_render(&snap, 0, &theme, 18.0, 2, &styles[0], &[], None, &[]);
+        let in_first =
+            build_line_render(&snap, 0, &theme, 18.0, 2, &styles[0], &[], None, &[], &[]);
         assert_eq!(
             in_first.inline_images.len(),
             1,
@@ -885,7 +937,8 @@ mod tests {
         assert!(in_first.text.contains("![a]"), "caret's image shown raw");
 
         // Caret on the line but between the images: both stay boxes.
-        let between = build_line_render(&snap, 0, &theme, 18.0, 13, &styles[0], &[], None, &[]);
+        let between =
+            build_line_render(&snap, 0, &theme, 18.0, 13, &styles[0], &[], None, &[], &[]);
         assert_eq!(
             between.inline_images.len(),
             2,
@@ -901,13 +954,13 @@ mod tests {
 
         let mut single: Buffer = "> quoted line\n".parse().unwrap();
         let snap = single.render_snapshot();
-        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[]);
+        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[], &[]);
         assert!(!lr.text.contains('▎'), "bar must not be a text glyph");
         assert_eq!(lr.quote_bar_bytes, vec![0], "one gutter at the line start");
 
         let mut nested: Buffer = "> > deeply quoted\n".parse().unwrap();
         let snap = nested.render_snapshot();
-        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[]);
+        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[], &[]);
         assert_eq!(lr.quote_bar_bytes.len(), 2, "one gutter per nesting level");
         assert_eq!(lr.quote_bar_bytes[0], 0, "outer gutter at line start");
         assert!(
@@ -941,12 +994,24 @@ mod tests {
             &[],
             Some(ctx.clone()),
             &[],
+            &[],
         );
         assert!(off.table.is_some(), "off-cursor header is a grid row");
         assert!(off.text.is_empty(), "grid row text hidden");
 
         // Cursor inside the block: reveal — raw pipe text, no table ref.
-        let on = build_line_render(&snap, 0, &theme, 18.0, 2, &styles[0], &[], Some(ctx), &[]);
+        let on = build_line_render(
+            &snap,
+            0,
+            &theme,
+            18.0,
+            2,
+            &styles[0],
+            &[],
+            Some(ctx),
+            &[],
+            &[],
+        );
         assert!(on.table.is_none(), "cursor in block reveals raw text");
         assert_eq!(on.text, "| a | b |");
     }
@@ -977,6 +1042,7 @@ mod tests {
             &styles[last],
             &[],
             Some(ctx),
+            &[],
             &[],
         );
         assert!(
