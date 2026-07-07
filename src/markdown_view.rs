@@ -132,6 +132,7 @@ impl MarkdownView {
             f32::INFINITY,
             &[],
             &(0..0),
+            &std::collections::HashMap::new(),
         );
         self.doc = Some(doc);
         self.laid_out = Some((width, scale));

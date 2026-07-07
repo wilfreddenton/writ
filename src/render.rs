@@ -15,7 +15,7 @@ use std::ops::Range;
 
 use crate::buffer::RenderSnapshot;
 use crate::editor::EditorTheme;
-use crate::inline::{StyledRegion, TextStyle};
+use crate::inline::{MathSpan, StyledRegion, TextStyle};
 use crate::marker::MarkerKind;
 use crate::segment_map::{SegmentMap, Special};
 use crate::table::RowKind;
@@ -46,6 +46,14 @@ pub struct InlineImageRef {
     pub alt: String,
     /// Display byte offset of the collapsed image's zero-width point (where the inline
     /// box sits). Ordered left-to-right across a line.
+    pub display_offset: usize,
+}
+
+/// An inline `$…$` math span collapsed to a zero-width display point on a line. The draw
+/// path reserves an inline box there and paints the rendered math image on the baseline.
+#[derive(Clone)]
+pub struct InlineMathRef {
+    pub latex: String,
     pub display_offset: usize,
 }
 
@@ -100,6 +108,10 @@ pub struct LineRender {
     /// while the cursor is on the line (raw markdown revealed) and on standalone-image
     /// lines (mutually exclusive with `image`). Ordered by `display_offset`.
     pub inline_images: Vec<InlineImageRef>,
+    /// Inline `$…$` math spans on the line, each collapsed to a zero-width point where the
+    /// draw path reserves an inline box for the rendered math. Empty for a span the cursor
+    /// is inside (raw `$…$` revealed) and when the `math` feature is off.
+    pub inline_math: Vec<InlineMathRef>,
     /// This line is a grid-rendered table row: its raw pipe text is hidden (`text`
     /// empty) and the draw path paints the cell grid instead. `None` when the line is
     /// not a table, or when the cursor is inside the table block (raw text revealed).
@@ -146,6 +158,9 @@ pub fn build_line_render(
     // mode (hidden text + `table` ref) engages only while the cursor is off the block;
     // otherwise the line renders as ordinary raw pipe text via the normal path.
     table_ctx: Option<TableCtx>,
+    // Inline `$…$` math spans on this line (empty when the `math` feature is off). Each is
+    // collapsed to an inline box unless the caret is inside it (then the raw `$…$` shows).
+    math_spans: &[MathSpan],
 ) -> LineRender {
     let markers = snapshot.line_markers(line_idx);
     let range = markers.range.clone();
@@ -363,6 +378,26 @@ pub fn build_line_render(
         }
     }
 
+    // Inline `$…$` math: collapse each span to a zero-width point (the draw path reserves
+    // an inline box + paints the rendered math), unless the caret is inside it — then the
+    // raw `$…$` shows for editing. Grid tables / standalone-image lines have no text flow.
+    let mut inline_math_specs: Vec<(usize, String)> = Vec::new();
+    if !is_grid_table && !is_standalone_image {
+        for span in math_spans {
+            if span.full_range.start < line_start
+                || span.full_range.end > line_end
+                || cursor_in(&span.full_range, cursor_offset)
+            {
+                continue;
+            }
+            specials.push(Special::Hidden(span.full_range.clone()));
+            let latex = line_text
+                [span.content_range.start - line_start..span.content_range.end - line_start]
+                .to_string();
+            inline_math_specs.push((span.full_range.start, latex));
+        }
+    }
+
     let (text, map) = SegmentMap::build(&line_text, line_start, &specials);
 
     // Resolve each collapsed inline image to its zero-width display point, ordered
@@ -377,6 +412,14 @@ pub fn build_line_render(
         })
         .collect();
     inline_images.sort_by_key(|i| i.display_offset);
+    let mut inline_math: Vec<InlineMathRef> = inline_math_specs
+        .into_iter()
+        .map(|(buffer_start, latex)| InlineMathRef {
+            latex,
+            display_offset: map.buffer_to_display(buffer_start),
+        })
+        .collect();
+    inline_math.sort_by_key(|m| m.display_offset);
 
     // Display offsets of each blockquote marker (outermost first), for the drawn gutter
     // rules. Skipped inside code blocks, where `> ` isn't a quote marker.
@@ -497,6 +540,7 @@ pub fn build_line_render(
         image,
         code_ranges,
         inline_images,
+        inline_math,
         table: table_ref,
     }
 }
@@ -605,7 +649,17 @@ mod tests {
         let theme = EditorTheme::dracula();
         // "#1" is bytes 4..6. Cursor off the line so nothing is revealed.
         let extra = [link_region(4..6)];
-        let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &[], &extra, None);
+        let lr = build_line_render(
+            &snapshot,
+            0,
+            &theme,
+            18.0,
+            usize::MAX,
+            &[],
+            &extra,
+            None,
+            &[],
+        );
         let link_run = lr
             .runs
             .iter()
@@ -625,7 +679,7 @@ mod tests {
         let mut buffer: Buffer = "See #1 today\n".parse().unwrap();
         let snapshot = buffer.render_snapshot();
         let theme = EditorTheme::dracula();
-        let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &[], &[], None);
+        let lr = build_line_render(&snapshot, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[]);
         assert!(!lr.runs.iter().any(|r| r.underline));
     }
 
@@ -638,7 +692,7 @@ mod tests {
         let mut buf: Buffer = "- [x] done\n- [ ] todo\n".parse().unwrap();
         let snap = buf.render_snapshot();
 
-        let done = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None);
+        let done = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[]);
         assert!(
             done.runs
                 .iter()
@@ -652,7 +706,7 @@ mod tests {
             "the checkbox itself stays green"
         );
 
-        let todo = build_line_render(&snap, 1, &theme, 18.0, usize::MAX, &[], &[], None);
+        let todo = build_line_render(&snap, 1, &theme, 18.0, usize::MAX, &[], &[], None, &[]);
         assert!(
             !todo
                 .runs
@@ -671,13 +725,33 @@ mod tests {
         let snap = buf.render_snapshot();
         let styles = snap.inline_styles_by_line();
 
-        let coded = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &styles[0], &[], None);
+        let coded = build_line_render(
+            &snap,
+            0,
+            &theme,
+            18.0,
+            usize::MAX,
+            &styles[0],
+            &[],
+            None,
+            &[],
+        );
         assert_eq!(coded.code_ranges.len(), 1, "one code span");
         // The chip covers the visible `foo()` (backticks hidden off-cursor).
         let (s, e) = (coded.code_ranges[0].start, coded.code_ranges[0].end);
         assert_eq!(&coded.text[s..e], "foo()");
 
-        let plain = build_line_render(&snap, 1, &theme, 18.0, usize::MAX, &styles[1], &[], None);
+        let plain = build_line_render(
+            &snap,
+            1,
+            &theme,
+            18.0,
+            usize::MAX,
+            &styles[1],
+            &[],
+            None,
+            &[],
+        );
         assert!(plain.code_ranges.is_empty(), "no code span, no chip");
     }
 
@@ -692,13 +766,13 @@ mod tests {
         let snap = buffer.render_snapshot();
 
         // Cursor off the `---` line: text hidden, rule flagged.
-        let lr = build_line_render(&snap, 2, &theme, 18.0, 0, &[], &[], None);
+        let lr = build_line_render(&snap, 2, &theme, 18.0, 0, &[], &[], None, &[]);
         assert!(lr.is_hr, "off-line thematic break renders as a rule");
         assert!(lr.text.is_empty(), "the `---` text is hidden");
 
         // Cursor on the `---` line: text revealed, no rule.
         let on = snap.line_markers(2).range.start;
-        let lr = build_line_render(&snap, 2, &theme, 18.0, on, &[], &[], None);
+        let lr = build_line_render(&snap, 2, &theme, 18.0, on, &[], &[], None, &[]);
         assert!(!lr.is_hr, "revealed for editing when cursor is on it");
         assert_eq!(lr.text, "---");
     }
@@ -713,7 +787,17 @@ mod tests {
         let snap = buffer.render_snapshot();
         let styles = snap.inline_styles_by_line();
 
-        let off = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &styles[0], &[], None);
+        let off = build_line_render(
+            &snap,
+            0,
+            &theme,
+            18.0,
+            usize::MAX,
+            &styles[0],
+            &[],
+            None,
+            &[],
+        );
         let img = off
             .image
             .as_ref()
@@ -723,7 +807,7 @@ mod tests {
         assert!(off.text.is_empty(), "the `![alt](url)` markdown is hidden");
 
         // Cursor on the line: reveal the raw markdown, no image block.
-        let on = build_line_render(&snap, 0, &theme, 18.0, 0, &styles[0], &[], None);
+        let on = build_line_render(&snap, 0, &theme, 18.0, 0, &styles[0], &[], None, &[]);
         assert!(
             on.image.is_none(),
             "cursor on the line reveals raw markdown"
@@ -739,7 +823,17 @@ mod tests {
         let mut buffer: Buffer = "see ![a](x.png) here\n".parse().unwrap();
         let snap = buffer.render_snapshot();
         let styles = snap.inline_styles_by_line();
-        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &styles[0], &[], None);
+        let lr = build_line_render(
+            &snap,
+            0,
+            &theme,
+            18.0,
+            usize::MAX,
+            &styles[0],
+            &[],
+            None,
+            &[],
+        );
         assert!(
             lr.image.is_none(),
             "image amid other text is not standalone"
@@ -758,7 +852,17 @@ mod tests {
         let snap = buffer.render_snapshot();
         let styles = snap.inline_styles_by_line();
 
-        let off = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &styles[0], &[], None);
+        let off = build_line_render(
+            &snap,
+            0,
+            &theme,
+            18.0,
+            usize::MAX,
+            &styles[0],
+            &[],
+            None,
+            &[],
+        );
         assert_eq!(off.inline_images.len(), 2, "both inline images detected");
         assert!(
             off.inline_images[0].display_offset <= off.inline_images[1].display_offset,
@@ -772,7 +876,7 @@ mod tests {
         assert!(off.image.is_none(), "not a standalone image");
 
         // Caret inside the first image: it reveals, the second stays a box.
-        let in_first = build_line_render(&snap, 0, &theme, 18.0, 2, &styles[0], &[], None);
+        let in_first = build_line_render(&snap, 0, &theme, 18.0, 2, &styles[0], &[], None, &[]);
         assert_eq!(
             in_first.inline_images.len(),
             1,
@@ -781,7 +885,7 @@ mod tests {
         assert!(in_first.text.contains("![a]"), "caret's image shown raw");
 
         // Caret on the line but between the images: both stay boxes.
-        let between = build_line_render(&snap, 0, &theme, 18.0, 13, &styles[0], &[], None);
+        let between = build_line_render(&snap, 0, &theme, 18.0, 13, &styles[0], &[], None, &[]);
         assert_eq!(
             between.inline_images.len(),
             2,
@@ -797,13 +901,13 @@ mod tests {
 
         let mut single: Buffer = "> quoted line\n".parse().unwrap();
         let snap = single.render_snapshot();
-        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None);
+        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[]);
         assert!(!lr.text.contains('▎'), "bar must not be a text glyph");
         assert_eq!(lr.quote_bar_bytes, vec![0], "one gutter at the line start");
 
         let mut nested: Buffer = "> > deeply quoted\n".parse().unwrap();
         let snap = nested.render_snapshot();
-        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None);
+        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[]);
         assert_eq!(lr.quote_bar_bytes.len(), 2, "one gutter per nesting level");
         assert_eq!(lr.quote_bar_bytes[0], 0, "outer gutter at line start");
         assert!(
@@ -836,12 +940,13 @@ mod tests {
             &styles[0],
             &[],
             Some(ctx.clone()),
+            &[],
         );
         assert!(off.table.is_some(), "off-cursor header is a grid row");
         assert!(off.text.is_empty(), "grid row text hidden");
 
         // Cursor inside the block: reveal — raw pipe text, no table ref.
-        let on = build_line_render(&snap, 0, &theme, 18.0, 2, &styles[0], &[], Some(ctx));
+        let on = build_line_render(&snap, 0, &theme, 18.0, 2, &styles[0], &[], Some(ctx), &[]);
         assert!(on.table.is_none(), "cursor in block reveals raw text");
         assert_eq!(on.text, "| a | b |");
     }
@@ -872,6 +977,7 @@ mod tests {
             &styles[last],
             &[],
             Some(ctx),
+            &[],
         );
         assert!(
             lr.table.is_none(),

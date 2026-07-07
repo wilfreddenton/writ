@@ -29,8 +29,10 @@ use crate::editor::{Direction, EditorState};
 use crate::fold;
 use crate::git::head_blob_text;
 use crate::github::GitHubClient;
+#[cfg(feature = "math")]
+use crate::inline::detect_inline_math;
 use crate::inline::{
-    GitHubContext, GitHubRef, NakedUrl, RawGitHubMatch, detect_github_references_in_line,
+    GitHubContext, GitHubRef, MathSpan, NakedUrl, RawGitHubMatch, detect_github_references_in_line,
     detect_naked_urls,
 };
 use crate::marker::MarkerKind;
@@ -128,6 +130,9 @@ pub struct Editor {
     github_validation_cache: GitHubValidationCache,
     naked_urls_by_line: HashMap<usize, Vec<NakedUrl>>,
     github_refs_by_line: HashMap<usize, Vec<RawGitHubMatch>>,
+    /// Inline `$…$` math spans per line, from the viewport-windowed detection pass. Always
+    /// present but only populated when the `math` feature is on (empty otherwise).
+    math_spans_by_line: HashMap<usize, Vec<MathSpan>>,
     /// (buffer version, scanned line range) the cached detection reflects; lets
     /// `refresh_detection` skip the rescan when neither the text nor the scanned window
     /// changed (cursor-only rebuilds). Reset when the GitHub context changes.
@@ -171,6 +176,7 @@ impl Editor {
             github_validation_cache: GitHubValidationCache::new(),
             naked_urls_by_line: HashMap::new(),
             github_refs_by_line: HashMap::new(),
+            math_spans_by_line: HashMap::new(),
             detection_key: None,
             autocomplete: None,
             find: None,
@@ -635,6 +641,43 @@ impl Editor {
         (github_matches_by_line, urls_by_line)
     }
 
+    /// Detect inline `$…$` math over `[start, end)` (the same viewport window as
+    /// `detect_links`). `$$…$$` display blocks are collected once per build in the layout;
+    /// here they're only used to exclude a `$` that belongs to display math.
+    #[cfg(feature = "math")]
+    fn detect_math(&mut self, start: usize, end: usize) -> HashMap<usize, Vec<MathSpan>> {
+        let snapshot = self.state.buffer.render_snapshot();
+        let block_ranges: Vec<Range<usize>> = snapshot
+            .math_blocks()
+            .into_iter()
+            .map(|m| m.block)
+            .collect();
+        let mut by_line = HashMap::new();
+        for line_idx in start..end {
+            let range = snapshot.line_byte_range(line_idx);
+            let text = snapshot
+                .rope
+                .slice(
+                    snapshot.rope.byte_to_char(range.start)..snapshot.rope.byte_to_char(range.end),
+                )
+                .to_string();
+            if !text.contains('$') {
+                continue;
+            }
+            let code_ranges: Vec<Range<usize>> = snapshot
+                .inline_styles_for_line(line_idx)
+                .iter()
+                .filter(|s| s.style.code)
+                .map(|s| s.full_range.clone())
+                .collect();
+            let spans = detect_inline_math(&text, range.start, &code_ranges, &block_ranges);
+            if !spans.is_empty() {
+                by_line.insert(line_idx, spans);
+            }
+        }
+        by_line
+    }
+
     /// Re-run GitHub-ref / naked-URL detection over `lines` (clamped to the buffer) and
     /// cache the results. The caller passes the viewport (plus overscan + cursor line);
     /// every consumer — visible-line coloring, cursor-line autocomplete, and
@@ -651,7 +694,17 @@ impl Editor {
         let (refs, urls) = self.detect_links(lines.start, lines.end);
         self.github_refs_by_line = refs;
         self.naked_urls_by_line = urls;
+        #[cfg(feature = "math")]
+        {
+            self.math_spans_by_line = self.detect_math(lines.start, lines.end);
+        }
         self.detection_key = Some((version, lines));
+    }
+
+    /// Inline `$…$` math spans per line (empty for lines without any). Populated by the
+    /// viewport-windowed `refresh_detection` scan (only under the `math` feature).
+    pub fn math_spans_by_line(&self) -> &HashMap<usize, Vec<MathSpan>> {
+        &self.math_spans_by_line
     }
 
     // --- find bar -----------------------------------------------------------

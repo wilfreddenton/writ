@@ -24,11 +24,15 @@ use crate::diff::{DiffState, InlineChange};
 use crate::editor::EditorTheme;
 use crate::image_cache::{ImageCache, ImageState};
 use crate::inline::{
-    GitHubContext, NakedUrl, RawGitHubMatch, StyledRegion, github_refs_to_styled_regions,
+    GitHubContext, MathSpan, NakedUrl, RawGitHubMatch, StyledRegion, github_refs_to_styled_regions,
     naked_urls_to_styled_regions,
 };
+#[cfg(feature = "math")]
+use crate::math;
 #[cfg(feature = "mermaid")]
 use crate::mermaid;
+#[cfg(feature = "math")]
+use crate::render::InlineMathRef;
 use crate::render::{
     ImageRef, InlineImageRef, LineRender, TableCtx, build_cell_render, build_line_render,
 };
@@ -560,6 +564,11 @@ enum ImageBlockKind {
 struct InlineImageDraw {
     /// `(brush, nat_w, nat_h)` for a loaded image; `None` paints a placeholder box.
     brush: Option<(ImageBrush, f32, f32)>,
+    /// Device-px to shift the drawn image DOWN from its laid-out box position. Parley
+    /// bottom-aligns an inline box to the text baseline; math has content below the
+    /// baseline (descenders), so its image is shifted down by its descent to sit the
+    /// math baseline on the text baseline. `0.0` for ordinary images.
+    baseline_offset: f32,
 }
 
 /// Inline git-diff decorations for one real line (added-line bg + word ranges).
@@ -672,6 +681,7 @@ fn build_ghosts_before(
             &styles,
             &[],
             None,
+            &[],
         );
         let layout = engine.build_line_hanging(
             &lr.text,
@@ -796,15 +806,99 @@ fn resolve_inline_images(
                         loaded.width as f32,
                         loaded.height as f32,
                     ));
-                    (w, h, InlineImageDraw { brush })
+                    (
+                        w,
+                        h,
+                        InlineImageDraw {
+                            brush,
+                            baseline_offset: 0.0,
+                        },
+                    )
                 }
                 _ => (
                     INLINE_IMG_PLACEHOLDER_W * scale,
                     INLINE_IMG_PLACEHOLDER_H * scale,
-                    InlineImageDraw { brush: None },
+                    InlineImageDraw {
+                        brush: None,
+                        baseline_offset: 0.0,
+                    },
                 ),
             };
             inline_boxes.push((ii.display_offset, w, h));
+            draw
+        })
+        .collect();
+    (inline_boxes, draws)
+}
+
+/// Resolve a line's inline `$…$` math spans to `(inline_boxes, draws)`, mirroring
+/// [`resolve_inline_images`]. Each span's `(latex, size, color)` becomes a [`math::MathJob`]
+/// keyed into the shared image cache; a loaded render supplies the box size + a
+/// `baseline_offset` (its descent below the math baseline, so it sits on the text baseline),
+/// and loading/failed spans get a placeholder box. Jobs are collected into `math_sources`
+/// (deduped) for the shell to render off-thread.
+#[cfg(feature = "math")]
+fn resolve_inline_math(
+    inline_math: &[InlineMathRef],
+    images: &ImageCache,
+    math_sources: &mut Vec<(String, math::MathJob)>,
+    font_px: f32,
+    fg: (f32, f32, f32),
+    max_advance: f32,
+    scale: f32,
+) -> (Vec<(usize, f32, f32)>, Vec<InlineImageDraw>) {
+    let mut inline_boxes: Vec<(usize, f32, f32)> = Vec::new();
+    let draws: Vec<InlineImageDraw> = inline_math
+        .iter()
+        .map(|im| {
+            let job = math::MathJob {
+                latex: im.latex.clone(),
+                display: false,
+                font_px,
+                scale,
+                fg,
+            };
+            let key = math::key_for(&job);
+            if !math_sources.iter().any(|(k, _)| k == &key) {
+                math_sources.push((key.clone(), job));
+            }
+            let (w, h, draw) = match images.get(&key) {
+                Some(ImageState::Loaded(loaded)) => {
+                    let mut w = loaded.display_w * scale;
+                    let mut h = loaded.display_h * scale;
+                    // Descent (px below the math baseline) → shift the image down so the
+                    // math baseline lands on the text baseline Parley aligns the box to.
+                    let descent =
+                        (loaded.display_h - loaded.baseline.unwrap_or(loaded.display_h)) * scale;
+                    if w > max_advance && w > 0.0 {
+                        let s = max_advance / w;
+                        w = max_advance;
+                        h *= s;
+                    }
+                    let brush = Some((
+                        loaded.brush.clone(),
+                        loaded.width as f32,
+                        loaded.height as f32,
+                    ));
+                    (
+                        w,
+                        h,
+                        InlineImageDraw {
+                            brush,
+                            baseline_offset: descent,
+                        },
+                    )
+                }
+                _ => (
+                    INLINE_IMG_PLACEHOLDER_W * scale,
+                    INLINE_IMG_PLACEHOLDER_H * scale,
+                    InlineImageDraw {
+                        brush: None,
+                        baseline_offset: 0.0,
+                    },
+                ),
+            };
+            inline_boxes.push((im.display_offset, w, h));
             draw
         })
         .collect();
@@ -889,6 +983,10 @@ pub struct DocLayout {
     /// kick off off-thread rendering (mirrors `image_urls`).
     #[cfg(feature = "mermaid")]
     mermaid_sources: Vec<(String, String)>,
+    /// `(cache key, job)` of each materialized math render (block + inline), for the shell
+    /// to kick off off-thread rendering.
+    #[cfg(feature = "math")]
+    math_sources: Vec<(String, math::MathJob)>,
     /// Vertical padding (device px) above/below an image block, and the placeholder
     /// box colors — baked from `scale`/theme at build so the draw pass is self-contained.
     img_vpad: f32,
@@ -980,6 +1078,8 @@ impl DocLayout {
         // through the diagram shows (and copies) the source, and reveal doesn't flip-flop as
         // the drag head enters/leaves.
         selection: &Range<usize>,
+        // Inline `$…$` math spans per line (empty when the `math` feature is off).
+        math_spans: &HashMap<usize, Vec<MathSpan>>,
     ) -> Self {
         let LayoutParams {
             content_x0,
@@ -1037,6 +1137,7 @@ impl DocLayout {
             image: None,
             code_ranges: Vec::new(),
             inline_images: Vec::new(),
+            inline_math: Vec::new(),
             table: None,
         });
         // The materialized band: [measure_from_line, measured_count). Lines before
@@ -1073,6 +1174,17 @@ impl DocLayout {
         let mut image_urls: Vec<String> = Vec::new();
         #[cfg(feature = "mermaid")]
         let mut mermaid_sources: Vec<(String, String)> = Vec::new();
+        #[cfg(feature = "math")]
+        let mut math_sources: Vec<(String, math::MathJob)> = Vec::new();
+        // Scan display-math blocks once (openers can be off-screen).
+        #[cfg(feature = "math")]
+        let math_blocks = snapshot.math_blocks();
+        // Glyph color for math = theme foreground (rgb), so it's legible on the dark theme.
+        #[cfg(feature = "math")]
+        let math_fg = {
+            let c = fg.components;
+            (c[0], c[1], c[2])
+        };
         // Content width available to an image (device px), same basis as `max_advance`.
         let content_w = max_advance;
         let img_vpad = IMG_VPAD * scale;
@@ -1140,6 +1252,38 @@ impl DocLayout {
             };
             #[cfg(feature = "mermaid")]
             if let Some(m) = &mermaid
+                && i != m.anchor_line
+            {
+                heights.push(0.0);
+                layouts.push(empty_layout.clone());
+                renders.push(empty_render.clone());
+                line_ranges.push(snapshot.line_byte_range(i));
+                line_diffs.push(LineDiff::default());
+                ghosts.push(Vec::new());
+                ghost_height.push(0.0);
+                quote_bars.push(Vec::new());
+                image_blocks.push(None);
+                inline_draws.push(Vec::new());
+                table_lines.push(None);
+                continue;
+            }
+            // Display-math block ($$…$$): same as mermaid — rendered mode when the caret
+            // isn't inside and no selection overlaps; non-anchor lines collapse to zero
+            // height, the anchor draws the image below.
+            #[cfg(feature = "math")]
+            let math_block = {
+                let ls = snapshot.line_byte_range(i).start;
+                math_blocks
+                    .iter()
+                    .find(|m| m.block.contains(&ls))
+                    .filter(|m| {
+                        let selected =
+                            m.block.start < selection.end && selection.start < m.block.end;
+                        !selected && !m.block.contains(&cursor_line_start)
+                    })
+            };
+            #[cfg(feature = "math")]
+            if let Some(m) = &math_block
                 && i != m.anchor_line
             {
                 heights.push(0.0);
@@ -1231,6 +1375,55 @@ impl DocLayout {
                 table_lines.push(None);
                 continue;
             }
+            // Display-math anchor (materialized): render the math and draw it centered in
+            // place of the raw `$$…$$`; collect the job for the off-thread renderer.
+            #[cfg(feature = "math")]
+            if let Some(m) = &math_block {
+                let latex = snapshot
+                    .rope
+                    .slice(
+                        snapshot.rope.byte_to_char(m.content.start)
+                            ..snapshot.rope.byte_to_char(m.content.end),
+                    )
+                    .to_string();
+                let job = math::MathJob {
+                    latex,
+                    display: true,
+                    font_px: base_font_size * 1.1,
+                    scale,
+                    fg: math_fg,
+                };
+                let key = math::key_for(&job);
+                if !math_sources.iter().any(|(k, _)| k == &key) {
+                    math_sources.push((key.clone(), job));
+                }
+                let img = ImageRef {
+                    url: key,
+                    alt: "math".to_string(),
+                };
+                let (block, block_h) = build_image_block(images, &img, content_w, scale, img_vpad);
+                let range = snapshot.line_byte_range(i);
+                height_cache.set(render_key(version, i, cursor_component(i, &range)), block_h);
+                if i >= anchor_line {
+                    band_y += block_h;
+                    if band_y >= band_span {
+                        past_band = true;
+                        measured_count = i + 1;
+                    }
+                }
+                heights.push(block_h);
+                layouts.push(empty_layout.clone());
+                renders.push(empty_render.clone());
+                quote_bars.push(Vec::new());
+                line_ranges.push(range);
+                line_diffs.push(LineDiff::default());
+                ghosts.push(Vec::new());
+                ghost_height.push(0.0);
+                image_blocks.push(Some(block));
+                inline_draws.push(Vec::new());
+                table_lines.push(None);
+                continue;
+            }
             // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
             // `gh` is the full block height (shaped rows + estimated overflow beyond the cap).
             let (line_ghosts, gh) =
@@ -1268,6 +1461,7 @@ impl DocLayout {
                         &line_styles[i],
                         &[],
                         tc,
+                        math_spans.get(&i).map_or(&[][..], |v| v.as_slice()),
                     ))
                 })
             } else {
@@ -1280,15 +1474,33 @@ impl DocLayout {
                     &line_styles[i],
                     &extra,
                     table_ctx.clone(),
+                    math_spans.get(&i).map_or(&[][..], |v| v.as_slice()),
                 ))
             };
-            let (inline_boxes, line_inline_draws) = resolve_inline_images(
+            #[cfg_attr(not(feature = "math"), allow(unused_mut))]
+            let (mut inline_boxes, mut line_inline_draws) = resolve_inline_images(
                 &lr.inline_images,
                 images,
                 &mut image_urls,
                 max_advance,
                 scale,
             );
+            // Inline `$…$` math shares the inline-box id space with images (id = index into
+            // the combined slice), so its boxes/draws are appended after the image ones.
+            #[cfg(feature = "math")]
+            if !lr.inline_math.is_empty() {
+                let (math_boxes, math_draws) = resolve_inline_math(
+                    &lr.inline_math,
+                    images,
+                    &mut math_sources,
+                    lr.font_size,
+                    math_fg,
+                    max_advance,
+                    scale,
+                );
+                inline_boxes.extend(math_boxes);
+                line_inline_draws.extend(math_draws);
+            }
             let key = line_key(
                 &lr.text,
                 scale,
@@ -1475,6 +1687,8 @@ impl DocLayout {
             image_urls,
             #[cfg(feature = "mermaid")]
             mermaid_sources,
+            #[cfg(feature = "math")]
+            math_sources,
             img_vpad,
             img_label_size: 14.0 * scale,
             image_border: peniko_color(theme.comment),
@@ -1820,7 +2034,7 @@ impl DocLayout {
                     continue;
                 };
                 let x = self.pad_x as f64 + pib.x as f64;
-                let y = gy as f64 + pib.y as f64;
+                let y = gy as f64 + pib.y as f64 + draw.baseline_offset as f64;
                 match &draw.brush {
                     Some((brush, nat_w, nat_h)) => {
                         // draw_image paints at native pixel size, so scale box/intrinsic.
@@ -2045,6 +2259,13 @@ impl DocLayout {
     #[cfg(feature = "mermaid")]
     pub fn mermaid_sources(&self) -> &[(String, String)] {
         &self.mermaid_sources
+    }
+
+    /// `(cache key, job)` of each materialized math render, for the shell to kick off
+    /// off-thread rendering (mirrors `mermaid_sources`).
+    #[cfg(feature = "math")]
+    pub fn math_sources(&self) -> &[(String, math::MathJob)] {
+        &self.math_sources
     }
 
     /// Paint standalone-image blocks: a loaded image at its fitted device rect, or a
@@ -2323,6 +2544,7 @@ mod tests {
                         image: None,
                         code_ranges: Vec::new(),
                         inline_images: Vec::new(),
+                        inline_math: Vec::new(),
                         table: None,
                     })
                 })
@@ -2339,6 +2561,8 @@ mod tests {
             image_urls: Vec::new(),
             #[cfg(feature = "mermaid")]
             mermaid_sources: Vec::new(),
+            #[cfg(feature = "math")]
+            math_sources: Vec::new(),
             img_vpad: 0.0,
             img_label_size: 14.0,
             image_border: Color::TRANSPARENT,
@@ -2430,6 +2654,7 @@ mod tests {
             f32::INFINITY,
             &[],
             &(0..0),
+            &std::collections::HashMap::new(),
         );
         // Several buffer offsets (incl. second line) should map to a caret rect
         // whose center hit-tests back to the same offset.
@@ -2474,6 +2699,7 @@ mod tests {
                 f32::INFINITY,
                 folds,
                 &(0..0),
+                &std::collections::HashMap::new(),
             )
         };
         let full = build(&mut engine, &[]);
@@ -2538,6 +2764,7 @@ mod tests {
                 f32::INFINITY,
                 &[],
                 &(0..0),
+                &std::collections::HashMap::new(),
             )
         };
         let doc = build(&params);
@@ -2601,6 +2828,7 @@ mod tests {
             f32::INFINITY,
             &[],
             &(0..0),
+            &std::collections::HashMap::new(),
         );
 
         // A mid-document line: its top pins to the viewport top exactly.
@@ -2653,6 +2881,7 @@ mod tests {
             f32::INFINITY,
             &[],
             &(0..0),
+            &std::collections::HashMap::new(),
         );
         // Line 0's changed version has a deleted ghost stacked above it.
         assert!(doc.ghost_height[0] > 0.0, "expected a ghost above line 0");
@@ -2701,6 +2930,7 @@ mod tests {
             f32::INFINITY,
             &[],
             &(0..0),
+            &std::collections::HashMap::new(),
         );
         assert!(
             !doc.trailing_ghosts.is_empty(),
@@ -2748,6 +2978,7 @@ mod tests {
                 f32::INFINITY,
                 &[],
                 &(0..0),
+                &std::collections::HashMap::new(),
             )
         };
         let t0 = Instant::now();
@@ -2804,6 +3035,7 @@ mod tests {
                     f32::INFINITY,
                     &[],
                     &(0..0),
+                    &std::collections::HashMap::new(),
                 )
             };
 
@@ -2858,6 +3090,7 @@ mod tests {
             viewport_h,
             &[],
             &(0..0),
+            &std::collections::HashMap::new(),
         );
         let n = doc.line_count();
         assert!(n >= 3000);
@@ -2925,6 +3158,7 @@ mod tests {
             viewport_h,
             &[],
             &(0..0),
+            &std::collections::HashMap::new(),
         );
         let n = doc.line_count();
         // Head virtualized: the band starts near the anchor, not at line 0.
@@ -3118,6 +3352,7 @@ mod tests {
             f32::INFINITY,
             &[],
             &(0..0),
+            &std::collections::HashMap::new(),
         );
         // Table lines are the header/delimiter/body rows.
         for (line, want) in [
@@ -3183,6 +3418,7 @@ mod tests {
                 f32::INFINITY,
                 &[],
                 &(0..0),
+                &std::collections::HashMap::new(),
             )
         };
         // Cursor off the table (past the end): grid mode, header row hidden + flagged.
@@ -3231,6 +3467,7 @@ mod tests {
             f32::INFINITY,
             &[],
             &(0..0),
+            &std::collections::HashMap::new(),
         )
     }
 
