@@ -79,12 +79,107 @@ impl EditorTheme {
         }
     }
 
+    /// The Solarized Dark color theme (companion to [`solarized_light`](Self::solarized_light)).
+    pub fn solarized_dark() -> Self {
+        Self {
+            background: Color::from_rgba8(0x00, 0x2B, 0x36, 0xFF),
+            surface: Color::from_rgba8(0x07, 0x36, 0x42, 0xFF),
+            foreground: Color::from_rgba8(0x83, 0x94, 0x96, 0xFF),
+            selection: Color::from_rgba8(0x0A, 0x4B, 0x5C, 0xFF),
+            comment: Color::from_rgba8(0x58, 0x6E, 0x75, 0xFF),
+            red: Color::from_rgba8(0xDC, 0x32, 0x2F, 0xFF),
+            orange: Color::from_rgba8(0xCB, 0x4B, 0x16, 0xFF),
+            yellow: Color::from_rgba8(0xB5, 0x89, 0x00, 0xFF),
+            green: Color::from_rgba8(0x85, 0x99, 0x00, 0xFF),
+            cyan: Color::from_rgba8(0x2A, 0xA1, 0x98, 0xFF),
+            purple: Color::from_rgba8(0x6C, 0x71, 0xC4, 0xFF),
+            pink: Color::from_rgba8(0xD3, 0x36, 0x82, 0xFF),
+        }
+    }
+
+    /// The Gruvbox Dark color theme: keywords red, types aqua, strings green.
+    pub fn gruvbox_dark() -> Self {
+        Self {
+            background: Color::from_rgba8(0x28, 0x28, 0x28, 0xFF),
+            surface: Color::from_rgba8(0x1D, 0x20, 0x21, 0xFF),
+            foreground: Color::from_rgba8(0xEB, 0xDB, 0xB2, 0xFF),
+            selection: Color::from_rgba8(0x50, 0x49, 0x45, 0xFF),
+            comment: Color::from_rgba8(0x92, 0x83, 0x74, 0xFF),
+            red: Color::from_rgba8(0xFB, 0x49, 0x34, 0xFF),
+            orange: Color::from_rgba8(0xFE, 0x80, 0x19, 0xFF),
+            yellow: Color::from_rgba8(0xFA, 0xBD, 0x2F, 0xFF),
+            green: Color::from_rgba8(0xB8, 0xBB, 0x26, 0xFF),
+            cyan: Color::from_rgba8(0x8E, 0xC0, 0x7C, 0xFF),
+            purple: Color::from_rgba8(0xD3, 0x86, 0x9B, 0xFF),
+            pink: Color::from_rgba8(0xFB, 0x49, 0x34, 0xFF),
+        }
+    }
+
+    /// The Tokyo Night color theme (dark): keywords magenta, types cyan.
+    pub fn tokyo_night() -> Self {
+        Self {
+            background: Color::from_rgba8(0x1A, 0x1B, 0x26, 0xFF),
+            surface: Color::from_rgba8(0x16, 0x16, 0x1E, 0xFF),
+            foreground: Color::from_rgba8(0xC0, 0xCA, 0xF5, 0xFF),
+            selection: Color::from_rgba8(0x33, 0x46, 0x7C, 0xFF),
+            comment: Color::from_rgba8(0x56, 0x5F, 0x89, 0xFF),
+            red: Color::from_rgba8(0xF7, 0x76, 0x8E, 0xFF),
+            orange: Color::from_rgba8(0xFF, 0x9E, 0x64, 0xFF),
+            yellow: Color::from_rgba8(0xE0, 0xAF, 0x68, 0xFF),
+            green: Color::from_rgba8(0x9E, 0xCE, 0x6A, 0xFF),
+            cyan: Color::from_rgba8(0x7D, 0xCF, 0xFF, 0xFF),
+            purple: Color::from_rgba8(0xBB, 0x9A, 0xF7, 0xFF),
+            pink: Color::from_rgba8(0xBB, 0x9A, 0xF7, 0xFF),
+        }
+    }
+
+    /// The Catppuccin Mocha color theme (dark): keywords mauve, types teal.
+    pub fn catppuccin_mocha() -> Self {
+        Self {
+            background: Color::from_rgba8(0x1E, 0x1E, 0x2E, 0xFF),
+            surface: Color::from_rgba8(0x18, 0x18, 0x25, 0xFF),
+            foreground: Color::from_rgba8(0xCD, 0xD6, 0xF4, 0xFF),
+            selection: Color::from_rgba8(0x45, 0x47, 0x5A, 0xFF),
+            comment: Color::from_rgba8(0x93, 0x99, 0xB2, 0xFF),
+            red: Color::from_rgba8(0xF3, 0x8B, 0xA8, 0xFF),
+            orange: Color::from_rgba8(0xFA, 0xB3, 0x87, 0xFF),
+            yellow: Color::from_rgba8(0xF9, 0xE2, 0xAF, 0xFF),
+            green: Color::from_rgba8(0xA6, 0xE3, 0xA1, 0xFF),
+            cyan: Color::from_rgba8(0x94, 0xE2, 0xD5, 0xFF),
+            purple: Color::from_rgba8(0xCB, 0xA6, 0xF7, 0xFF),
+            pink: Color::from_rgba8(0xCB, 0xA6, 0xF7, 0xFF),
+        }
+    }
+
+    /// The Catppuccin Latte color theme (light): keywords mauve, types teal.
+    pub fn catppuccin_latte() -> Self {
+        Self {
+            background: Color::from_rgba8(0xEF, 0xF1, 0xF5, 0xFF),
+            surface: Color::from_rgba8(0xE6, 0xE9, 0xEF, 0xFF),
+            foreground: Color::from_rgba8(0x4C, 0x4F, 0x69, 0xFF),
+            selection: Color::from_rgba8(0xBC, 0xC0, 0xCC, 0xFF),
+            comment: Color::from_rgba8(0x8C, 0x8F, 0xA1, 0xFF),
+            red: Color::from_rgba8(0xD2, 0x0F, 0x39, 0xFF),
+            orange: Color::from_rgba8(0xFE, 0x64, 0x0B, 0xFF),
+            yellow: Color::from_rgba8(0xDF, 0x8E, 0x1D, 0xFF),
+            green: Color::from_rgba8(0x40, 0xA0, 0x2B, 0xFF),
+            cyan: Color::from_rgba8(0x17, 0x92, 0x99, 0xFF),
+            purple: Color::from_rgba8(0x88, 0x39, 0xEF, 0xFF),
+            pink: Color::from_rgba8(0x88, 0x39, 0xEF, 0xFF),
+        }
+    }
+
     /// A built-in theme by its config name, or `None` if unknown.
     pub fn by_name(name: &str) -> Option<Self> {
         match name {
             "dracula" => Some(Self::dracula()),
             "nord" => Some(Self::nord()),
             "solarized-light" => Some(Self::solarized_light()),
+            "solarized-dark" => Some(Self::solarized_dark()),
+            "gruvbox-dark" => Some(Self::gruvbox_dark()),
+            "tokyo-night" => Some(Self::tokyo_night()),
+            "catppuccin-mocha" => Some(Self::catppuccin_mocha()),
+            "catppuccin-latte" => Some(Self::catppuccin_latte()),
             _ => None,
         }
     }
@@ -126,5 +221,39 @@ impl EditorTheme {
 impl Default for EditorTheme {
     fn default() -> Self {
         Self::dracula()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every built-in preset resolves, and no two share a background — a cheap guard
+    /// against a copy-paste slip leaving two presets identical.
+    #[test]
+    fn presets_resolve_and_are_distinct() {
+        let names = [
+            "dracula",
+            "nord",
+            "solarized-light",
+            "solarized-dark",
+            "gruvbox-dark",
+            "tokyo-night",
+            "catppuccin-mocha",
+            "catppuccin-latte",
+        ];
+        let mut backgrounds = Vec::new();
+        for name in names {
+            let theme = EditorTheme::by_name(name)
+                .unwrap_or_else(|| panic!("preset '{name}' should resolve"));
+            let bg = theme.background.to_rgba8();
+            let key = (bg.r, bg.g, bg.b);
+            assert!(
+                !backgrounds.contains(&key),
+                "preset '{name}' shares a background with another preset"
+            );
+            backgrounds.push(key);
+        }
+        assert!(EditorTheme::by_name("does-not-exist").is_none());
     }
 }

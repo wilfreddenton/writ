@@ -9,8 +9,9 @@ family = "JetBrains Mono"
 size = 18.0
 
 [theme]
-# A built-in preset — "dracula" (default), "nord", or "solarized-light" — or the name
-# of a custom [themes.*] you define below.
+# A built-in preset, or the name of a custom [themes.*] you define below. Built-ins:
+#   dark:  dracula (default), nord, solarized-dark, gruvbox-dark, tokyo-night, catppuccin-mocha
+#   light: solarized-light, catppuccin-latte
 name = "dracula"
 
 # Optional per-color tweaks applied on top of the selected theme. Colors are hex,
@@ -24,16 +25,10 @@ name = "dracula"
 
 # Define your own themes here, then select one with `name` above. Any color you omit
 # is inherited from dracula. A [themes.<name>] shadows a built-in of the same name.
-[themes.gruvbox-dark]
-background = "#282828"
-surface    = "#1D2021"
-foreground = "#EBDBB2"
-selection  = "#504945"
-comment    = "#928374"
-red        = "#FB4934"
-orange     = "#FE8019"
-yellow     = "#FABD2F"
-green      = "#B8BB26"
-cyan       = "#8EC07C"
-purple     = "#D3869B"
-pink       = "#FB4934"
+[themes.my-midnight]
+background = "#0B0E14"
+foreground = "#BFBDB6"
+comment    = "#4D5566"
+pink       = "#FF8F40"
+cyan       = "#59C2FF"
+green      = "#AAD94C"

@@ -43,13 +43,13 @@ family = "JetBrains Mono"   # must be monospace; verified at startup, falls back
 size = 18.0
 
 [theme]
-name = "nord"               # built-in: dracula (default), nord, solarized-light — or a [themes.*] you define
+name = "nord"               # a built-in preset (see below) or a [themes.*] you define
 
 [theme.overrides]           # optional per-color hex tweaks on top of the selected theme
 comment = "#7A88B8"
 ```
 
-- **Themes.** Pick a built-in preset by `name`, or define your own under `[themes.<name>]` (any omitted color is inherited from dracula) and select it. `[theme.overrides]` applies hex tweaks on top. The 12 color slots are `background`, `surface`, `foreground`, `selection`, `comment`, `red`, `orange`, `yellow`, `green`, `cyan`, `purple`, `pink`.
+- **Themes.** Pick a built-in preset by `name` — dark: `dracula` (default), `nord`, `solarized-dark`, `gruvbox-dark`, `tokyo-night`, `catppuccin-mocha`; light: `solarized-light`, `catppuccin-latte` — or define your own under `[themes.<name>]` (any omitted color is inherited from dracula) and select it. `[theme.overrides]` applies hex tweaks on top. The 12 color slots are `background`, `surface`, `foreground`, `selection`, `comment`, `red`, `orange`, `yellow`, `green`, `cyan`, `purple`, `pink`.
 - **Font.** The family **must be monospace** — writ verifies fixed-pitch at startup and falls back to the system monospace (with a warning) if the font is proportional or not installed, protecting its deterministic wrapping.
 - Config is read once at startup; edits take effect on the next launch.
 
