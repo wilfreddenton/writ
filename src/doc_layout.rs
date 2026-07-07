@@ -967,6 +967,71 @@ const MEASURE_OVERSCAN_PX: f32 = 800.0;
 /// layout even when the cursor briefly outruns the scroll position).
 const MEASURE_OVERSCAN_LINES: usize = 30;
 
+/// The 11 parallel per-line output vectors accumulated by `DocLayout::build`, kept in
+/// one struct so a placeholder row (hidden line or image-block anchor) is a single
+/// `push_placeholder` call instead of 11 hand-aligned pushes — the "add a field, forget
+/// a vector" hazard. Destructured into `DocLayout`'s fields at construction.
+struct Bands {
+    heights: Vec<f32>,
+    layouts: Vec<Rc<parley::Layout<Brush>>>,
+    renders: Vec<Rc<LineRender>>,
+    line_ranges: Vec<Range<usize>>,
+    line_diffs: Vec<LineDiff>,
+    ghosts: Vec<Vec<Ghost>>,
+    ghost_height: Vec<f32>,
+    quote_bars: Vec<Vec<f32>>,
+    image_blocks: Vec<Option<ImageBlock>>,
+    inline_draws: Vec<Vec<InlineImageDraw>>,
+    table_lines: Vec<Option<(Rc<TableLayout>, RowKind)>>,
+    empty_layout: Rc<parley::Layout<Brush>>,
+    empty_render: Rc<LineRender>,
+}
+
+impl Bands {
+    fn new(
+        n: usize,
+        empty_layout: Rc<parley::Layout<Brush>>,
+        empty_render: Rc<LineRender>,
+    ) -> Self {
+        Bands {
+            heights: Vec::with_capacity(n),
+            layouts: Vec::with_capacity(n),
+            renders: Vec::with_capacity(n),
+            line_ranges: Vec::with_capacity(n),
+            line_diffs: Vec::with_capacity(n),
+            ghosts: Vec::with_capacity(n),
+            ghost_height: Vec::with_capacity(n),
+            quote_bars: Vec::with_capacity(n),
+            image_blocks: Vec::with_capacity(n),
+            inline_draws: Vec::with_capacity(n),
+            table_lines: Vec::with_capacity(n),
+            empty_layout,
+            empty_render,
+        }
+    }
+
+    /// A non-materialized row: a hidden line (`height` 0, `image_block` None) or an
+    /// image-block anchor (its block height + `Some(block)`). Everything else empty.
+    fn push_placeholder(
+        &mut self,
+        height: f32,
+        range: Range<usize>,
+        image_block: Option<ImageBlock>,
+    ) {
+        self.heights.push(height);
+        self.layouts.push(self.empty_layout.clone());
+        self.renders.push(self.empty_render.clone());
+        self.line_ranges.push(range);
+        self.line_diffs.push(LineDiff::default());
+        self.ghosts.push(Vec::new());
+        self.ghost_height.push(0.0);
+        self.quote_bars.push(Vec::new());
+        self.image_blocks.push(image_block);
+        self.inline_draws.push(Vec::new());
+        self.table_lines.push(None);
+    }
+}
+
 pub struct DocLayout {
     layouts: Vec<Rc<parley::Layout<Brush>>>,
     /// Per-line render results (shared with the RenderCache via `Rc`), parallel to
@@ -1171,16 +1236,7 @@ impl DocLayout {
         // Scan mermaid fences once, not per line (a per-line info-string check allocates).
         #[cfg(feature = "mermaid")]
         let mermaid_blocks = snapshot.mermaid_blocks();
-        let mut layouts = Vec::with_capacity(n);
-        let mut renders = Vec::with_capacity(n);
-        let mut line_ranges = Vec::with_capacity(n);
-        let mut line_diffs = Vec::with_capacity(n);
-        let mut ghosts = Vec::with_capacity(n);
-        let mut ghost_height = Vec::with_capacity(n);
-        let mut quote_bars: Vec<Vec<f32>> = Vec::with_capacity(n);
-        let mut image_blocks: Vec<Option<ImageBlock>> = Vec::with_capacity(n);
-        let mut inline_draws: Vec<Vec<InlineImageDraw>> = Vec::with_capacity(n);
-        let mut table_lines: Vec<Option<(Rc<TableLayout>, RowKind)>> = Vec::with_capacity(n);
+        let mut bands = Bands::new(n, empty_layout.clone(), empty_render.clone());
         let mut image_urls: Vec<String> = Vec::new();
         #[cfg(feature = "mermaid")]
         let mut mermaid_sources: Vec<(String, String)> = Vec::new();
@@ -1199,7 +1255,6 @@ impl DocLayout {
         let content_w = max_advance;
         let img_vpad = IMG_VPAD * scale;
         // Each line's total height = its ghost block above + the real line.
-        let mut heights = Vec::with_capacity(n);
         // Cursor component of a line's render key. Table rows share block-reveal state
         // (all flip together when the cursor enters/leaves the block) — except the row
         // the cursor actually sits on, which reveals its own markers. Three distinct
@@ -1231,17 +1286,7 @@ impl DocLayout {
                 fold_idx += 1;
             }
             if fold_idx < folds.len() && folds[fold_idx].start <= i {
-                heights.push(0.0);
-                layouts.push(empty_layout.clone());
-                renders.push(empty_render.clone());
-                line_ranges.push(snapshot.line_byte_range(i));
-                line_diffs.push(LineDiff::default());
-                ghosts.push(Vec::new());
-                ghost_height.push(0.0);
-                quote_bars.push(Vec::new());
-                image_blocks.push(None);
-                inline_draws.push(Vec::new());
-                table_lines.push(None);
+                bands.push_placeholder(0.0, snapshot.line_byte_range(i), None);
                 continue;
             }
             // Mermaid fence (diagram mode = caret outside the fence). Its non-anchor lines
@@ -1263,17 +1308,7 @@ impl DocLayout {
             if let Some(m) = &mermaid
                 && i != m.anchor_line
             {
-                heights.push(0.0);
-                layouts.push(empty_layout.clone());
-                renders.push(empty_render.clone());
-                line_ranges.push(snapshot.line_byte_range(i));
-                line_diffs.push(LineDiff::default());
-                ghosts.push(Vec::new());
-                ghost_height.push(0.0);
-                quote_bars.push(Vec::new());
-                image_blocks.push(None);
-                inline_draws.push(Vec::new());
-                table_lines.push(None);
+                bands.push_placeholder(0.0, snapshot.line_byte_range(i), None);
                 continue;
             }
             // Display-math block ($$…$$): same as mermaid — rendered mode when the caret
@@ -1294,17 +1329,7 @@ impl DocLayout {
             if let Some(m) = &math_block
                 && i != m.anchor_line
             {
-                heights.push(0.0);
-                layouts.push(empty_layout.clone());
-                renders.push(empty_render.clone());
-                line_ranges.push(snapshot.line_byte_range(i));
-                line_diffs.push(LineDiff::default());
-                ghosts.push(Vec::new());
-                ghost_height.push(0.0);
-                quote_bars.push(Vec::new());
-                image_blocks.push(None);
-                inline_draws.push(Vec::new());
-                table_lines.push(None);
+                bands.push_placeholder(0.0, snapshot.line_byte_range(i), None);
                 continue;
             }
             // Estimate the head (above the band) and the tail (once the band has covered
@@ -1327,17 +1352,17 @@ impl DocLayout {
                 // estimate it (deleted-line count × row height) so the scroll extent stays
                 // stable instead of jumping when the line scrolls into the materialized band.
                 let gh = estimate_ghost_height(diff, i, min_row);
-                heights.push(gh + h);
-                layouts.push(empty_layout.clone());
-                renders.push(empty_render.clone());
-                line_ranges.push(range);
-                line_diffs.push(LineDiff::default());
-                ghosts.push(Vec::new());
-                ghost_height.push(gh);
-                quote_bars.push(Vec::new());
-                image_blocks.push(None);
-                inline_draws.push(Vec::new());
-                table_lines.push(None);
+                bands.heights.push(gh + h);
+                bands.layouts.push(empty_layout.clone());
+                bands.renders.push(empty_render.clone());
+                bands.line_ranges.push(range);
+                bands.line_diffs.push(LineDiff::default());
+                bands.ghosts.push(Vec::new());
+                bands.ghost_height.push(gh);
+                bands.quote_bars.push(Vec::new());
+                bands.image_blocks.push(None);
+                bands.inline_draws.push(Vec::new());
+                bands.table_lines.push(None);
                 continue;
             }
             // Mermaid anchor (materialized): draw the diagram (or placeholder) in place of
@@ -1370,17 +1395,7 @@ impl DocLayout {
                         measured_count = i + 1;
                     }
                 }
-                heights.push(block_h);
-                layouts.push(empty_layout.clone());
-                renders.push(empty_render.clone());
-                quote_bars.push(Vec::new());
-                line_ranges.push(range);
-                line_diffs.push(LineDiff::default());
-                ghosts.push(Vec::new());
-                ghost_height.push(0.0);
-                image_blocks.push(Some(block));
-                inline_draws.push(Vec::new());
-                table_lines.push(None);
+                bands.push_placeholder(block_h, range, Some(block));
                 continue;
             }
             // Display-math anchor (materialized): render the math and draw it centered in
@@ -1419,17 +1434,7 @@ impl DocLayout {
                         measured_count = i + 1;
                     }
                 }
-                heights.push(block_h);
-                layouts.push(empty_layout.clone());
-                renders.push(empty_render.clone());
-                quote_bars.push(Vec::new());
-                line_ranges.push(range);
-                line_diffs.push(LineDiff::default());
-                ghosts.push(Vec::new());
-                ghost_height.push(0.0);
-                image_blocks.push(Some(block));
-                inline_draws.push(Vec::new());
-                table_lines.push(None);
+                bands.push_placeholder(block_h, range, Some(block));
                 continue;
             }
             // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
@@ -1688,17 +1693,17 @@ impl DocLayout {
                     measured_count = i + 1;
                 }
             }
-            heights.push(total_h);
-            layouts.push(layout);
-            renders.push(lr);
-            quote_bars.push(bars);
-            line_ranges.push(range);
-            line_diffs.push(line_diff);
-            ghosts.push(line_ghosts);
-            ghost_height.push(gh);
-            image_blocks.push(image_block);
-            inline_draws.push(line_inline_draws);
-            table_lines.push(table_line);
+            bands.heights.push(total_h);
+            bands.layouts.push(layout);
+            bands.renders.push(lr);
+            bands.quote_bars.push(bars);
+            bands.line_ranges.push(range);
+            bands.line_diffs.push(line_diff);
+            bands.ghosts.push(line_ghosts);
+            bands.ghost_height.push(gh);
+            bands.image_blocks.push(image_block);
+            bands.inline_draws.push(line_inline_draws);
+            bands.table_lines.push(table_line);
         }
         cache.sweep();
         render_cache.sweep();
@@ -1716,6 +1721,20 @@ impl DocLayout {
             deleted_bg: peniko_color_alpha(theme.red, 0.15),
             deleted_inline: peniko_color_alpha(theme.red, 0.40),
         };
+        let Bands {
+            heights,
+            layouts,
+            renders,
+            line_ranges,
+            line_diffs,
+            ghosts,
+            ghost_height,
+            quote_bars,
+            image_blocks,
+            inline_draws,
+            table_lines,
+            ..
+        } = bands;
         Self {
             layouts,
             renders,
