@@ -1,0 +1,39 @@
+# writ configuration — copy to ~/.config/writ/config.toml (or pass --config <path>).
+# Everything here is optional; omitted keys fall back to the built-in defaults.
+
+[font]
+# A monospace font family. writ verifies it is fixed-pitch at startup and falls back
+# to the system monospace (with a warning) if it isn't, or if the font isn't installed.
+family = "JetBrains Mono"
+# Base font size in logical pixels (default 18, clamped to 6–96).
+size = 18.0
+
+[theme]
+# A built-in preset — "dracula" (default), "nord", or "solarized-light" — or the name
+# of a custom [themes.*] you define below.
+name = "dracula"
+
+# Optional per-color tweaks applied on top of the selected theme. Colors are hex,
+# "#RRGGBB" or "#RRGGBBAA". The 12 slots are:
+#   background surface foreground selection comment
+#   red orange yellow green cyan purple pink
+# Syntax mapping: keyword/operator = pink, function = green, type = cyan,
+# string = yellow, number/constant = purple, comment = comment.
+[theme.overrides]
+# comment = "#7A88B8"
+
+# Define your own themes here, then select one with `name` above. Any color you omit
+# is inherited from dracula. A [themes.<name>] shadows a built-in of the same name.
+[themes.gruvbox-dark]
+background = "#282828"
+surface    = "#1D2021"
+foreground = "#EBDBB2"
+selection  = "#504945"
+comment    = "#928374"
+red        = "#FB4934"
+orange     = "#FE8019"
+yellow     = "#FABD2F"
+green      = "#B8BB26"
+cyan       = "#8EC07C"
+purple     = "#D3869B"
+pink       = "#FB4934"

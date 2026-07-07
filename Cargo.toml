@@ -48,7 +48,7 @@ math = ["dep:ratex-parser", "dep:ratex-layout", "dep:ratex-render", "dep:ratex-t
 editor = ["git", "github", "watch"]
 
 # the desktop editor application (winit shell). implies editor.
-app = ["editor", "remote-images", "mermaid", "math", "dep:winit", "dep:arboard", "dep:open", "dep:clap"]
+app = ["editor", "remote-images", "mermaid", "math", "dep:winit", "dep:arboard", "dep:open", "dep:clap", "dep:toml", "dep:dirs"]
 
 # the GhostText daemon (writd binary)
 ghosttext = ["app", "dep:tokio-tungstenite", "dep:futures"]
@@ -88,6 +88,8 @@ rustls = { version = "0.23.36", features = ["ring"], optional = true }
 unicode-segmentation = "1.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
+toml = { version = "0.8", optional = true }
+dirs = { version = "5", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 tokio-tungstenite = { version = "0.29", optional = true }
 tree-sitter = "0.26"

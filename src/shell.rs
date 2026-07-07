@@ -39,7 +39,7 @@ use winit::event_loop::ControlFlow;
 
 use crate::buffer::Buffer;
 use crate::chrome::{BarRect, FindButtonRects, StatusInfo, draw_find_bar, draw_status_bar};
-use crate::config::Config;
+use crate::config::{self, Config, ResolvedConfig};
 use crate::consts::{
     CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, OUTLINE_WIDTH, PADDING, STATUS_BAR_H,
     WHEEL_LINE_STEP,
@@ -303,6 +303,8 @@ struct DocEngine {
     height_cache: HeightCache,
     table_cache: TableCache,
     theme: EditorTheme,
+    /// Base document font size (logical px), from config; defaults to `FONT_SIZE`.
+    font_size: f32,
     editor: Editor,
     doc: Option<DocLayout>,
     /// Shared cache of decoded standalone images, threaded into `DocLayout::build`.
@@ -381,10 +383,21 @@ struct App {
 impl App {
     fn new(
         mut editor: Editor,
+        config: ResolvedConfig,
         proxy: EventLoopProxy<WritEvent>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
         let title = window_title(&editor);
+        // Apply the configured font family, but only if it renders fixed-pitch — a
+        // proportional (or unloadable) family would break writ's deterministic wrapping.
+        let mut text_engine = TextEngine::new();
+        if let Some(family) = config.font_family {
+            text_engine.set_font_family(Some(family.clone()));
+            if !text_engine.is_monospace() {
+                eprintln!("[writ] config: font '{family}' is not monospace; using the default");
+                text_engine.set_font_family(None);
+            }
+        }
         // Forward file-watch notifications into the loop so it can park on `Wait`
         // rather than polling on a timer. The thread ends when the watcher (and its
         // sender) drop at app exit, making `recv()` return `Err`.
@@ -404,12 +417,13 @@ impl App {
             state: None,
             scene: Scene::new(),
             doc_engine: DocEngine {
-                text_engine: TextEngine::new(),
+                text_engine,
                 line_cache: LineCache::new(),
                 render_cache: RenderCache::new(),
                 height_cache: HeightCache::new(),
                 table_cache: TableCache::new(),
-                theme: EditorTheme::dracula(),
+                theme: config.theme,
+                font_size: config.font_size,
                 editor,
                 doc: None,
                 images: ImageCache::new(),
@@ -948,7 +962,7 @@ impl DocEngine {
             pad_x: PADDING,
             pad_top: PADDING,
             pad_bottom: PADDING * 2.0,
-            base_font_size: FONT_SIZE,
+            base_font_size: self.font_size,
             line_height: LINE_HEIGHT,
             fg: peniko_color(self.theme.foreground),
         };
@@ -2651,32 +2665,34 @@ pub fn run() -> Result<()> {
         return snapshot(&path, w, h, scroll);
     }
 
-    let editor = load_editor_from_cli();
+    let (editor, app_config) = load_editor_from_cli();
     let event_loop = EventLoop::<WritEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(editor, proxy, runtime.handle().clone());
+    let mut app = App::new(editor, app_config, proxy, runtime.handle().clone());
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
 /// Build the editor from CLI args: open the `--file`, set GitHub context, and start
 /// watching the file for external edits (the pivot use case — an agent edits the
-/// file, writ shows the live diff). With no args, falls back to the sample doc.
-fn load_editor_from_cli() -> Editor {
+/// file, writ shows the live diff). With no args, falls back to the sample doc. Also
+/// loads the user config (theme + font) from `--config` or the default location.
+fn load_editor_from_cli() -> (Editor, ResolvedConfig) {
     use clap::Parser;
 
-    // No args → the demo showcase.
+    // No args → the demo showcase with default config.
     if std::env::args().len() <= 1 {
-        return demo_editor();
+        return (demo_editor(), ResolvedConfig::default());
     }
 
     let config = Config::parse();
+    let app_config = config::load(config.config.as_deref());
     // `--demo`: showcase doc with a synthetic HEAD diff (no file needed).
     if config.demo {
-        return demo_editor();
+        return (demo_editor(), app_config);
     }
     let Some(path) = config.file.clone() else {
-        return demo_editor();
+        return (demo_editor(), app_config);
     };
 
     let mut editor = Editor::open(&path);
@@ -2701,7 +2717,7 @@ fn load_editor_from_cli() -> Editor {
     if let Err(e) = editor.watch_file() {
         eprintln!("[writ] file watch failed: {e}");
     }
-    editor
+    (editor, app_config)
 }
 
 /// Synchronously validate every detected GitHub ref (blocking on the current tokio
@@ -2789,6 +2805,8 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     // Headless snapshots never open the find bar, so no find-bar inset.
     let (content_top, editor_h) = chrome_metrics(1.0, height as f32, 0.0);
     // Reuse the shared rebuild path (caches + Parley/Vello engine) headlessly.
+    // Snapshots stay on the built-in defaults (no user config) so golden frames are
+    // stable across machines.
     let mut de = DocEngine {
         text_engine: TextEngine::new(),
         line_cache: LineCache::new(),
@@ -2796,6 +2814,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         height_cache: HeightCache::new(),
         table_cache: TableCache::new(),
         theme: EditorTheme::dracula(),
+        font_size: FONT_SIZE,
         editor,
         doc: None,
         images: ImageCache::new(),
