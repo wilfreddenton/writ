@@ -22,10 +22,12 @@ fn span(range: std::ops::Range<usize>, highlight_id: usize) -> HighlightSpan {
 
 // --- Mermaid ---------------------------------------------------------------------------
 
-/// Diagram-type + structural statement words → `@keyword`. Matched case-insensitively
-/// (the grammar itself lexes several of these case-insensitively). Stored lowercase.
-const MERMAID_KEYWORDS: &[&str] = &[
-    // diagram types
+/// Structural words shared across diagram types → `@keyword`, plus every diagram-type
+/// header (so the first word always colors). Stored lowercase; matched case-insensitively.
+/// Type-SPECIFIC vocabularies live in [`mermaid_type_keywords`] so a word like gitGraph's
+/// `order` or requirement's `contains` can't false-positive on a flowchart node id.
+const MERMAID_COMMON: &[&str] = &[
+    // diagram-type headers
     "graph",
     "flowchart",
     "sequencediagram",
@@ -39,78 +41,212 @@ const MERMAID_KEYWORDS: &[&str] = &[
     "mindmap",
     "timeline",
     "quadrantchart",
+    "requirement",
     "requirementdiagram",
-    // structural / statement leads
+    "c4context",
+    "c4container",
+    "c4component",
+    "c4dynamic",
+    "c4deployment",
+    "sankey",
+    "xychart",
+    "block",
+    "packet",
+    "architecture",
+    "radar",
+    "kanban",
+    "treemap",
+    "zenuml",
+    "info",
+    // structural leads common to many types
     "subgraph",
     "end",
-    "participant",
-    "actor",
-    "as",
-    "activate",
-    "deactivate",
-    "note",
-    "over",
-    "loop",
-    "alt",
-    "else",
-    "opt",
-    "par",
-    "and",
-    "rect",
-    "break",
-    "critical",
-    "option",
-    "class",
-    "state",
-    "section",
-    "title",
     "direction",
-    "acctitle",
-    "accdescr",
-    // gantt
-    "dateformat",
-    "axisformat",
-    "excludes",
-    "includes",
-    "todaymarker",
-    "inclusiveenddates",
-    "topaxis",
-    "tickinterval",
-    // flowchart directives / git
     "click",
     "style",
-    "linkstyle",
     "classdef",
+    "linkstyle",
     "callback",
-    "link",
     "href",
-    "commit",
-    "branch",
-    "checkout",
-    "merge",
-    "autonumber",
-    // ER key modifiers
-    "pk",
-    "fk",
-    "uk",
+    "acctitle",
+    "accdescr",
+    "title",
+    "section",
 ];
 
-/// Flowchart directions → `@constant` (unanimous across grammars; distinct from keywords).
+/// Diagram directions → `@constant` (distinct from keywords). Only honored in flowchart/graph
+/// so a bare `lr`/`bt` node id elsewhere isn't miscolored.
 const MERMAID_DIRECTIONS: &[&str] = &["tb", "td", "bt", "rl", "lr"];
 
+/// Keyword vocabulary specific to a diagram type — applied ON TOP of [`MERMAID_COMMON`] only
+/// when the block's header matches, so cross-type collisions (a flowchart node named `commit`
+/// or `system`) don't light up. Keyed by the lowercased first header word.
+fn mermaid_type_keywords(header: &str) -> &'static [&'static str] {
+    match header {
+        "sequencediagram" => &[
+            "participant",
+            "actor",
+            "as",
+            "activate",
+            "deactivate",
+            "note",
+            "over",
+            "left",
+            "right",
+            "of",
+            "loop",
+            "alt",
+            "else",
+            "opt",
+            "par",
+            "and",
+            "rect",
+            "break",
+            "critical",
+            "option",
+            "box",
+            "create",
+            "destroy",
+            "links",
+            "properties",
+            "details",
+            "autonumber",
+        ],
+        "classdiagram" => &["class", "namespace", "cssclass", "note", "link"],
+        "statediagram" => &[
+            "state",
+            "note",
+            "hide",
+            "empty",
+            "description",
+            "fork",
+            "join",
+            "choice",
+            "as",
+            "direction",
+        ],
+        "erdiagram" => &["pk", "fk", "uk"],
+        "gantt" => &[
+            "dateformat",
+            "axisformat",
+            "excludes",
+            "includes",
+            "todaymarker",
+            "inclusiveenddates",
+            "topaxis",
+            "tickinterval",
+            "weekday",
+            "weekend",
+            "done",
+            "active",
+            "crit",
+            "milestone",
+            "after",
+            "until",
+        ],
+        "pie" => &["showdata"],
+        "gitgraph" => &[
+            "commit",
+            "branch",
+            "merge",
+            "checkout",
+            "switch",
+            "cherry",
+            "pick",
+            "order",
+            "tag",
+            "type",
+            "id",
+            "reverse",
+            "normal",
+            "highlight",
+        ],
+        "requirement" | "requirementdiagram" => &[
+            "requirement",
+            "functionalrequirement",
+            "performancerequirement",
+            "interfacerequirement",
+            "physicalrequirement",
+            "designconstraint",
+            "element",
+            "satisfies",
+            "traces",
+            "contains",
+            "copies",
+            "derives",
+            "refines",
+            "verifies",
+            "risk",
+            "verifymethod",
+        ],
+        "c4context" | "c4container" | "c4component" | "c4dynamic" | "c4deployment" => &[
+            "person",
+            "person_ext",
+            "system",
+            "system_ext",
+            "systemdb",
+            "systemqueue",
+            "container",
+            "containerdb",
+            "containerqueue",
+            "component",
+            "rel",
+            "birel",
+            "rel_u",
+            "rel_d",
+            "rel_l",
+            "rel_r",
+            "boundary",
+            "enterprise_boundary",
+            "system_boundary",
+            "container_boundary",
+            "node",
+            "deployment_node",
+        ],
+        "quadrantchart" => &["quadrant", "axis"],
+        "xychart" => &["bar", "line", "axis"],
+        "block" => &["columns", "space"],
+        "mindmap" => &["icon"],
+        _ => &[],
+    }
+}
+
+/// The diagram type = the first alphabetic word, skipping a leading `---` front-matter block,
+/// `%%` directive/comment lines, and blank lines. Lowercased; empty if none found.
+fn mermaid_header(src: &str) -> String {
+    let mut in_frontmatter = false;
+    for line in src.lines() {
+        let t = line.trim();
+        if t == "---" {
+            in_frontmatter = !in_frontmatter;
+            continue;
+        }
+        if in_frontmatter || t.is_empty() || t.starts_with("%%") {
+            continue;
+        }
+        let word: String = t
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        return word.to_ascii_lowercase();
+    }
+    String::new()
+}
+
 /// Characters that make up flow/sequence/edge operators (`-->`, `-.->`, `==>`, `..>`,
-/// `--)`, …). Letters `x`/`o` (arrowheads) are excluded so a run never eats an adjacent
-/// identifier letter (e.g. the `oo` in `foo-->bar`); `|` is excluded so an edge label
-/// `-->|yes|` keeps the arrow (`-->`) and the label (`|yes|`) as separate tokens.
+/// `<|--`, `--)`, …). Letters `x`/`o` (arrowheads) are excluded from the run so it never eats
+/// an adjacent identifier letter (e.g. the `oo` in `foo-->bar`) — a trailing `x`/`o` head is
+/// re-attached explicitly below. `|` is excluded so an edge label `-->|yes|` keeps the arrow
+/// and the label as separate tokens.
 fn is_arrow_char(c: u8) -> bool {
     matches!(c, b'-' | b'.' | b'=' | b'<' | b'>' | b'~' | b'*')
 }
 
-/// Tokenize Mermaid source. Colors comments (`%%`), quoted strings, edge/arrow operators,
-/// diagram/structural keywords, directions, and numbers; identifiers, node text, brackets,
-/// and label pipes fall through as plain foreground (matching how those captures resolve in
-/// the theme). Best-effort — a keyword word inside a bracketed label may color, which is an
-/// acceptable cosmetic edge for edit-time source reveal.
+/// Tokenize Mermaid source. Colors comments (`%%`), quoted strings, edge labels, arrows,
+/// `<<stereotypes>>`, `[*]` state markers, `:::class` operators, keywords (type-aware),
+/// directions, and numbers. Keyword matching is suppressed inside node-shape brackets
+/// (`[...]`/`(...)`/`{...}`) so label text like `A[state of the art]` stays plain. Node ids,
+/// brackets, and pipes fall through as foreground.
 pub fn highlight_mermaid(src: &str) -> Vec<HighlightSpan> {
     let kw = highlight_id("keyword");
     let constant = highlight_id("constant");
@@ -118,12 +254,26 @@ pub fn highlight_mermaid(src: &str) -> Vec<HighlightSpan> {
     let comment = highlight_id("comment");
     let string = highlight_id("string");
     let number = highlight_id("number");
+    let type_id = highlight_id("type");
+
+    let header = mermaid_header(src);
+    let type_kw = mermaid_type_keywords(&header);
+    let is_flowchart = matches!(header.as_str(), "flowchart" | "graph");
 
     let b = src.as_bytes();
     let mut spans = Vec::new();
     let mut i = 0;
+    // Node-shape bracket nesting; keyword/arrow/number matching is suppressed while > 0 so
+    // a label's inner text stays plain. Reset at each newline (a label can't span lines) to
+    // stay robust against unbalanced brackets during editing.
+    let mut depth: i32 = 0;
     while i < b.len() {
         let c = b[i];
+        if c == b'\n' {
+            depth = 0;
+            i += 1;
+            continue;
+        }
         // `%%` comment to end of line — also covers `%%{ init: … }%%` directive lines.
         if c == b'%' && i + 1 < b.len() && b[i + 1] == b'%' {
             let start = i;
@@ -133,7 +283,7 @@ pub fn highlight_mermaid(src: &str) -> Vec<HighlightSpan> {
             spans.push(span(start..i, comment));
             continue;
         }
-        // Quoted string label.
+        // Quoted string (colored even inside a label).
         if c == b'"' {
             let start = i;
             i += 1;
@@ -146,9 +296,57 @@ pub fn highlight_mermaid(src: &str) -> Vec<HighlightSpan> {
             spans.push(span(start..i, string));
             continue;
         }
-        // Edge label `|text|` (e.g. `A -->|yes| B`): the label reads as a string, distinct
-        // from the arrow before it. Requires a non-empty `|…|` on the same line — a bare `|`
-        // (or ER `||` cardinality) falls through as plain punctuation.
+        // `[*]` state start/end marker → constant (before generic bracket handling).
+        if c == b'[' && b[i + 1..].starts_with(b"*]") {
+            spans.push(span(i..i + 3, constant));
+            i += 3;
+            continue;
+        }
+        // Node-shape brackets: track depth (contents plain); the bracket glyphs render fg.
+        if matches!(c, b'[' | b'(' | b'{') {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if matches!(c, b']' | b')' | b'}') {
+            depth = (depth - 1).max(0);
+            i += 1;
+            continue;
+        }
+        // Inside a label everything but a quoted string is plain text.
+        if depth > 0 {
+            i += 1;
+            continue;
+        }
+        // `<<stereotype>>` (class/state) → type; also stops the trailing `>>` from reading
+        // as an operator.
+        if c == b'<' && b[i + 1..].starts_with(b"<") {
+            let start = i;
+            let mut j = i + 2;
+            while j + 1 < b.len() && !(b[j] == b'>' && b[j + 1] == b'>') && b[j] != b'\n' {
+                j += 1;
+            }
+            if j + 1 < b.len() && b[j] == b'>' && b[j + 1] == b'>' {
+                spans.push(span(start..j + 2, type_id));
+                i = j + 2;
+                continue;
+            }
+        }
+        // `:::className` class-apply operator (flowchart) → operator + the class as type.
+        if c == b':' && b[i + 1..].starts_with(b"::") {
+            spans.push(span(i..i + 3, op));
+            i += 3;
+            let ns = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            if ns < i {
+                spans.push(span(ns..i, type_id));
+            }
+            continue;
+        }
+        // Edge label `|text|` (e.g. `A -->|yes| B`) → string, distinct from the arrow before
+        // it. Requires a non-empty `|…|` on the line; a bare `|` falls through as plain.
         if c == b'|' {
             let mut j = i + 1;
             while j < b.len() && b[j] != b'|' && b[j] != b'\n' {
@@ -162,14 +360,22 @@ pub fn highlight_mermaid(src: &str) -> Vec<HighlightSpan> {
             i += 1;
             continue;
         }
-        // Edge/arrow operator: a run of arrow chars that actually forms a connector.
+        // Edge/arrow operator: a run of arrow chars, plus an optional trailing `x`/`o`
+        // arrowhead (`--x`, `--o`) when it's not the start of an identifier.
         if is_arrow_char(c) {
             let start = i;
             while i < b.len() && is_arrow_char(b[i]) {
                 i += 1;
             }
-            let run = &b[start..i];
-            if run.len() >= 2 && run.iter().any(|&x| matches!(x, b'-' | b'=' | b'>')) {
+            let connector = b[start..i].iter().any(|&x| matches!(x, b'-' | b'=' | b'>'));
+            if connector
+                && i < b.len()
+                && matches!(b[i], b'x' | b'o')
+                && !(i + 1 < b.len() && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_'))
+            {
+                i += 1; // re-attach the arrowhead
+            }
+            if i - start >= 2 && connector {
                 spans.push(span(start..i, op));
             }
             continue;
@@ -183,16 +389,16 @@ pub fn highlight_mermaid(src: &str) -> Vec<HighlightSpan> {
             spans.push(span(start..i, number));
             continue;
         }
-        // Word: keyword / direction / plain identifier.
+        // Word: direction (flowchart only) / keyword (common + type) / plain identifier.
         if c.is_ascii_alphabetic() || c == b'_' {
             let start = i;
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                 i += 1;
             }
             let word = src[start..i].to_ascii_lowercase();
-            if MERMAID_DIRECTIONS.contains(&word.as_str()) {
+            if is_flowchart && MERMAID_DIRECTIONS.contains(&word.as_str()) {
                 spans.push(span(start..i, constant));
-            } else if MERMAID_KEYWORDS.contains(&word.as_str()) {
+            } else if MERMAID_COMMON.contains(&word.as_str()) || type_kw.contains(&word.as_str()) {
                 spans.push(span(start..i, kw));
             }
             continue;
@@ -336,6 +542,38 @@ mod tests {
         let src = "foo-->bar";
         let c = cats(src, &highlight_mermaid(src));
         assert_eq!(c, vec![("-->".to_string(), "operator")]);
+    }
+
+    #[test]
+    fn mermaid_keywords_suppressed_inside_labels() {
+        // `end`/`state` are keywords at statement level but must stay plain inside a label.
+        let src = "flowchart TD\n  A[end of state] --> B";
+        let c = cats(src, &highlight_mermaid(src));
+        assert_eq!(cat_of(&c, "end"), None);
+        assert_eq!(cat_of(&c, "state"), None);
+        assert_eq!(cat_of(&c, "-->"), Some("operator"));
+    }
+
+    #[test]
+    fn mermaid_type_aware_keywords() {
+        // `commit` is a gitGraph keyword...
+        let git = "gitGraph\n  commit\n  branch dev";
+        let c = cats(git, &highlight_mermaid(git));
+        assert_eq!(cat_of(&c, "commit"), Some("keyword"));
+        assert_eq!(cat_of(&c, "branch"), Some("keyword"));
+        // ...but a flowchart node id named `commit` must NOT color as a keyword.
+        let flow = "flowchart LR\n  commit --> push";
+        let c = cats(flow, &highlight_mermaid(flow));
+        assert_eq!(cat_of(&c, "commit"), None);
+    }
+
+    #[test]
+    fn mermaid_stereotype_marker_and_arrowhead() {
+        let src = "stateDiagram-v2\n  [*] --> S\n  S --x T\n  note <<fork>>";
+        let c = cats(src, &highlight_mermaid(src));
+        assert_eq!(cat_of(&c, "[*]"), Some("constant"));
+        assert_eq!(cat_of(&c, "--x"), Some("operator")); // arrowhead re-attached
+        assert_eq!(cat_of(&c, "<<fork>>"), Some("type"));
     }
 
     #[test]
