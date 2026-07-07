@@ -41,11 +41,14 @@ remote-images = ["_net"]
 # render ```mermaid fences as diagrams (native SVG via mermaid-rs-renderer → writ's resvg)
 mermaid = ["dep:mermaid-rs-renderer"]
 
+# render LaTeX math ($…$ / $$…$$) via RaTeX (parse→layout→tiny-skia PNG, embedded fonts)
+math = ["dep:ratex-parser", "dep:ratex-layout", "dep:ratex-render", "dep:ratex-types"]
+
 # the full core::Editor orchestration hub (diff-from-HEAD + GitHub + file watch)
 editor = ["git", "github", "watch"]
 
 # the desktop editor application (winit shell). implies editor.
-app = ["editor", "remote-images", "mermaid", "dep:winit", "dep:arboard", "dep:open", "dep:clap"]
+app = ["editor", "remote-images", "mermaid", "math", "dep:winit", "dep:arboard", "dep:open", "dep:clap"]
 
 # the GhostText daemon (writd binary)
 ghosttext = ["app", "dep:tokio-tungstenite", "dep:futures"]
@@ -61,6 +64,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Native mermaid → SVG. `default-features=false` drops its `png` feature (which pulls
 # resvg 0.47, conflicting with our 0.46); we feed its SVG string into our own resvg.
 mermaid-rs-renderer = { version = "0.3", default-features = false, optional = true }
+# LaTeX math → raster (tiny-skia, embedded KaTeX fonts; no resvg — see `math` feature).
+ratex-parser = { version = "0.1.12", optional = true }
+ratex-layout = { version = "0.1.12", optional = true }
+ratex-render = { version = "0.1.12", features = ["embed-fonts"], optional = true }
+ratex-types = { version = "0.1.12", optional = true }
 # SVG rasterization (badges etc.); default features pull in text + system-fonts,
 # needed to render `<text>` labels in shields.io-style badges.
 resvg = "0.46"

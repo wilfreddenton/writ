@@ -56,6 +56,8 @@ use crate::github::{GitHubClient, ValidationResult};
 use crate::image_cache::ImageCache;
 use crate::image_load::{RepaintSignal, load_local_images_blocking, spawn_image_loads};
 use crate::inline::{GitHubContext, GitHubRef};
+#[cfg(feature = "math")]
+use crate::math;
 #[cfg(feature = "mermaid")]
 use crate::mermaid;
 use crate::outline::{current_heading_index, draw_outline};
@@ -476,6 +478,17 @@ fn sync_image_loads(
         if !sources.is_empty() {
             let proxy = proxy.clone();
             mermaid::spawn_mermaid_renders(sources, &doc_engine.images, move || {
+                let _ = proxy.send_event(WritEvent::ImageLoaded);
+            });
+        }
+    }
+    // Math renders (block + inline) share the same off-thread → image-cache path.
+    #[cfg(feature = "math")]
+    {
+        let jobs = doc.math_sources();
+        if !jobs.is_empty() {
+            let proxy = proxy.clone();
+            math::spawn_math_renders(jobs, &doc_engine.images, move || {
                 let _ = proxy.send_event(WritEvent::ImageLoaded);
             });
         }
@@ -963,6 +976,7 @@ impl DocEngine {
             viewport_h,
             &folds,
             &selection,
+            self.editor.math_spans_by_line(),
         )
     }
 }
@@ -2696,6 +2710,9 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         images: ImageCache::new(),
         preedit: None,
     };
+    // Run viewport detection (naked URLs, GitHub refs, inline `$…$` math) over the whole
+    // document so the golden frame matches the live render, which detects before layout.
+    de.editor.refresh_detection(0..usize::MAX);
     // Headless: lay out the whole document (anchor 0, infinite viewport) so any scroll
     // position renders correctly for the golden frame.
     let mut doc = de.rebuild(width as f32, 1.0, 0, f32::INFINITY);
@@ -2708,6 +2725,8 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     load_local_images_blocking(img_dir.as_deref(), doc.image_urls(), &de.images);
     #[cfg(feature = "mermaid")]
     mermaid::render_mermaid_blocking(doc.mermaid_sources(), &de.images);
+    #[cfg(feature = "math")]
+    math::render_math_blocking(doc.math_sources(), &de.images);
     doc = de.rebuild(width as f32, 1.0, 0, f32::INFINITY);
     doc.scroll_by(scroll_y, editor_h);
     let mut scene = Scene::new();

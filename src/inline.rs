@@ -295,6 +295,74 @@ pub struct RawGitHubMatch {
     pub byte_range: Range<usize>,
 }
 
+/// An inline `$…$` math span detected in a line (buffer byte ranges).
+#[derive(Debug, Clone)]
+pub struct MathSpan {
+    /// The whole `$…$` including delimiters.
+    pub full_range: Range<usize>,
+    /// The LaTeX between the delimiters.
+    pub content_range: Range<usize>,
+}
+
+/// Detect inline `$…$` math in one line. `$` is ordinary text in CommonMark, so this is a
+/// hand-rolled scan (no tree-sitter): an unescaped `$` opens (but `$$` is a display-math
+/// delimiter, skipped here — those are collected once per build), the next unescaped `$`
+/// on the same line closes. Following the GitHub/pandoc rule, the opener must not be
+/// followed by whitespace and the closer not preceded by whitespace (so prose like
+/// "$5 and $10" doesn't match). `$` inside `code_ranges` (inline code) or `block_ranges`
+/// (`$$…$$` display math) is skipped. Buffer offsets via `line_start`.
+#[cfg(feature = "math")]
+pub fn detect_inline_math(
+    line: &str,
+    line_start: usize,
+    code_ranges: &[Range<usize>],
+    block_ranges: &[Range<usize>],
+) -> Vec<MathSpan> {
+    let mut spans = Vec::new();
+    if !line.contains('$') {
+        return spans;
+    }
+    let b = line.as_bytes();
+    let excluded = |abs: usize| {
+        code_ranges
+            .iter()
+            .chain(block_ranges.iter())
+            .any(|r| r.contains(&abs))
+    };
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'$' || (i > 0 && b[i - 1] == b'\\') {
+            i += 1;
+            continue;
+        }
+        // `$$` is a display-math delimiter, not an inline opener.
+        if i + 1 < b.len() && b[i + 1] == b'$' {
+            i += 2;
+            continue;
+        }
+        // Opener must be followed by a non-whitespace char, and be outside code/block math.
+        if i + 1 >= b.len() || b[i + 1].is_ascii_whitespace() || excluded(line_start + i) {
+            i += 1;
+            continue;
+        }
+        // Closing `$`: first unescaped `$` on the line whose preceding char isn't whitespace.
+        let mut j = i + 1;
+        while j < b.len() && !(b[j] == b'$' && b[j - 1] != b'\\') {
+            j += 1;
+        }
+        if j < b.len() && !b[j - 1].is_ascii_whitespace() && !excluded(line_start + j) {
+            spans.push(MathSpan {
+                full_range: (line_start + i)..(line_start + j + 1),
+                content_range: (line_start + i + 1)..(line_start + j),
+            });
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
 /// A naked URL detected in text (not inside []() markdown link syntax).
 #[derive(Debug, Clone)]
 pub struct NakedUrl {
@@ -1675,5 +1743,47 @@ mod tests {
         let regions = naked_urls_to_styled_regions(&urls, &cache, Some(&ctx));
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].display_text, Some("#123".to_string()));
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn inline_math_basic_and_content() {
+        let line = "before $x^2 + 1$ after";
+        let spans = detect_inline_math(line, 0, &[], &[]);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].full_range, 7..16);
+        assert_eq!(&line[spans[0].content_range.clone()], "x^2 + 1");
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn inline_math_rejects_currency() {
+        // "$5 ... $10": opener followed by a digit is fine, but the closer is preceded by
+        // whitespace ("$10" — the space before the second `$`), so no span matches.
+        assert!(detect_inline_math("this $5 and $10 more", 0, &[], &[]).is_empty());
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn inline_math_two_spans_and_offsets() {
+        let line = "$a$ and $b+c$";
+        let spans = detect_inline_math(line, 100, &[], &[]);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].full_range, 100..103);
+        assert_eq!(spans[1].full_range, 108..113);
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn inline_math_skips_display_and_escaped_and_code() {
+        // `$$` display delimiter is not an inline opener.
+        assert!(detect_inline_math("$$x$$", 0, &[], &[]).is_empty());
+        // Escaped `\$` is literal.
+        assert!(detect_inline_math("cost is \\$5 today", 0, &[], &[]).is_empty());
+        // A `$` inside an inline-code range is skipped.
+        let line = "`$x$` and $y$";
+        let spans = detect_inline_math(line, 0, std::slice::from_ref(&(0..5)), &[]);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&line[spans[0].content_range.clone()], "y");
     }
 }

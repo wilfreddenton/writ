@@ -15,6 +15,8 @@ use crate::marker::{
     HeadingInfo, LineMarkers, ListItemInfo, ParsedNodes, collect_node_infos,
     is_line_in_checked_task, is_line_in_code_block, markers_at_from_infos,
 };
+#[cfg(feature = "math")]
+use crate::math::MathBlock;
 #[cfg(feature = "mermaid")]
 use crate::mermaid::MermaidBlock;
 use crate::parser::{MarkdownParser, MarkdownTree};
@@ -241,6 +243,58 @@ impl RenderSnapshot {
         self.mermaid_blocks()
             .into_iter()
             .find(|m| m.block.contains(&line_start))
+    }
+
+    /// All `$$…$$` display-math blocks, scanned once per build (block openers can be
+    /// off-screen above the viewport, so a whole-doc pass is right; a per-line scan would
+    /// miss them). Skips `$$` inside fenced code blocks. Inline `$…$` is detected separately
+    /// (in the viewport-windowed link scan). A single byte-level pass over the rope.
+    #[cfg(feature = "math")]
+    pub fn math_blocks(&self) -> Vec<MathBlock> {
+        // Byte positions where a `$$` delimiter begins.
+        let mut delims: Vec<usize> = Vec::new();
+        let mut prev_dollar = false;
+        let mut pos = 0usize;
+        for chunk in self.rope.chunks() {
+            for &b in chunk.as_bytes() {
+                if b == b'$' {
+                    if prev_dollar {
+                        delims.push(pos - 1);
+                        prev_dollar = false;
+                    } else {
+                        prev_dollar = true;
+                    }
+                } else {
+                    prev_dollar = false;
+                }
+                pos += 1;
+            }
+        }
+        if delims.len() < 2 {
+            return Vec::new();
+        }
+        delims.retain(|&d| {
+            !self
+                .parsed
+                .code_blocks
+                .iter()
+                .any(|cb| cb.block_range.contains(&d))
+        });
+        let mut blocks = Vec::new();
+        let mut i = 0;
+        while i + 1 < delims.len() {
+            let (open, close) = (delims[i], delims[i + 1]);
+            let content = (open + 2)..close;
+            if !content.is_empty() {
+                blocks.push(MathBlock {
+                    block: open..(close + 2),
+                    content,
+                    anchor_line: self.rope.byte_to_line(open),
+                });
+            }
+            i += 2;
+        }
+        blocks
     }
 
     /// Get code highlights for a specific line. O(code_blocks) scan.

@@ -40,6 +40,9 @@ pub struct LoadedImage {
     pub height: u32,
     pub display_w: f32,
     pub display_h: f32,
+    /// For math: logical px from the image top down to the text baseline (so inline math
+    /// can sit on the line). `None` for ordinary images (they have no baseline).
+    pub baseline: Option<f32>,
 }
 
 /// Load state for one image URL.
@@ -118,6 +121,7 @@ pub fn decode(bytes: &[u8]) -> Option<LoadedImage> {
             height,
             display_w: width as f32,
             display_h: height as f32,
+            baseline: None,
         });
     }
     looks_like_svg(bytes).then(|| decode_svg(bytes)).flatten()
@@ -176,6 +180,7 @@ fn decode_svg(bytes: &[u8]) -> Option<LoadedImage> {
         height: rh,
         display_w: dw,
         display_h: dh,
+        baseline: None,
     })
 }
 
