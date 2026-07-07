@@ -38,6 +38,15 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
+      # Guard the reduced-feature library paths: `--all-features` can't catch a module
+      # that uses a feature-gated dep while being registered ungated (the render-only /
+      # editor-only consumers pull neither winit nor the app stack).
+      - name: Build (render-only, no default features)
+        run: cargo build --no-default-features --verbose
+
+      - name: Build (editor, no app)
+        run: cargo build --no-default-features --features editor --verbose
+
       - name: Run tests
         env:
           GITHUB_TOKEN: ${{ secrets.GH_API_TOKEN }}
