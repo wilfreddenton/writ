@@ -1083,20 +1083,15 @@ fn apply_fetched(editor: &mut Editor, fetched: FetchedSuggestions) {
     }
 }
 
-/// Find the GitHub ref (regular or naked-URL) under a screen point, with its
-/// on-screen anchor rect. Returns None when the pointer isn't over a detected ref.
-/// Index of the autocomplete row whose rect contains `pos` (physical px), if any.
-fn ac_row_at(rects: &[ScreenRect], pos: (f32, f32)) -> Option<usize> {
-    let (px, py) = (pos.0 as f64, pos.1 as f64);
-    rects
-        .iter()
-        .position(|&(x0, y0, x1, y1)| px >= x0 && px <= x1 && py >= y0 && py <= y1)
-}
-
 fn rect_contains(rect: &ScreenRect, pos: (f32, f32)) -> bool {
     let (px, py) = (pos.0 as f64, pos.1 as f64);
     let &(x0, y0, x1, y1) = rect;
     px >= x0 && px <= x1 && py >= y0 && py <= y1
+}
+
+/// Index of the autocomplete row whose rect contains `pos` (physical px), if any.
+fn ac_row_at(rects: &[ScreenRect], pos: (f32, f32)) -> Option<usize> {
+    rects.iter().position(|r| rect_contains(r, pos))
 }
 
 /// Paint the clipped document body (diff backgrounds, quote gutters, rules, images,

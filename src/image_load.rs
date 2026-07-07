@@ -111,19 +111,13 @@ pub fn spawn_image_loads(
                     }
                     None => None,
                 };
-                match loaded {
-                    Some(img) => cache.set_loaded(&url, img),
-                    None => cache.set_failed(&url),
-                }
+                cache.store_render(&url, loaded.ok_or(None));
                 signal.notify();
             });
         } else {
             let doc_dir = doc_dir.clone();
             runtime.spawn_blocking(move || {
-                match load_local_image(doc_dir.as_deref(), &url) {
-                    Some(img) => cache.set_loaded(&url, img),
-                    None => cache.set_failed(&url),
-                }
+                cache.store_render(&url, load_local_image(doc_dir.as_deref(), &url).ok_or(None));
                 signal.notify();
             });
         }
@@ -140,9 +134,6 @@ pub fn load_local_images_blocking(doc_dir: Option<&Path>, urls: &[String], cache
         } else {
             load_local_image(doc_dir, url)
         };
-        match loaded {
-            Some(img) => cache.set_loaded(url, img),
-            None => cache.set_failed(url),
-        }
+        cache.store_render(url, loaded.ok_or(None));
     }
 }

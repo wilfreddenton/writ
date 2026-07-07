@@ -272,6 +272,15 @@ impl GitHubClient {
     }
 
     /// Search issues/PRs, optionally with a text query.
+    /// The GitHub search qualifier string for issues+PRs in one repo, sorted by recency,
+    /// optionally constrained to `text`.
+    fn issue_search_query(owner: &str, repo: &str, text: Option<&str>) -> String {
+        match text {
+            Some(t) => format!("repo:{owner}/{repo} type:issue type:pr {t} sort:updated"),
+            None => format!("repo:{owner}/{repo} type:issue type:pr sort:updated"),
+        }
+    }
+
     async fn search_issues(
         &self,
         owner: &str,
@@ -279,13 +288,7 @@ impl GitHubClient {
         query: Option<&str>,
         limit: usize,
     ) -> Vec<IssueOrPr> {
-        let search_query = match query {
-            Some(q) => format!(
-                "repo:{}/{} type:issue type:pr {} sort:updated",
-                owner, repo, q
-            ),
-            None => format!("repo:{}/{} type:issue type:pr sort:updated", owner, repo),
-        };
+        let search_query = Self::issue_search_query(owner, repo, query);
 
         let graphql_query = format!(
             r#"
@@ -318,10 +321,7 @@ impl GitHubClient {
         search_text: &str,
         limit: usize,
     ) -> Vec<IssueOrPr> {
-        let search_query = format!(
-            "repo:{}/{} type:issue type:pr {} sort:updated",
-            owner, repo, search_text
-        );
+        let search_query = Self::issue_search_query(owner, repo, Some(search_text));
 
         let graphql_query = format!(
             r#"

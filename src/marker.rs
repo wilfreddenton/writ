@@ -1051,14 +1051,7 @@ pub fn markers_at_from_infos(
             }
             "atx_h1_marker" | "atx_h2_marker" | "atx_h3_marker" | "atx_h4_marker"
             | "atx_h5_marker" | "atx_h6_marker" => {
-                let level = match kind {
-                    "atx_h1_marker" => 1,
-                    "atx_h2_marker" => 2,
-                    "atx_h3_marker" => 3,
-                    "atx_h4_marker" => 4,
-                    "atx_h5_marker" => 5,
-                    _ => 6,
-                };
+                let level = atx_marker_level(kind).unwrap_or(6);
                 let range_end = extend_over_space(rope, end);
                 markers.push(Marker {
                     kind: MarkerKind::Heading(level),

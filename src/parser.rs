@@ -84,20 +84,21 @@ impl MarkdownParser {
             .expect("Could not load inline grammar");
         let mut tree_cursor = block_tree.walk();
 
+        // The leaf nodes whose inner text gets a second (inline) parse pass.
+        let is_leaf = |kind: &str| kind == "inline" || kind == "pipe_table_cell";
+
         let mut i = 0;
         'outer: loop {
             let node = loop {
                 let kind = tree_cursor.node().kind();
-                if kind == "inline" || kind == "pipe_table_cell" || !tree_cursor.goto_first_child()
-                {
+                if is_leaf(kind) || !tree_cursor.goto_first_child() {
                     while !tree_cursor.goto_next_sibling() {
                         if !tree_cursor.goto_parent() {
                             break 'outer;
                         }
                     }
                 }
-                let kind = tree_cursor.node().kind();
-                if kind == "inline" || kind == "pipe_table_cell" {
+                if is_leaf(tree_cursor.node().kind()) {
                     break tree_cursor.node();
                 }
             };

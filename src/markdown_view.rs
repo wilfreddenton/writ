@@ -76,13 +76,18 @@ impl MarkdownView {
         }
     }
 
+    /// Discard the built layout so the next `layout`/`render` rebuilds.
+    fn invalidate_layout(&mut self) {
+        self.doc = None;
+        self.laid_out = None;
+    }
+
     /// Replace the entire document with `text`, discarding any prior content, layout,
     /// and scroll position.
     pub fn set_markdown(&mut self, text: &str) {
         self.buffer = Buffer::new();
         self.buffer.insert(0, text, 0);
-        self.doc = None;
-        self.laid_out = None;
+        self.invalidate_layout();
         self.scroll_y = 0.0;
     }
 
@@ -91,8 +96,7 @@ impl MarkdownView {
     pub fn push_str(&mut self, text: &str) {
         let end = self.buffer.len_bytes();
         self.buffer.insert(end, text, 0);
-        self.doc = None;
-        self.laid_out = None;
+        self.invalidate_layout();
     }
 
     /// Lay out the whole document at `width`/`scale` (a single anchor-0, infinite-
@@ -163,8 +167,7 @@ impl MarkdownView {
         match decode(bytes) {
             Some(img) => {
                 self.images.set_loaded(url, img);
-                self.doc = None;
-                self.laid_out = None;
+                self.invalidate_layout();
                 true
             }
             None => {
@@ -178,8 +181,7 @@ impl MarkdownView {
     /// so the next `render` reflows around the placeholder. Scroll is preserved.
     pub fn set_image_failed(&mut self, url: &str) {
         self.images.set_failed(url);
-        self.doc = None;
-        self.laid_out = None;
+        self.invalidate_layout();
     }
 
     /// The full content height of the built document (0 if nothing is laid out yet).
