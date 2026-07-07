@@ -2,6 +2,7 @@
 //! styled line with browser-grade (Chromium) soft-wrap and hanging indent, and paints its
 //! glyphs into a Vello scene. Drives the per-line layout cache and the display↔buffer map.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use parley::{
@@ -45,6 +46,10 @@ impl StyleRun {
 pub struct TextEngine {
     fcx: FontContext,
     lcx: LayoutContext<Brush>,
+    /// User-chosen font family; `None` = system monospace. When set, layouts use the
+    /// stack `[family, monospace]` so a missing font (or one rejected by the startup
+    /// monospace guard) still falls back to system monospace.
+    font_family: Option<String>,
 }
 
 impl Default for TextEngine {
@@ -58,7 +63,39 @@ impl TextEngine {
         Self {
             fcx: FontContext::new(),
             lcx: LayoutContext::new(),
+            font_family: None,
         }
+    }
+
+    /// Set the document font family (`None` = system monospace). Callers should verify
+    /// fixed-pitch via [`is_monospace`](Self::is_monospace) before trusting a user value.
+    pub fn set_font_family(&mut self, family: Option<String>) {
+        self.font_family = family;
+    }
+
+    /// The default font for a line: the configured family with a monospace fallback, or
+    /// system monospace when unset. Owned (`'static`) so it borrows nothing from `self`.
+    fn body_family(&self) -> FontFamily<'static> {
+        match &self.font_family {
+            Some(name) => FontFamily::List(Cow::Owned(vec![
+                FontFamilyName::Named(Cow::Owned(name.clone())),
+                FontFamilyName::Generic(GenericFamily::Monospace),
+            ])),
+            None => FontFamily::Single(FontFamilyName::Generic(GenericFamily::Monospace)),
+        }
+    }
+
+    /// Whether the current font is fixed-pitch: a run of `i` and a run of `M` share the
+    /// same advance. Guards writ's deterministic wrapping — a proportional family (or one
+    /// that fell back to a non-mono default because it failed to load) returns false.
+    pub fn is_monospace(&mut self) -> bool {
+        let wi = self
+            .build_line("iiiiiiiiii", 1.0, 16.0, 1.0, Color::WHITE, None, &[])
+            .width();
+        let wm = self
+            .build_line("MMMMMMMMMM", 1.0, 16.0, 1.0, Color::WHITE, None, &[])
+            .width();
+        (wi - wm).abs() <= 0.01 * wi.max(1.0)
     }
 
     /// Build a laid-out line. `font_size` is in *logical* pixels; `scale` (the
@@ -114,14 +151,13 @@ impl TextEngine {
         content_start: usize,
         inline_boxes: &[(usize, f32, f32)],
     ) -> Layout<Brush> {
+        let family = self.body_family();
         let mut builder = self.lcx.ranged_builder(&mut self.fcx, text, scale, true);
         builder.push_default(StyleProperty::FontSize(font_size));
         builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(
             line_height,
         )));
-        builder.push_default(StyleProperty::FontFamily(FontFamily::Single(
-            FontFamilyName::Generic(GenericFamily::Monospace),
-        )));
+        builder.push_default(StyleProperty::FontFamily(family.clone()));
         builder.push_default(StyleProperty::Brush(Brush::Solid(base_color)));
         // A word too long to fit the wrap width breaks at an arbitrary point instead of
         // overflowing off the right edge (CSS `overflow-wrap: anywhere`); normal text
@@ -146,12 +182,7 @@ impl TextEngine {
                 );
             }
             if run.mono {
-                builder.push(
-                    StyleProperty::FontFamily(FontFamily::Single(FontFamilyName::Generic(
-                        GenericFamily::Monospace,
-                    ))),
-                    run.range.clone(),
-                );
+                builder.push(StyleProperty::FontFamily(family.clone()), run.range.clone());
             }
             if run.underline {
                 builder.push(StyleProperty::Underline(true), run.range.clone());
