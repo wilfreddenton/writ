@@ -98,11 +98,12 @@ const MERMAID_KEYWORDS: &[&str] = &[
 /// Flowchart directions → `@constant` (unanimous across grammars; distinct from keywords).
 const MERMAID_DIRECTIONS: &[&str] = &["tb", "td", "bt", "rl", "lr"];
 
-/// Characters that make up flow/sequence/class/ER edge operators (`-->`, `-.->`, `==>`,
-/// `<|--`, `..>`, `--)`, …). Letters `x`/`o` (arrowheads) are deliberately excluded so a
-/// run never eats an adjacent identifier letter (e.g. the `oo` in `foo-->bar`).
+/// Characters that make up flow/sequence/edge operators (`-->`, `-.->`, `==>`, `..>`,
+/// `--)`, …). Letters `x`/`o` (arrowheads) are excluded so a run never eats an adjacent
+/// identifier letter (e.g. the `oo` in `foo-->bar`); `|` is excluded so an edge label
+/// `-->|yes|` keeps the arrow (`-->`) and the label (`|yes|`) as separate tokens.
 fn is_arrow_char(c: u8) -> bool {
-    matches!(c, b'-' | b'.' | b'=' | b'<' | b'>' | b'~' | b'|' | b'*')
+    matches!(c, b'-' | b'.' | b'=' | b'<' | b'>' | b'~' | b'*')
 }
 
 /// Tokenize Mermaid source. Colors comments (`%%`), quoted strings, edge/arrow operators,
@@ -143,6 +144,22 @@ pub fn highlight_mermaid(src: &str) -> Vec<HighlightSpan> {
                 i += 1;
             }
             spans.push(span(start..i, string));
+            continue;
+        }
+        // Edge label `|text|` (e.g. `A -->|yes| B`): the label reads as a string, distinct
+        // from the arrow before it. Requires a non-empty `|…|` on the same line — a bare `|`
+        // (or ER `||` cardinality) falls through as plain punctuation.
+        if c == b'|' {
+            let mut j = i + 1;
+            while j < b.len() && b[j] != b'|' && b[j] != b'\n' {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'|' && j > i + 1 {
+                spans.push(span(i..j + 1, string));
+                i = j + 1;
+                continue;
+            }
+            i += 1;
             continue;
         }
         // Edge/arrow operator: a run of arrow chars that actually forms a connector.
@@ -302,6 +319,8 @@ mod tests {
         assert_eq!(cat_of(&c, "flowchart"), Some("keyword"));
         assert_eq!(cat_of(&c, "LR"), Some("constant"));
         assert_eq!(cat_of(&c, "-->"), Some("operator"));
+        // The edge label `|yes|` is a string, kept separate from the arrow `-->`.
+        assert_eq!(cat_of(&c, "|yes|"), Some("string"));
         assert_eq!(cat_of(&c, "pie"), Some("keyword"));
         assert_eq!(cat_of(&c, "\"a\""), Some("string"));
         assert_eq!(cat_of(&c, "42"), Some("number"));
