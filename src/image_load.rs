@@ -59,18 +59,16 @@ async fn fetch_remote_image(url: &str) -> Option<Vec<u8>> {
 }
 
 /// Decode image bytes (CPU-heavy — run on a blocking thread, not the async reactor).
-/// Logs an undecodable body (e.g. SVG, which the `image` crate can't rasterize).
+/// `decode` tries the raster path then falls back to SVG, so `None` means both failed.
 fn decode_image_bytes(url: &str, bytes: &[u8]) -> Option<LoadedImage> {
-    match decode(bytes) {
-        Some(img) => Some(img),
-        None => {
-            eprintln!(
-                "[writ] image decode failed ({url}): {} bytes, unsupported format (SVG is not supported)",
-                bytes.len()
-            );
-            None
-        }
+    let img = decode(bytes);
+    if img.is_none() {
+        eprintln!(
+            "[writ] image decode failed ({url}): {} bytes, unsupported or malformed image",
+            bytes.len()
+        );
     }
+    img
 }
 
 /// GET + decode a remote image inline. Used by the blocking snapshot path; the live GUI

@@ -44,7 +44,8 @@ pub struct TableInfo {
     pub header: TableRow,
     /// Byte range of the `|---|---|` delimiter line.
     pub delimiter_line: Range<usize>,
-    /// Per-column alignment, from the delimiter cells.
+    /// Per-column alignment, from the delimiter cells. Its length is the delimiter-cell
+    /// count, which may differ from `ncols` — index defensively (default `Align::Left`).
     pub aligns: Vec<Align>,
     pub body: Vec<TableRow>,
     /// Max cell count across header and body rows.

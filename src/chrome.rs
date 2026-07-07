@@ -542,6 +542,8 @@ pub fn draw_status_bar(
     let mut text = String::new();
     let mut runs = Vec::new();
     for (i, (s, depth)) in items.iter().enumerate() {
+        // Compact nested-checkbox glyphs (`" ]"` / `"x]"`) attach to the preceding item
+        // with no separating space; everything else gets a leading space.
         let needs_space = !s.starts_with(' ') && !s.starts_with('x');
         if i > 0 && needs_space {
             text.push(' ');

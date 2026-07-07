@@ -1,9 +1,6 @@
-//! Parley text layout + Vello glyph drawing — the core of writ's new render path
-//! (see MIGRATION-PLAN.md, text-core). Replaces the hand-rolled gpui `Line`/shaping.
-//!
-//! Phase 1: lays out a single styled line with browser-grade (Chromium) soft-wrap
-//! and paints its glyphs into a Vello scene. Later phases feed this from the real
-//! `build_styled_content` and drive per-line caching + the display↔buffer map.
+//! Parley text layout + Vello glyph drawing — the core of writ's render path. Lays out a
+//! styled line with browser-grade (Chromium) soft-wrap and hanging indent, and paints its
+//! glyphs into a Vello scene. Drives the per-line layout cache and the display↔buffer map.
 
 use std::ops::Range;
 

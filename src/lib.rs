@@ -12,8 +12,8 @@
 //! # Quick Start
 //!
 //! ```ignore
-//! let editor = writ::core::Editor::open(std::path::Path::new("notes.md"));
-//! writ::shell::run()?; // opens a window and edits the file from --file
+//! // `writ --file notes.md` — the shell reads the path from the CLI and runs the app.
+//! writ::shell::run()?;
 //! ```
 
 #[cfg(feature = "editor")]

@@ -313,10 +313,6 @@ mod tests {
             !hunks[0].new_inline_changes.is_empty(),
             "Should have new inline changes"
         );
-
-        // Print what we found
-        eprintln!("Old inline changes: {:?}", hunks[0].old_inline_changes);
-        eprintln!("New inline changes: {:?}", hunks[0].new_inline_changes);
     }
 
     #[test]

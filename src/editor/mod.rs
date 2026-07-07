@@ -1605,10 +1605,8 @@ impl EditorState {
         }
     }
 
-    /// Propagate checkbox state after tab cycling changes the structure.
-    /// Propagate checkbox state after editing (insert/delete).
-    /// If current line has a checkbox, propagate from it.
-    /// If not, check if we're inside a parent checkbox and re-evaluate it.
+    /// Propagate checkbox state after editing (insert/delete): if the current line has a
+    /// checkbox, propagate from it; otherwise re-evaluate the enclosing parent checkbox.
     fn propagate_checkbox_after_edit(&mut self) {
         let cursor_offset = self.cursor().offset;
         let line_idx = self.buffer.byte_to_line(cursor_offset);

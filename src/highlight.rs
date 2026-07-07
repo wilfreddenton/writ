@@ -132,10 +132,9 @@ impl Highlighter {
     fn create_rust_config() -> Option<HighlightConfiguration> {
         let language = tree_sitter_rust::LANGUAGE.into();
 
-        // Use Zed's highlights.scm for better Rust coverage
+        // Zed's highlights.scm — broader Rust coverage than the upstream query.
         let highlights_query = include_str!("../queries/rust/highlights.scm");
 
-        // Create highlight configuration
         let mut config = match HighlightConfiguration::new(
             language,
             "rust",

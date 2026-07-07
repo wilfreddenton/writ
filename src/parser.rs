@@ -101,6 +101,10 @@ impl MarkdownParser {
                     break tree_cursor.node();
                 }
             };
+            // Carve the node's range into the gaps BETWEEN its named children: each pushed
+            // range runs from the current cursor to the next child's start, then advances
+            // past that child. This excludes the children's own spans (which get their own
+            // injection) so the block highlighter only re-parses the interstitial text.
             let mut range = node.range();
             let mut ranges = Vec::new();
             if tree_cursor.goto_first_child() {
@@ -245,17 +249,7 @@ mod tests {
             .block_tree()
             .changed_ranges(tree1.block_tree())
             .collect();
-        eprintln!("Changed ranges after removing first blockquote marker:");
-        for range in &ranges {
-            eprintln!(
-                "  bytes {}..{} (rows {}..{})",
-                range.start_byte, range.end_byte, range.start_point.row, range.end_point.row
-            );
-        }
-
-        // We expect it to report at least line 0 changed.
-        // The question is: does it also report lines 1-2 changed since they're
-        // now a separate blockquote?
+        // Removing the first blockquote marker must report at least line 0 changed.
         assert!(!ranges.is_empty());
     }
 }

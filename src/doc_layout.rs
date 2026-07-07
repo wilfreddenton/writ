@@ -537,16 +537,15 @@ const IMG_PLACEHOLDER_H: f32 = 120.0;
 const INLINE_IMG_PLACEHOLDER_W: f32 = 80.0;
 const INLINE_IMG_PLACEHOLDER_H: f32 = 20.0;
 
-/// A standalone image to paint on a line: its load state plus the sizing the draw
-/// pass needs. `dest_*` are device px on screen; `nat_*` are the image's intrinsic
-/// pixel dimensions (draw_image paints at native size, so the transform scales
-/// `dest/nat`).
+/// A standalone image to paint on a line: `alt` text plus a load-state-specific payload.
 struct ImageBlock {
     alt: String,
     kind: ImageBlockKind,
 }
 
 enum ImageBlockKind {
+    /// `dest_*` are device px on screen; `nat_*` are the image's intrinsic pixel
+    /// dimensions (draw_image paints at native size, so the transform scales `dest/nat`).
     Loaded {
         brush: ImageBrush,
         nat_w: f32,

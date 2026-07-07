@@ -282,12 +282,6 @@ impl ActiveSurface {
     }
 }
 
-/// The document engine: the editor/buffer plus the caches and Parley/Vello text
-/// engine that lay it out into `doc`. Held as one field kept SEPARATE from `state`
-/// (the GPU surface) so `&mut self.doc_engine` and `&self.state` are disjoint
-/// borrows — the split that lets a rebuild run while the surface stays borrowed at
-/// the call site. The per-line caches + `Rc`-wrapped layouts/renders avoid deep
-/// clones on the typing hot path.
 /// In-progress IME composition (owned form of [`PreeditView`]): the composing `text`
 /// and its caret/selection `cursor` (byte offsets within `text`). Held on `DocEngine`
 /// so `rebuild` can splice it into the caret line without threading a param everywhere.
@@ -296,6 +290,12 @@ struct Preedit {
     cursor: Option<(usize, usize)>,
 }
 
+/// The document engine: the editor/buffer plus the caches and Parley/Vello text
+/// engine that lay it out into `doc`. Held as one field kept SEPARATE from `state`
+/// (the GPU surface) so `&mut self.doc_engine` and `&self.state` are disjoint
+/// borrows — the split that lets a rebuild run while the surface stays borrowed at
+/// the call site. The per-line caches + `Rc`-wrapped layouts/renders avoid deep
+/// clones on the typing hot path.
 struct DocEngine {
     text_engine: TextEngine,
     line_cache: LineCache,
