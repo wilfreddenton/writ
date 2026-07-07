@@ -1156,6 +1156,9 @@ impl DocLayout {
         // Inline `$…$` math spans per line (empty when the `math` feature is off).
         math_spans: &HashMap<usize, Vec<MathSpan>>,
     ) -> Self {
+        // `selection` is only read by the mermaid/math reveal predicates.
+        #[cfg(not(any(feature = "mermaid", feature = "math")))]
+        let _ = selection;
         let LayoutParams {
             content_x0,
             content_w,

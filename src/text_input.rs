@@ -13,7 +13,9 @@ use parley::{Affinity, Cursor};
 use vello::Scene;
 use vello::kurbo::{Affine, Rect};
 use vello::peniko::Fill;
+#[cfg(feature = "app")]
 use winit::event::KeyEvent;
+#[cfg(feature = "app")]
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::consts::{CARET_WIDTH, UI_LINE_HEIGHT};
@@ -269,9 +271,10 @@ pub fn draw_text_field(
 }
 
 /// Map a winit key event to a `TextField` mutation, returning whether it was
-/// consumed. This is the winit boundary, kept out of the tested core. Enter, Tab,
-/// and Escape are intentionally *not* handled here — the shell owns those (submit /
-/// dismiss). Ctrl+V (paste) is also the shell's job, since it holds the clipboard.
+/// consumed. This is the winit boundary (`app`-only), kept out of the tested core.
+/// Enter, Tab, and Escape are intentionally *not* handled here — the shell owns those
+/// (submit / dismiss). Ctrl+V (paste) is also the shell's job, since it holds the clipboard.
+#[cfg(feature = "app")]
 pub fn apply_key(field: &mut TextField, event: &KeyEvent, mods: ModifiersState) -> bool {
     let shift = mods.shift_key();
     let ctrl = mods.control_key() || mods.super_key();

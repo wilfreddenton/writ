@@ -25,6 +25,7 @@ pub use markdown_view::MarkdownView;
 pub use raster::rasterize_scene_to_png;
 
 pub mod buffer;
+#[cfg(feature = "editor")]
 pub mod chrome;
 pub mod config;
 pub mod consts;
@@ -50,6 +51,7 @@ pub mod marker;
 pub mod math;
 #[cfg(feature = "mermaid")]
 pub mod mermaid;
+#[cfg(feature = "editor")]
 pub mod outline;
 #[cfg(feature = "app")]
 pub mod overlay;
