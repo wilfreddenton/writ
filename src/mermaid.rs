@@ -133,6 +133,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_surfaces_reason() {
+        // A parseable header with an unsupported construct yields a message (not just a
+        // generic failure), so the placeholder can show the author what's wrong.
+        let src = "classDiagram\n  class A {\n    <<interface>>\n  }";
+        let key = key_for(src);
+        let cache = ImageCache::new();
+        render_mermaid_blocking(&[(key.clone(), src.to_string())], &cache);
+        match cache.get(&key) {
+            Some(ImageState::Failed(Some(msg))) => {
+                assert!(!msg.is_empty(), "error message should be non-empty");
+            }
+            _ => panic!("expected Failed(Some(reason))"),
+        }
+    }
+
+    #[test]
     fn key_is_stable_per_source() {
         assert_eq!(key_for("graph LR; A-->B"), key_for("graph LR; A-->B"));
         assert_ne!(key_for("graph LR; A-->B"), key_for("graph LR; A-->C"));

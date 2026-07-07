@@ -207,6 +207,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_surfaces_reason() {
+        // An unknown control sequence yields a message shown in the placeholder.
+        let j = job("\\unknowncmd{x}", true);
+        let key = key_for(&j);
+        let cache = ImageCache::new();
+        render_math_blocking(&[(key.clone(), j)], &cache);
+        match cache.get(&key) {
+            Some(ImageState::Failed(Some(msg))) => assert!(!msg.is_empty()),
+            _ => panic!("expected Failed(Some(reason))"),
+        }
+    }
+
+    #[test]
     fn key_stable_and_distinguishes_display() {
         assert_eq!(key_for(&job("x", true)), key_for(&job("x", true)));
         assert_ne!(key_for(&job("x", true)), key_for(&job("x", false)));
