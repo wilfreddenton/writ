@@ -33,7 +33,7 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::window::{Theme, Window, WindowId};
+use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 use winit::event_loop::ControlFlow;
 
@@ -322,6 +322,9 @@ struct App {
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
     mouse_down: bool,
+    /// The OS cursor icon currently set on the window, so hover updates only call
+    /// `set_cursor` on a real change (Ctrl-hover over a link → pointer, else default).
+    cursor_icon: CursorIcon,
     /// Click-count tracking for double/triple-click select (winit doesn't provide it):
     /// the last press's time + position, and the running count (cycles 1→2→3).
     last_click: Option<(std::time::Instant, (f32, f32))>,
@@ -415,6 +418,7 @@ impl App {
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             mouse_down: false,
+            cursor_icon: CursorIcon::Default,
             last_click: None,
             click_count: 0,
             drag_scroll_dy: 0.0,
@@ -1094,6 +1098,34 @@ fn ac_row_at(rects: &[ScreenRect], pos: (f32, f32)) -> Option<usize> {
     rects.iter().position(|r| rect_contains(r, pos))
 }
 
+/// Point the OS cursor at whatever's under the pointer: a hand (`Pointer`) when Ctrl/Cmd
+/// is held over a Ctrl-clickable link (same hit-test → `link_at` path as the click), else
+/// the default arrow. Only calls `set_cursor` on a change. Gated on the modifier first so
+/// the (snapshot-building) `link_at` lookup runs only during an actual Ctrl-hover.
+fn update_link_cursor(
+    doc_engine: &mut DocEngine,
+    modifiers: ModifiersState,
+    mouse_pos: (f32, f32),
+    current: &mut CursorIcon,
+    window: &Window,
+) {
+    let over_link = (modifiers.control_key() || modifiers.super_key())
+        && doc_engine
+            .doc
+            .as_ref()
+            .and_then(|d| d.hit_test(mouse_pos.0, mouse_pos.1))
+            .is_some_and(|off| doc_engine.editor.link_at(off).is_some());
+    let icon = if over_link {
+        CursorIcon::Pointer
+    } else {
+        CursorIcon::Default
+    };
+    if icon != *current {
+        *current = icon;
+        window.set_cursor(icon);
+    }
+}
+
 /// Paint the clipped document body (diff backgrounds, quote gutters, rules, images,
 /// selection, glyphs, caret) plus the bottom status bar into `scene`. Overlays
 /// (hover popover / autocomplete) differ per caller and are drawn separately. Shared by
@@ -1564,6 +1596,14 @@ impl ApplicationHandler<WritEvent> for App {
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
+                // Pressing/releasing Ctrl while stationary over a link flips the pointer.
+                update_link_cursor(
+                    &mut self.doc_engine,
+                    self.modifiers,
+                    self.mouse_pos,
+                    &mut self.cursor_icon,
+                    &state.window,
+                );
             }
             WindowEvent::Ime(winit::event::Ime::Enabled) => {
                 self.doc_engine.preedit = None;
@@ -1728,6 +1768,16 @@ impl ApplicationHandler<WritEvent> for App {
                     if changed {
                         state.window.request_redraw();
                     }
+                }
+                // Ctrl-hover over a link shows the pointer cursor (skip while drag-selecting).
+                if !self.mouse_down {
+                    update_link_cursor(
+                        &mut self.doc_engine,
+                        self.modifiers,
+                        self.mouse_pos,
+                        &mut self.cursor_icon,
+                        &state.window,
+                    );
                 }
             }
             WindowEvent::MouseInput {
