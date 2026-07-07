@@ -52,8 +52,10 @@ pub enum ImageState {
     Loading,
     /// Decoded and ready to paint.
     Loaded(Arc<LoadedImage>),
-    /// The fetch or decode failed (missing file, network error, bad bytes).
-    Failed,
+    /// The fetch, decode, or render failed. Carries a short human-readable reason when one
+    /// is available (e.g. a mermaid/LaTeX syntax error), shown in the placeholder so the
+    /// author sees what went wrong; `None` for a plain image load failure.
+    Failed(Option<Arc<str>>),
 }
 
 /// Thread-safe cache of image load states, shared across clones (like the GitHub
@@ -95,7 +97,15 @@ impl ImageCache {
         self.inner
             .lock()
             .unwrap()
-            .insert(url.to_string(), ImageState::Failed);
+            .insert(url.to_string(), ImageState::Failed(None));
+    }
+
+    /// Mark failed with a short reason (mermaid/LaTeX syntax error) shown in the placeholder.
+    pub fn set_failed_with(&self, url: &str, reason: impl Into<Arc<str>>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(url.to_string(), ImageState::Failed(Some(reason.into())));
     }
 }
 

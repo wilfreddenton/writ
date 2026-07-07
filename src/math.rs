@@ -59,55 +59,73 @@ pub fn key_for(job: &MathJob) -> String {
     format!("math:{:016x}", h.finish())
 }
 
-/// Render math to a paintable image. `None` on a parse error, a panic (adversarial input
-/// can panic layout/render), an empty result, or a decode failure. The returned image's
-/// `display_w/display_h` are LOGICAL px (raster ÷ dpr, matching the SVG-decode convention
-/// so `build_image_block`/inline sizing scale it right on hidpi), and `baseline` is set to
-/// the logical px from the image top to the math baseline (for inline placement).
-fn render_to_image(job: &MathJob) -> Option<LoadedImage> {
-    catch_unwind(AssertUnwindSafe(|| {
-        let nodes = parse(&job.latex).ok()?;
-        let (r, g, b) = job.fg;
-        let opts = LayoutOptions {
-            style: if job.display {
-                MathStyle::Display
-            } else {
-                MathStyle::Text
-            },
-            color: Color { r, g, b, a: 1.0 },
-            ..Default::default()
-        };
-        let dl = to_display_list(&layout(&nodes, &opts));
-        let total_h = (dl.height + dl.depth) as f32;
-        if dl.width <= 0.0 || total_h <= 0.0 {
-            return None;
-        }
-        let em = job.font_px;
-        // Clamp the device-pixel-ratio so neither raster dimension crosses MAX_RASTER.
-        let base_w = dl.width as f32 * em + 2.0 * PAD;
-        let base_h = total_h * em + 2.0 * PAD;
-        let dpr = job.scale.min(MAX_RASTER / base_w.max(base_h)).max(0.01);
-        let ropts = RenderOptions {
-            font_size: em,
-            padding: PAD,
-            background_color: Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            },
-            font_dir: String::new(),
-            device_pixel_ratio: dpr,
-        };
-        let png = render_to_png(&dl, &ropts).ok()?;
-        let mut img = decode(&png)?;
-        img.display_w = img.width as f32 / dpr;
-        img.display_h = img.height as f32 / dpr;
-        img.baseline = Some(dl.height as f32 * em + PAD);
-        Some(img)
-    }))
-    .ok()
-    .flatten()
+/// Longest error kept for the placeholder — enough for a RaTeX parse error without letting a
+/// pathological message blow up the box.
+const MAX_ERR_LEN: usize = 200;
+
+/// Collapse whitespace and cap length so a parse error fits the placeholder box.
+fn truncate_err(msg: &str) -> String {
+    let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one_line.char_indices().nth(MAX_ERR_LEN) {
+        Some((byte, _)) => format!("{}…", &one_line[..byte]),
+        None => one_line,
+    }
+}
+
+/// Render math to a paintable image. `Ok(img)` on success; `Err(Some(msg))` on a LaTeX parse
+/// error (shown in the block-math placeholder so the author sees the mistake); `Err(None)` on
+/// a panic, empty result, or decode/render failure. The returned image's `display_w/display_h`
+/// are LOGICAL px (raster ÷ dpr, matching the SVG-decode convention so `build_image_block`/
+/// inline sizing scale it right on hidpi), and `baseline` is the logical px from the image top
+/// to the math baseline (for inline placement).
+fn render_to_image(job: &MathJob) -> Result<LoadedImage, Option<String>> {
+    let out = catch_unwind(AssertUnwindSafe(
+        || -> Result<LoadedImage, Option<String>> {
+            let nodes = parse(&job.latex).map_err(|e| Some(truncate_err(&e.to_string())))?;
+            let (r, g, b) = job.fg;
+            let opts = LayoutOptions {
+                style: if job.display {
+                    MathStyle::Display
+                } else {
+                    MathStyle::Text
+                },
+                color: Color { r, g, b, a: 1.0 },
+                ..Default::default()
+            };
+            let dl = to_display_list(&layout(&nodes, &opts));
+            let total_h = (dl.height + dl.depth) as f32;
+            if dl.width <= 0.0 || total_h <= 0.0 {
+                return Err(None);
+            }
+            let em = job.font_px;
+            // Clamp the device-pixel-ratio so neither raster dimension crosses MAX_RASTER.
+            let base_w = dl.width as f32 * em + 2.0 * PAD;
+            let base_h = total_h * em + 2.0 * PAD;
+            let dpr = job.scale.min(MAX_RASTER / base_w.max(base_h)).max(0.01);
+            let ropts = RenderOptions {
+                font_size: em,
+                padding: PAD,
+                background_color: Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                },
+                font_dir: String::new(),
+                device_pixel_ratio: dpr,
+            };
+            let png = render_to_png(&dl, &ropts).map_err(|_| None)?;
+            let mut img = decode(&png).ok_or(None)?;
+            img.display_w = img.width as f32 / dpr;
+            img.display_h = img.height as f32 / dpr;
+            img.baseline = Some(dl.height as f32 * em + PAD);
+            Ok(img)
+        },
+    ));
+    match out {
+        Ok(r) => r,
+        Err(_) => Err(None), // layout/render panicked on adversarial input
+    }
 }
 
 /// For each `(key, job)` with no cache entry, mark it loading and render on a worker thread
@@ -129,8 +147,9 @@ pub fn spawn_math_renders(
         let job = job.clone();
         std::thread::spawn(move || {
             match render_to_image(&job) {
-                Some(img) => cache.set_loaded(&key, img),
-                None => cache.set_failed(&key),
+                Ok(img) => cache.set_loaded(&key, img),
+                Err(Some(msg)) => cache.set_failed_with(&key, msg),
+                Err(None) => cache.set_failed(&key),
             }
             notify();
         });
@@ -144,8 +163,9 @@ pub fn render_math_blocking(jobs: &[(String, MathJob)], cache: &ImageCache) {
             continue;
         }
         match render_to_image(job) {
-            Some(img) => cache.set_loaded(key, img),
-            None => cache.set_failed(key),
+            Ok(img) => cache.set_loaded(key, img),
+            Err(Some(msg)) => cache.set_failed_with(key, msg),
+            Err(None) => cache.set_failed(key),
         }
     }
 }

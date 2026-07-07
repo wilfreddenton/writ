@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use parley::{Affinity, Cluster, Cursor, PositionedLayoutItem};
 use ropey::Rope;
@@ -554,7 +555,10 @@ enum ImageBlockKind {
         dest_h: f32,
     },
     Loading,
-    Failed,
+    /// Failed render/load; `reason` is a short error (mermaid/LaTeX syntax) shown in the box.
+    Failed {
+        reason: Option<Arc<str>>,
+    },
 }
 
 /// Draw data for one inline image, indexed by its Parley inline-box `id`. The box's
@@ -758,10 +762,10 @@ fn build_image_block(
             };
             (block, dh + 2.0 * vpad)
         }
-        Some(ImageState::Failed) => (
+        Some(ImageState::Failed(reason)) => (
             ImageBlock {
                 alt: img.alt.clone(),
-                kind: ImageBlockKind::Failed,
+                kind: ImageBlockKind::Failed { reason },
             },
             IMG_PLACEHOLDER_H * scale,
         ),
@@ -2332,7 +2336,7 @@ impl DocLayout {
                         );
                     scene.draw_image(brush, transform);
                 }
-                ImageBlockKind::Loading | ImageBlockKind::Failed => {
+                ImageBlockKind::Loading | ImageBlockKind::Failed { .. } => {
                     let line_bottom = (self.tops[i + 1] - self.scroll_y) as f64;
                     let x1 = (self.width - self.pad_x) as f64;
                     let bottom = line_bottom - self.img_vpad as f64;
@@ -2345,18 +2349,21 @@ impl DocLayout {
                         None,
                         &rect,
                     );
-                    let failed = matches!(block.kind, ImageBlockKind::Failed);
-                    let label = if block.alt.is_empty() {
-                        if failed {
-                            "broken image"
-                        } else {
-                            "loading image…"
+                    let reason = match &block.kind {
+                        ImageBlockKind::Failed { reason } => Some(reason),
+                        _ => None,
+                    };
+                    // Failed: `⚠ <alt>: <error>` when the renderer gave a reason (mermaid/LaTeX
+                    // syntax error), so the author sees what to fix; else a generic message.
+                    let label = match reason {
+                        Some(Some(msg)) if !block.alt.is_empty() => {
+                            format!("⚠ {}: {msg}", block.alt)
                         }
-                        .to_string()
-                    } else if failed {
-                        format!("⚠ {}", block.alt)
-                    } else {
-                        block.alt.clone()
+                        Some(Some(msg)) => format!("⚠ {msg}"),
+                        Some(None) if block.alt.is_empty() => "broken image".to_string(),
+                        Some(None) => format!("⚠ {}", block.alt),
+                        None if block.alt.is_empty() => "loading image…".to_string(),
+                        None => block.alt.clone(),
                     };
                     let pad = self.img_label_size * 0.5;
                     let layout = engine.build_line(
