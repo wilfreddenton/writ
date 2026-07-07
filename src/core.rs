@@ -1652,8 +1652,16 @@ impl Editor {
     /// Only parse/snapshot/diff work — no IO.
     pub fn apply_reload(&mut self, content: String, base_text: Option<String>) {
         if !self.state.buffer.content_eq(&content) {
+            // Persist folds across the reload: remap their offsets from the actual
+            // splice (external edits are usually a localized change), the same way a
+            // local edit does. `set_text` leaves `folded_headings` untouched, so without
+            // this the old offsets would land on the wrong lines in the new content.
+            let before = (!self.folded_headings.is_empty()).then(|| self.state.buffer.text());
             let cursor_line = self.state.buffer.byte_to_line(self.state.selection.head);
             self.set_text(&content);
+            if let Some(before) = before {
+                self.remap_folds(&before, &content);
+            }
             let line = cursor_line.min(self.state.buffer.line_count().saturating_sub(1));
             let offset = self.state.buffer.line_to_byte(line);
             self.state.selection = Selection::new(offset, offset);
@@ -2530,6 +2538,24 @@ let code = target(); // fenced block line
             e.text(),
             "a a a\n",
             "one undo reverts the whole replace-all"
+        );
+    }
+
+    #[test]
+    fn folds_persist_and_remap_across_reload() {
+        let mut e = Editor::new("# One\nbody\n## Two\nmore\n");
+        let two = e.text().find("## Two").unwrap();
+        e.toggle_fold(two);
+        assert!(e.folded_headings.contains(&two));
+        // An external edit prepends a line; the reload should shift the fold offset so it
+        // still lands on the (moved) heading rather than pointing at stale bytes.
+        let prefix = "intro line\n";
+        e.apply_reload(format!("{prefix}# One\nbody\n## Two\nmore\n"), None);
+        let two_after = e.text().find("## Two").unwrap();
+        assert_eq!(two_after, two + prefix.len());
+        assert!(
+            e.folded_headings.contains(&two_after),
+            "fold should remap to the heading's new offset after reload"
         );
     }
 

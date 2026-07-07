@@ -121,6 +121,10 @@ pub struct LineRender {
     pub table: Option<TableLineRef>,
 }
 
+/// Font-size multiplier for fenced code blocks — slightly smaller than body, matching
+/// how GitHub/most editors render code denser than prose.
+const CODE_BLOCK_SCALE: f32 = 0.9;
+
 /// Font-size multiplier for a heading level (1 = largest). 0 = body text. A modular type
 /// scale on the Major Third ratio (1.25), anchored so H6 = body size (the floor — no
 /// heading is ever smaller than body) and each step up is 1.25× the last, giving large,
@@ -217,9 +221,16 @@ pub fn build_line_render(
     let line_end = line_start + line_text.len();
 
     let heading_level = markers.heading_level().unwrap_or(0);
-    let font_size = base_font_size * heading_scale(heading_level);
-    let cursor_on_line = cursor_in(&range, cursor_offset);
     let in_code_block = markers.in_code_block || markers.is_fence();
+    // Fenced code renders slightly smaller (GitHub-style) so a code block reads as a
+    // denser, distinct block instead of competing with body prose. Headings and code are
+    // mutually exclusive, so the two scales never combine.
+    let font_size = if in_code_block {
+        base_font_size * CODE_BLOCK_SCALE
+    } else {
+        base_font_size * heading_scale(heading_level)
+    };
+    let cursor_on_line = cursor_in(&range, cursor_offset);
 
     // Grid table row: the cursor is off the whole table block, so this line hides its
     // raw pipe text and the draw path paints the cell grid. While the cursor is inside
