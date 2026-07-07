@@ -127,6 +127,18 @@ Pipe tables render as a live grid — bold header, per-column alignment (`:--`/`
 
 Ctrl+F opens a find bar docked above the status bar; Ctrl+H adds the replace row. Matches highlight live with a count, and the current match is emphasized; Enter/Shift+Enter cycle through them. Toggle regular expressions (Alt+R, with `$1` capture groups in the replacement) and case sensitivity (Alt+C). Enter in the replace field swaps the current match, Ctrl+Enter replaces all in one undo step. Click into the document to keep the bar open while you edit.
 
+### Folding
+
+Headings and nested lists fold from the gutter. Hover the left margin to reveal a chevron on any foldable line and click to collapse its section; the outline mirrors what's folded. Modifier-clicks scope the fold: Ctrl folds every section at that level, Shift folds recursively, Ctrl+Shift folds that level and everything deeper. Jumping to a hidden line auto-unfolds it. Task lists fold the same way, so a long checklist collapses to its parent item.
+
+### Mermaid Diagrams
+
+Fenced ` ```mermaid ` blocks render inline as diagrams. Rendering runs off the UI thread and is cached, so scrolling stays smooth. Drag a selection through a diagram (or move the cursor onto its block) and it de-sugars back to the raw source you're actually editing, then snaps back to the rendered diagram when you leave.
+
+### Math
+
+LaTeX math renders inline via RaTeX with the KaTeX fonts embedded. Block `$$…$$` renders as centered display math on its own line; inline `$…$` renders as a baseline-aligned box within the text (the GitHub/pandoc rule keeps prose like "$5 and $10" literal). Glyphs take the theme foreground color. As with mermaid, moving the cursor into a span reveals its raw source for editing.
+
 ## Library Usage
 
 writ is also a library: its rendering and editing layers work independently of the
@@ -196,7 +208,7 @@ and opt into only what you need:
 
 ```toml
 # render-only: pulls in none of tokio/reqwest/gix/github/winit
-writ = { version = "0.14", default-features = false }
+writ = { version = "0.15", default-features = false }
 ```
 
 | Feature | Adds |
@@ -205,6 +217,9 @@ writ = { version = "0.14", default-features = false }
 | `git` | inline-diff base sourced from git `HEAD` (gix) |
 | `github` | GitHub ref validation + `#`/`@` autocomplete |
 | `watch` | live file-reload on external edits |
+| `remote-images` | fetch `http(s)` image URLs (adds tokio/reqwest) |
+| `mermaid` | render fenced `mermaid` blocks as diagrams |
+| `math` | render `$…$` / `$$…$$` LaTeX math (RaTeX) |
 | `editor` | the full `core::Editor` orchestration (implies `git`, `github`, `watch`) |
 | `app` *(default)* | the winit + Vello desktop application |
 | `ghosttext` | the `writd` GhostText daemon |
