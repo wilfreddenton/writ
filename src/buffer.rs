@@ -687,13 +687,12 @@ impl BufferContent {
     }
 
     fn compute_new_end_point(&self, start: Point, text: &str) -> Point {
-        let newlines: Vec<_> = text.match_indices('\n').collect();
-        if newlines.is_empty() {
-            Point::new(start.row, start.column + text.len())
-        } else {
-            let last_newline_pos = newlines.last().unwrap().0;
-            let column = text.len() - last_newline_pos - 1;
-            Point::new(start.row + newlines.len(), column)
+        match text.rfind('\n') {
+            None => Point::new(start.row, start.column + text.len()),
+            Some(last) => {
+                let rows = text.bytes().filter(|&b| b == b'\n').count();
+                Point::new(start.row + rows, text.len() - last - 1)
+            }
         }
     }
 

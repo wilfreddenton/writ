@@ -51,10 +51,23 @@ impl PasteContext {
 
 /// Normalize line endings and curly quotes.
 fn normalize(text: &str) -> String {
-    text.replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace(['\u{201C}', '\u{201D}'], "\"")
-        .replace(['\u{2018}', '\u{2019}'], "'")
+    // Single pass: CRLF/CR → LF, and curly quotes → ASCII, in one allocation.
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\u{201C}' | '\u{201D}' => out.push('"'),
+            '\u{2018}' | '\u{2019}' => out.push('\''),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Transform pasted content based on context.

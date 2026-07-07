@@ -1472,24 +1472,20 @@ impl Editor {
             AutocompleteTrigger::User => true,
         };
 
+        // `old` is owned, so when the trigger matches MOVE its suggestions/selection/prefix
+        // into the new state (a prefix keystroke keeps them) — no per-keystroke Vec clone.
+        let (suggestions, selected_index, fetched_prefix) = match old.filter(|_| same_trigger) {
+            Some(ac) => (ac.suggestions, ac.selected_index, ac.fetched_prefix),
+            None => (Vec::new(), 0, None),
+        };
         self.autocomplete = Some(AutocompleteState {
             trigger,
             trigger_offset,
             prefix,
-            suggestions: old
-                .as_ref()
-                .filter(|_| same_trigger)
-                .map(|ac| ac.suggestions.clone())
-                .unwrap_or_default(),
-            selected_index: old
-                .as_ref()
-                .filter(|_| same_trigger)
-                .map(|ac| ac.selected_index)
-                .unwrap_or(0),
+            suggestions,
+            selected_index,
             loading: false,
-            fetched_prefix: old
-                .filter(|_| same_trigger)
-                .and_then(|ac| ac.fetched_prefix),
+            fetched_prefix,
         });
         should_fetch
     }

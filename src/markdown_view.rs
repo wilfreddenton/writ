@@ -151,11 +151,8 @@ impl MarkdownView {
     ///
     /// [`set_image_bytes`]: MarkdownView::set_image_bytes
     /// [`set_image_failed`]: MarkdownView::set_image_failed
-    pub fn image_urls(&self) -> Vec<String> {
-        self.doc
-            .as_ref()
-            .map(|d| d.image_urls().to_vec())
-            .unwrap_or_default()
+    pub fn image_urls(&self) -> &[String] {
+        self.doc.as_ref().map_or(&[], |d| d.image_urls())
     }
 
     /// Hand decoded image bytes for `url` to the view (the consumer fetched them). On a

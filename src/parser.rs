@@ -87,6 +87,8 @@ impl MarkdownParser {
         // The leaf nodes whose inner text gets a second (inline) parse pass.
         let is_leaf = |kind: &str| kind == "inline" || kind == "pipe_table_cell";
 
+        // Reused across nodes: the interstitial ranges fed to `set_included_ranges`.
+        let mut ranges: Vec<Range> = Vec::new();
         let mut i = 0;
         'outer: loop {
             let node = loop {
@@ -107,7 +109,7 @@ impl MarkdownParser {
             // past that child. This excludes the children's own spans (which get their own
             // injection) so the block highlighter only re-parses the interstitial text.
             let mut range = node.range();
-            let mut ranges = Vec::new();
+            ranges.clear();
             if tree_cursor.goto_first_child() {
                 while tree_cursor.goto_next_sibling() {
                     if !tree_cursor.node().is_named() {

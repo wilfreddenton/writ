@@ -407,10 +407,13 @@ pub fn highlight_mermaid(src: &str) -> Vec<HighlightSpan> {
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                 i += 1;
             }
-            let word = src[start..i].to_ascii_lowercase();
-            if is_flowchart && MERMAID_DIRECTIONS.contains(&word.as_str()) {
+            // Case-insensitive compare against the (lowercase) keyword lists WITHOUT
+            // allocating a lowercased copy per word — node ids never match, so this is hot.
+            let word = &src[start..i];
+            let matches = |list: &[&str]| list.iter().any(|k| k.eq_ignore_ascii_case(word));
+            if is_flowchart && matches(MERMAID_DIRECTIONS) {
                 spans.push(span(start..i, constant));
-            } else if MERMAID_COMMON.contains(&word.as_str()) || type_kw.contains(&word.as_str()) {
+            } else if matches(MERMAID_COMMON) || matches(type_kw) {
                 spans.push(span(start..i, kw));
             }
             continue;

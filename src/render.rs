@@ -196,10 +196,12 @@ pub fn build_line_render(
     // `table_context_at_line`, so a caret at a row's left edge or at the last row's end —
     // where `offset == block.end` for a table ending at EOF with no trailing newline —
     // still counts as inside the block and reveals.
-    let cursor_line_start = snapshot
-        .line_byte_range(rope.byte_to_line(cursor_offset.min(rope.len_bytes())))
-        .start;
     let table_ref = table_ctx.as_ref().and_then(|tc| {
+        // Only table lines need the cursor's line start (a rope line lookup), so compute it
+        // here rather than for every laid-out line.
+        let cursor_line_start = snapshot
+            .line_byte_range(rope.byte_to_line(cursor_offset.min(rope.len_bytes())))
+            .start;
         (!tc.block.contains(&cursor_line_start)).then_some(TableLineRef {
             table_start: tc.block.start,
             kind: tc.kind,

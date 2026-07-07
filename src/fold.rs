@@ -32,9 +32,15 @@ pub fn heading_extent(headings: &[HeadingInfo], idx: usize, line_count: usize) -
 }
 
 /// Whether folding this heading would hide at least one line (drives chevron display).
+/// O(1): the extent is non-empty iff the next heading is a deeper child, or the next
+/// sibling/higher heading (or EOF) leaves at least one body line — no forward scan needed.
 pub fn heading_is_foldable(headings: &[HeadingInfo], idx: usize, line_count: usize) -> bool {
-    let r = heading_extent(headings, idx, line_count);
-    r.end > r.start
+    let h = &headings[idx];
+    match headings.get(idx + 1) {
+        None => h.line + 1 < line_count,
+        Some(next) if next.level > h.level => true,
+        Some(next) => next.line > h.line + 1,
+    }
 }
 
 /// Lines hidden when `list_items[idx]` folds: its nested/continuation lines, from the
