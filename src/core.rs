@@ -814,9 +814,14 @@ impl Editor {
     /// matching the TextMate/VS Code "fold recursively" convention.
     pub fn toggle_fold_recursive(&mut self, byte_offset: usize) {
         let offs = self.recursive_fold_set(byte_offset);
-        if offs.is_empty() {
-            return;
+        if !offs.is_empty() {
+            self.apply_group_fold(byte_offset, offs);
         }
+    }
+
+    /// Fold or unfold `offs` as a group, keyed on the anchor: fold (insert all) when the
+    /// anchor is currently unfolded, else unfold (remove all). Re-clamps the caret.
+    fn apply_group_fold(&mut self, byte_offset: usize, offs: Vec<usize>) {
         let folding = !self.folded_headings.contains(&byte_offset);
         for off in offs {
             if folding {
@@ -906,15 +911,7 @@ impl Editor {
             })
             .map(|(_, it)| it.byte_offset)
             .collect();
-        let folding = !self.folded_headings.contains(&byte_offset);
-        for off in offs {
-            if folding {
-                self.folded_headings.insert(off);
-            } else {
-                self.folded_headings.remove(&off);
-            }
-        }
-        self.clamp_cursor_to_visible();
+        self.apply_group_fold(byte_offset, offs);
     }
 
     /// Fold the thing the cursor is in: the innermost foldable list item the caret sits
@@ -1009,38 +1006,33 @@ impl Editor {
         }
     }
 
-    /// Fold to a heading depth: collapse exactly the sections at `level`, replacing any
-    /// current folds. Headings shallower than `level` stay visible (with their bodies),
-    /// and everything below a level-`level` heading hides — so expanding one reveals its
-    /// whole subtree at once. Level 1 leaves only the top-level headings showing.
-    pub fn fold_to_level(&mut self, level: u8) {
+    /// Replace the fold set with every foldable heading whose level satisfies `level_ok`.
+    fn fold_headings_where(&mut self, level_ok: impl Fn(u8) -> bool) {
         let line_count = self.state.buffer.line_count();
         let headings = self.state.buffer.headings();
         self.folded_headings = headings
             .iter()
             .enumerate()
             .filter(|(i, h)| {
-                h.level == level && fold::heading_is_foldable(headings, *i, line_count)
+                level_ok(h.level) && fold::heading_is_foldable(headings, *i, line_count)
             })
             .map(|(_, h)| h.byte_offset)
             .collect();
         self.clamp_cursor_to_visible();
     }
 
+    /// Fold to a heading depth: collapse exactly the sections at `level`, replacing any
+    /// current folds. Headings shallower than `level` stay visible (with their bodies),
+    /// and everything below a level-`level` heading hides — so expanding one reveals its
+    /// whole subtree at once. Level 1 leaves only the top-level headings showing.
+    pub fn fold_to_level(&mut self, level: u8) {
+        self.fold_headings_where(|l| l == level);
+    }
+
     /// Deep variant of [`fold_to_level`]: fold every foldable heading at `level` or deeper,
     /// pre-collapsing descendants so expanding a section reveals its children still folded.
     pub fn fold_to_level_deep(&mut self, level: u8) {
-        let line_count = self.state.buffer.line_count();
-        let headings = self.state.buffer.headings();
-        self.folded_headings = headings
-            .iter()
-            .enumerate()
-            .filter(|(i, h)| {
-                h.level >= level && fold::heading_is_foldable(headings, *i, line_count)
-            })
-            .map(|(_, h)| h.byte_offset)
-            .collect();
-        self.clamp_cursor_to_visible();
+        self.fold_headings_where(|l| l >= level);
     }
 
     /// Auto-unfold any folded section the caret has entered (search-jump, outline click,
@@ -1115,18 +1107,7 @@ impl Editor {
             return;
         }
 
-        let escaped;
-        let base = if regex {
-            query.as_str()
-        } else {
-            escaped = regex::escape(&query);
-            escaped.as_str()
-        };
-        let pattern = if case {
-            base.to_string()
-        } else {
-            format!("(?i){base}")
-        };
+        let pattern = Self::build_find_pattern(&query, regex, case);
 
         let matches: Vec<Range<usize>> = match Regex::new(&pattern) {
             Ok(re) => {
@@ -1215,24 +1196,30 @@ impl Editor {
     /// queries are `regex::escape`d, `(?i)` prepended when case-insensitive) so replace
     /// can expand `$1`/`${name}` capture groups against a matched slice. `None` for an
     /// empty or invalid pattern.
+    /// Build the regex source for a find query: literal queries are `regex::escape`d, and
+    /// `(?i)` is prepended when the search is case-insensitive.
+    fn build_find_pattern(query: &str, regex: bool, case_sensitive: bool) -> String {
+        let escaped;
+        let base = if regex {
+            query
+        } else {
+            escaped = regex::escape(query);
+            escaped.as_str()
+        };
+        if case_sensitive {
+            base.to_string()
+        } else {
+            format!("(?i){base}")
+        }
+    }
+
     fn find_regex(&self) -> Option<Regex> {
         let find = self.find.as_ref()?;
         let query = find.search.text();
         if query.is_empty() {
             return None;
         }
-        let escaped;
-        let base = if find.regex {
-            query
-        } else {
-            escaped = regex::escape(query);
-            escaped.as_str()
-        };
-        let pattern = if find.case_sensitive {
-            base.to_string()
-        } else {
-            format!("(?i){base}")
-        };
+        let pattern = Self::build_find_pattern(query, find.regex, find.case_sensitive);
         Regex::new(&pattern).ok()
     }
 

@@ -623,25 +623,31 @@ impl EditorState {
         states
     }
 
-    fn increment_ordered_marker(marker: &str) -> String {
+    /// Split an ordered marker (`1.`, `10)`) into its number and the suffix after the digits
+    /// (`.`/`)`). `None` when there's no leading digit run.
+    fn split_ordered_marker(marker: &str) -> Option<(usize, &str)> {
         let num_end = marker
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(marker.len());
         if num_end == 0 {
-            return marker.to_string();
+            return None;
         }
-        let num: usize = marker[..num_end].parse().unwrap_or(1);
-        format!("{}{}", num + 1, &marker[num_end..])
+        let num = marker[..num_end].parse().unwrap_or(1);
+        Some((num, &marker[num_end..]))
+    }
+
+    fn increment_ordered_marker(marker: &str) -> String {
+        match Self::split_ordered_marker(marker) {
+            Some((num, suffix)) => format!("{}{suffix}", num + 1),
+            None => marker.to_string(),
+        }
     }
 
     fn reset_ordered_marker(marker: &str) -> String {
-        let num_end = marker
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(marker.len());
-        if num_end == 0 {
-            return marker.to_string();
+        match Self::split_ordered_marker(marker) {
+            Some((_, suffix)) => format!("1{suffix}"),
+            None => marker.to_string(),
         }
-        format!("1{}", &marker[num_end..])
     }
 
     fn is_in_error_node(&self, node: tree_sitter::Node) -> bool {
@@ -1722,17 +1728,16 @@ impl EditorState {
             return 0;
         }
 
+        // The content span excluding surrounding whitespace — the range the `~~` wraps.
+        let leading_ws = content.len() - content.trim_start().len();
+        let trailing_ws = content.len() - content.trim_end().len();
+        let text_start = content_start + leading_ws;
+        let text_end = content_end - trailing_ws;
+
         if add_strikethrough {
             if trimmed.starts_with("~~") && trimmed.ends_with("~~") {
                 return 0;
             }
-
-            let leading_ws = content.len() - content.trim_start().len();
-            let trailing_ws = content.len() - content.trim_end().len();
-
-            let text_start = content_start + leading_ws;
-            let text_end = content_end - trailing_ws;
-
             // Single replace wrapping the text in `~~` — one undo entry, byte-identical
             // to inserting `~~` at both ends.
             let wrapped = format!("~~{trimmed}~~");
@@ -1747,31 +1752,23 @@ impl EditorState {
                 adjustment += 2;
             }
             adjustment
-        } else {
-            let leading_ws = content.len() - content.trim_start().len();
-            let text_start = content_start + leading_ws;
+        } else if trimmed.starts_with("~~") && trimmed.ends_with("~~") && trimmed.len() >= 4 {
+            // Single replace stripping the wrapping `~~` — one undo entry, byte-identical
+            // to deleting the trailing and leading `~~` separately.
+            let inner = trimmed[2..trimmed.len() - 2].to_string();
+            self.buffer
+                .replace(text_start..text_end, &inner, cursor_pos);
 
-            if trimmed.starts_with("~~") && trimmed.ends_with("~~") && trimmed.len() >= 4 {
-                let trailing_ws = content.len() - content.trim_end().len();
-                let text_end = content_end - trailing_ws;
-
-                // Single replace stripping the wrapping `~~` — one undo entry, byte-identical
-                // to deleting the trailing and leading `~~` separately.
-                let inner = trimmed[2..trimmed.len() - 2].to_string();
-                self.buffer
-                    .replace(text_start..text_end, &inner, cursor_pos);
-
-                let mut adjustment: isize = 0;
-                if cursor_pos > text_start + 2 {
-                    adjustment -= 2;
-                }
-                if cursor_pos > text_end {
-                    adjustment -= 2;
-                }
-                adjustment
-            } else {
-                0
+            let mut adjustment: isize = 0;
+            if cursor_pos > text_start + 2 {
+                adjustment -= 2;
             }
+            if cursor_pos > text_end {
+                adjustment -= 2;
+            }
+            adjustment
+        } else {
+            0
         }
     }
 }
