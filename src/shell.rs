@@ -162,9 +162,9 @@ watch the changes land in real time.
 
 ## Features
 
-- [x] GPU-rendered Markdown (winit + Vello + Parley)
-- [x] Live inline `git HEAD` diff with word-level changes
-- [x] GitHub `#123` / `@user` refs — validated, with hover cards + autocomplete
+- [x] ~~GPU-rendered Markdown (winit + Vello + Parley)~~
+- [x] ~~Live inline `git HEAD` diff with word-level changes~~
+- [x] ~~GitHub `#123` / `@user` refs — validated, with hover cards + autocomplete~~
 - [ ] GFM tables
 - [ ] Multi-cursor
 
