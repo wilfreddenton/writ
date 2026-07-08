@@ -1,6 +1,6 @@
 [package]
 name = "writ"
-version = "0.17.1"
+version = "0.17.2"
 description = "A hybrid markdown editor combining raw text editing with live inline rendering"
 authors = ["Wilfred Denton <wilfred@hey.com>"]
 license = "MIT"
