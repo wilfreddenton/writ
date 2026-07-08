@@ -44,13 +44,14 @@ use crate::consts::{
     CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, OUTLINE_WIDTH, PADDING, STATUS_BAR_H,
     WHEEL_LINE_STEP,
 };
-use crate::core::{AutocompleteSuggestion, AutocompleteTrigger, Editor, FieldFocus, FindMode};
+use crate::core::{
+    AutocompleteSuggestion, AutocompleteTrigger, Editor, FieldFocus, FindMode, WatchKind,
+};
 use crate::doc_layout::{
     DocLayout, GithubRenderData, HeightCache, LayoutParams, LineCache, PreeditView, RenderCache,
     ScreenRect, TableCache,
 };
 use crate::editor::{Direction, EditorTheme};
-use crate::fold;
 use crate::git::{detect_github_context, parse_github_repo_string};
 use crate::github::{GitHubClient, ValidationResult};
 use crate::image_cache::ImageCache;
@@ -230,6 +231,10 @@ pub(crate) enum WritEvent {
     /// The watched file changed on disk (forwarded from the file-watcher thread). The
     /// loop kicks off a blocking read off-thread rather than touching disk here.
     FileChanged,
+    /// A watched git dir moved HEAD (commit/checkout, working file untouched). Like
+    /// `FileChanged` but the off-thread read ignores the self-write mtime guard so the
+    /// diff base refreshes; the (unchanged) buffer is left alone via `content_eq`.
+    GitBaseChanged,
     /// The off-thread file read finished; its `(content, base_text)` is in `reload_slot`,
     /// ready for the cheap main-thread apply (buffer swap + diff).
     FileReloaded,
@@ -280,6 +285,17 @@ impl ActiveSurface {
         );
         (self.surface.config.width as f32, editor_h, self.scale)
     }
+}
+
+/// Re-sync the find-bar inset to the editor's current find state and reflow the document
+/// at the new editor height. The single sync point named by `find_bar_h`'s doc comment —
+/// every open/close/scale-change path routes through it so the inset can't drift. Takes
+/// `doc_engine` and `state` separately (they're disjoint `App` fields) so the reflow's
+/// `&mut DocEngine` and the surface's `&mut ActiveSurface` don't alias.
+fn sync_find_chrome(doc_engine: &mut DocEngine, state: &mut ActiveSurface) {
+    state.find_bar_h = find_bar_height(&doc_engine.editor, state.scale);
+    let (w, editor_h, scale) = state.viewport();
+    doc_engine.rebuild_preserving_scroll(w, scale, editor_h);
 }
 
 /// In-progress IME composition (owned form of [`PreeditView`]): the composing `text`
@@ -404,8 +420,12 @@ impl App {
         if let Some(rx) = editor.take_file_watch_rx() {
             let proxy = proxy.clone();
             std::thread::spawn(move || {
-                while rx.recv().is_ok() {
-                    if proxy.send_event(WritEvent::FileChanged).is_err() {
+                while let Ok(kind) = rx.recv() {
+                    let event = match kind {
+                        WatchKind::File => WritEvent::FileChanged,
+                        WatchKind::GitBase => WritEvent::GitBaseChanged,
+                    };
+                    if proxy.send_event(event).is_err() {
                         break;
                     }
                 }
@@ -1392,7 +1412,6 @@ fn draw_fold_chevrons(
     hover: Option<usize>,
     scale: f32,
 ) -> Vec<(usize, ScreenRect)> {
-    let line_count = editor.line_count();
     let (first, last) = doc.visible_range(editor_h);
     // Anchors collapsed inside a folded ancestor are zero-height but still fall inside the
     // contiguous visible-index span — exclude them so no stray chevron paints at the
@@ -1401,21 +1420,14 @@ fn draw_fold_chevrons(
     let visible_foldable = |line: usize| -> bool {
         line >= first && line < last && !hidden.iter().any(|r| r.contains(&line))
     };
-    // Every visible, non-collapsed, foldable anchor — headings AND list items alike; the
-    // draw + hit-rect geometry below is identical for both.
-    let headings = editor.state.buffer.headings();
-    let list_items = editor.state.buffer.list_items();
-    let mut anchors: Vec<(usize, usize)> = Vec::new(); // (line, byte_offset)
-    for (idx, h) in headings.iter().enumerate() {
-        if visible_foldable(h.line) && fold::heading_is_foldable(headings, idx, line_count) {
-            anchors.push((h.line, h.byte_offset));
-        }
-    }
-    for (idx, it) in list_items.iter().enumerate() {
-        if visible_foldable(it.line) && fold::list_item_is_foldable(list_items, idx) {
-            anchors.push((it.line, it.byte_offset));
-        }
-    }
+    // Every visible, non-collapsed, foldable anchor — headings, list items, and callouts
+    // alike; the draw + hit-rect geometry below is identical for all kinds.
+    let anchors: Vec<(usize, usize)> = editor
+        .fold_anchors()
+        .into_iter()
+        .filter(|a| visible_foldable(a.line))
+        .map(|a| (a.line, a.byte_offset))
+        .collect();
 
     let body_left = doc.body_left();
     let s = 9.0 * scale; // chevron glyph size (device px)
@@ -1468,17 +1480,20 @@ impl ApplicationHandler<WritEvent> for App {
     /// A tokio task finished (validation/suggestion). Results are already in the
     /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WritEvent) {
-        // The watched file changed on disk: read it (fs + git HEAD) on a blocking worker
-        // so the render thread never touches disk, then finish on FileReloaded.
-        if matches!(event, WritEvent::FileChanged) {
+        // The watched file (or a git dir) changed: read it (fs + git HEAD) on a blocking
+        // worker so the render thread never touches disk, then finish on FileReloaded. A
+        // git-only change ignores the self-write mtime guard so the diff base still
+        // refreshes when the working file is untouched (`apply_reload` no-ops the buffer).
+        if matches!(event, WritEvent::FileChanged | WritEvent::GitBaseChanged) {
             let Some(path) = self.doc_engine.editor.file_path().map(|p| p.to_path_buf()) else {
                 return;
             };
+            let ignore_self_write = matches!(event, WritEvent::GitBaseChanged);
             let last_mtime = self.doc_engine.editor.last_save_mtime();
             let slot = self.reload_slot.clone();
             let proxy = self.proxy.clone();
             self.runtime.spawn_blocking(move || {
-                if let Some(data) = Editor::read_reload(&path, last_mtime) {
+                if let Some(data) = Editor::read_reload(&path, last_mtime, ignore_self_write) {
                     *slot.lock().unwrap() = Some(data);
                     let _ = proxy.send_event(WritEvent::FileReloaded);
                 }
@@ -1606,6 +1621,10 @@ impl ApplicationHandler<WritEvent> for App {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 state.scale = scale_factor as f32;
+                // Text metrics and the find bar are scale-dependent, so a DPI change
+                // (e.g. dragging the window to another monitor) must recompute the bar
+                // height and relayout at the new scale, not just redraw stale geometry.
+                sync_find_chrome(&mut self.doc_engine, state);
                 state.window.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -2029,8 +2048,20 @@ impl ApplicationHandler<WritEvent> for App {
                     // rather than placing the caret in the box.
                     if let Some(line) = self.doc_engine.editor.checkbox_at(off) {
                         self.doc_engine.editor.toggle_checkbox(line);
-                        self.doc_engine.refresh(w, state.scale, vh);
-                        state.window.request_redraw();
+                        // A checkbox flip is a real buffer edit — run the full effect
+                        // pipeline (find-rescan, ref/image sync) rather than a bare refresh
+                        // that would leave find highlights and detection stale.
+                        apply_edit_effects(
+                            &mut self.doc_engine,
+                            &mut self.hovered,
+                            &self.runtime,
+                            &self.proxy,
+                            None,
+                            &state.window,
+                            w,
+                            state.scale,
+                            vh,
+                        );
                         return;
                     }
                     // A click on an image block hit-tests to the line start (the image
@@ -2113,9 +2144,8 @@ impl ApplicationHandler<WritEvent> for App {
                     && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("h"));
                 if open_find || open_replace {
                     self.doc_engine.editor.open_find(open_replace);
-                    state.find_bar_h = find_bar_height(&self.doc_engine.editor, state.scale);
-                    let (fw, feh, fscale) = state.viewport();
-                    self.doc_engine.rebuild_preserving_scroll(fw, fscale, feh);
+                    sync_find_chrome(&mut self.doc_engine, state);
+                    let (_, feh, _) = state.viewport();
                     if let Some(doc) = self.doc_engine.doc.as_mut() {
                         doc.scroll_to(self.doc_engine.editor.cursor_position(), feh);
                     }
@@ -2181,9 +2211,7 @@ impl ApplicationHandler<WritEvent> for App {
                     && matches!(&event.logical_key, Key::Named(NamedKey::Escape))
                 {
                     self.doc_engine.editor.close_find();
-                    state.find_bar_h = find_bar_height(&self.doc_engine.editor, state.scale);
-                    let (fw, feh, fscale) = state.viewport();
-                    self.doc_engine.rebuild_preserving_scroll(fw, fscale, feh);
+                    sync_find_chrome(&mut self.doc_engine, state);
                     state.window.request_redraw();
                     return;
                 }

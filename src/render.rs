@@ -121,6 +121,16 @@ pub struct LineRender {
     pub table: Option<TableLineRef>,
 }
 
+/// Header styling for a callout's first line (`> [!type] title`). Built by the caller
+/// (`doc_layout`) from the line's `CalloutInfo` + theme. When the caret is off the line,
+/// the content after `> ` collapses to `display` (icon + title); the whole header content
+/// is drawn in `color`, bold. Raw `[!type]` syntax is revealed while the caret is on it.
+#[derive(Clone)]
+pub struct CalloutHeader {
+    pub display: String,
+    pub color: Color,
+}
+
 /// Font-size multiplier for fenced code blocks — slightly smaller than body, matching
 /// how GitHub/most editors render code denser than prose.
 const CODE_BLOCK_SCALE: f32 = 0.9;
@@ -183,6 +193,29 @@ fn styled_run_for(
     (run, is_code_chip)
 }
 
+/// Push the `Special`s that reduce a styled region to just its content: collapse to its
+/// display text (link label, autolink), else hide the opening/closing delimiters (`**` … `**`).
+/// Shared by the off-cursor line path and the table-cell path.
+fn push_region_specials(specials: &mut Vec<Special>, region: &StyledRegion) {
+    if let Some(dt) = &region.display_text {
+        specials.push(Special::Collapsed {
+            buffer: region.full_range.clone(),
+            display: dt.clone(),
+        });
+    } else {
+        if region.content_range.start > region.full_range.start {
+            specials.push(Special::Hidden(
+                region.full_range.start..region.content_range.start,
+            ));
+        }
+        if region.full_range.end > region.content_range.end {
+            specials.push(Special::Hidden(
+                region.content_range.end..region.full_range.end,
+            ));
+        }
+    }
+}
+
 pub fn build_line_render(
     snapshot: &RenderSnapshot,
     line_idx: usize,
@@ -203,6 +236,9 @@ pub fn build_line_render(
     // no math is revealed here (and always when the `math` feature is off). Computed by the
     // caller, which knows the reveal state; this just tokenizes + colors them.
     latex_ranges: &[Range<usize>],
+    // Set when this line is a callout's `[!type]` header: the marker collapses to an
+    // icon+title in the accent color (raw syntax revealed while the caret is on the line).
+    callout: Option<CalloutHeader>,
 ) -> LineRender {
     let markers = snapshot.line_markers(line_idx);
     let range = markers.range.clone();
@@ -231,6 +267,7 @@ pub fn build_line_render(
         base_font_size * heading_scale(heading_level)
     };
     let cursor_on_line = cursor_in(&range, cursor_offset);
+    let is_callout_header = callout.is_some();
 
     // Grid table row: the cursor is off the whole table block, so this line hides its
     // raw pipe text and the draw path paints the cell grid. While the cursor is inside
@@ -383,9 +420,27 @@ pub fn build_line_render(
                 });
             }
         }
+        // Callout header (`> [!type] title`): with the caret off the line, collapse the
+        // content after `> ` to the icon + title. The `> ` marker keeps its own `"  "`
+        // substitution above (so the quote bar still paints). We skip the inline-region
+        // pass below for this line so a `[!type]` optimistically parsed as a shortcut link
+        // can't also hide its `[`/`]` and clash with this collapse.
+        if let Some(cc) = &callout {
+            let content_buf = markers.content_start();
+            if !cursor_on_line && content_buf >= line_start && content_buf < line_end {
+                specials.push(Special::Collapsed {
+                    buffer: content_buf..line_end,
+                    display: cc.display.clone(),
+                });
+            }
+        }
         // A standalone-image line is fully hidden (the image block draws in its place), so
         // skip the whole inline-collapse pass rather than testing the flag every iteration.
-        let collapse_regions: &[StyledRegion] = if is_standalone_image { &[] } else { &inline };
+        let collapse_regions: &[StyledRegion] = if is_standalone_image || is_callout_header {
+            &[]
+        } else {
+            &inline
+        };
         for (i, region) in collapse_regions.iter().enumerate() {
             if cursor_inside[i] {
                 continue; // reveal the whole region (markers included) for editing
@@ -408,24 +463,7 @@ pub fn build_line_render(
                 inline_image_specs.push((region.full_range.start, url.clone(), alt));
                 continue;
             }
-            if let Some(dt) = &region.display_text {
-                specials.push(Special::Collapsed {
-                    buffer: region.full_range.clone(),
-                    display: dt.clone(),
-                });
-            } else {
-                // Hide the opening and closing delimiters (e.g. `**` … `**`).
-                if region.content_range.start > region.full_range.start {
-                    specials.push(Special::Hidden(
-                        region.full_range.start..region.content_range.start,
-                    ));
-                }
-                if region.full_range.end > region.content_range.end {
-                    specials.push(Special::Hidden(
-                        region.content_range.end..region.full_range.end,
-                    ));
-                }
-            }
+            push_region_specials(&mut specials, region);
         }
     }
 
@@ -433,7 +471,9 @@ pub fn build_line_render(
     // an inline box + paints the rendered math), unless the caret is inside it — then the
     // raw `$…$` shows for editing. Grid tables / standalone-image lines have no text flow.
     let mut inline_math_specs: Vec<(usize, String)> = Vec::new();
-    if !is_grid_table && !is_standalone_image {
+    // A callout header collapses its content to an icon+title, so a `$…$` in the title
+    // must not also paint a math box (would land at the collapsed title's start).
+    if !is_grid_table && !is_standalone_image && !is_callout_header {
         for span in math_spans {
             if span.full_range.start < line_start
                 || span.full_range.end > line_end
@@ -542,24 +582,37 @@ pub fn build_line_render(
             h.bold = true;
             runs.push(h);
         }
-        for (i, region) in inline.iter().enumerate() {
-            // Style the visible content; when revealed, style the whole region.
-            let style_range = if cursor_inside[i] {
-                region.full_range.clone()
-            } else {
-                region.content_range.clone()
-            };
-            let r = map.buffer_range_to_display(style_range);
-            if r.is_empty() {
-                continue;
+        // Callout header: the icon + title (or, with the caret on the line, the raw
+        // `[!type]` syntax) reads in the type's accent color, bold. One run over the whole
+        // line covers it (the `> ` prefix is just spaces). Inline styles are skipped (the
+        // header collapses to the substituted display, or shows raw while editing).
+        if let Some(cc) = &callout {
+            if !text.is_empty() {
+                let mut h = StyleRun::new(0..text.len(), cc.color);
+                h.bold = true;
+                runs.push(h);
             }
-            let (mut run, is_code_chip) = styled_run_for(region, theme, r.clone(), content_color);
-            if is_code_chip {
-                code_ranges.push(r);
+        } else {
+            for (i, region) in inline.iter().enumerate() {
+                // Style the visible content; when revealed, style the whole region.
+                let style_range = if cursor_inside[i] {
+                    region.full_range.clone()
+                } else {
+                    region.content_range.clone()
+                };
+                let r = map.buffer_range_to_display(style_range);
+                if r.is_empty() {
+                    continue;
+                }
+                let (mut run, is_code_chip) =
+                    styled_run_for(region, theme, r.clone(), content_color);
+                if is_code_chip {
+                    code_ranges.push(r);
+                }
+                // A heading's inline content and a checked task's content read bold.
+                run.bold = run.bold || heading_level > 0 || region.checkbox == Some(true);
+                runs.push(run);
             }
-            // A heading's inline content and a checked task's content read bold.
-            run.bold = run.bold || heading_level > 0 || region.checkbox == Some(true);
-            runs.push(run);
         }
     }
 
@@ -641,19 +694,7 @@ pub fn build_cell_render(
     // text is just the styled content — mirroring the off-cursor path in build_line_render.
     let mut specials: Vec<Special> = Vec::new();
     for r in &regions {
-        if let Some(dt) = &r.display_text {
-            specials.push(Special::Collapsed {
-                buffer: r.full_range.clone(),
-                display: dt.clone(),
-            });
-        } else {
-            if r.content_range.start > r.full_range.start {
-                specials.push(Special::Hidden(r.full_range.start..r.content_range.start));
-            }
-            if r.full_range.end > r.content_range.end {
-                specials.push(Special::Hidden(r.content_range.end..r.full_range.end));
-            }
-        }
+        push_region_specials(&mut specials, r);
     }
     let (text, map) = SegmentMap::build(&cell_text, start, &specials);
 
@@ -713,6 +754,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         );
         let link_run = lr
             .runs
@@ -744,6 +786,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         );
         assert!(!lr.runs.iter().any(|r| r.underline));
     }
@@ -757,7 +800,19 @@ mod tests {
         let mut buf: Buffer = "- [x] done\n- [ ] todo\n".parse().unwrap();
         let snap = buf.render_snapshot();
 
-        let done = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[], &[]);
+        let done = build_line_render(
+            &snap,
+            0,
+            &theme,
+            18.0,
+            usize::MAX,
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+        );
         assert!(
             done.runs
                 .iter()
@@ -771,7 +826,19 @@ mod tests {
             "the checkbox itself stays green"
         );
 
-        let todo = build_line_render(&snap, 1, &theme, 18.0, usize::MAX, &[], &[], None, &[], &[]);
+        let todo = build_line_render(
+            &snap,
+            1,
+            &theme,
+            18.0,
+            usize::MAX,
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+        );
         assert!(
             !todo
                 .runs
@@ -801,6 +868,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         );
         assert_eq!(coded.code_ranges.len(), 1, "one code span");
         // The chip covers the visible `foo()` (backticks hidden off-cursor).
@@ -818,6 +886,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         );
         assert!(plain.code_ranges.is_empty(), "no code span, no chip");
     }
@@ -833,13 +902,13 @@ mod tests {
         let snap = buffer.render_snapshot();
 
         // Cursor off the `---` line: text hidden, rule flagged.
-        let lr = build_line_render(&snap, 2, &theme, 18.0, 0, &[], &[], None, &[], &[]);
+        let lr = build_line_render(&snap, 2, &theme, 18.0, 0, &[], &[], None, &[], &[], None);
         assert!(lr.is_hr, "off-line thematic break renders as a rule");
         assert!(lr.text.is_empty(), "the `---` text is hidden");
 
         // Cursor on the `---` line: text revealed, no rule.
         let on = snap.line_markers(2).range.start;
-        let lr = build_line_render(&snap, 2, &theme, 18.0, on, &[], &[], None, &[], &[]);
+        let lr = build_line_render(&snap, 2, &theme, 18.0, on, &[], &[], None, &[], &[], None);
         assert!(!lr.is_hr, "revealed for editing when cursor is on it");
         assert_eq!(lr.text, "---");
     }
@@ -865,6 +934,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         );
         let img = off
             .image
@@ -875,7 +945,19 @@ mod tests {
         assert!(off.text.is_empty(), "the `![alt](url)` markdown is hidden");
 
         // Cursor on the line: reveal the raw markdown, no image block.
-        let on = build_line_render(&snap, 0, &theme, 18.0, 0, &styles[0], &[], None, &[], &[]);
+        let on = build_line_render(
+            &snap,
+            0,
+            &theme,
+            18.0,
+            0,
+            &styles[0],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+        );
         assert!(
             on.image.is_none(),
             "cursor on the line reveals raw markdown"
@@ -902,6 +984,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         );
         assert!(
             lr.image.is_none(),
@@ -932,6 +1015,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         );
         assert_eq!(off.inline_images.len(), 2, "both inline images detected");
         assert!(
@@ -946,8 +1030,19 @@ mod tests {
         assert!(off.image.is_none(), "not a standalone image");
 
         // Caret inside the first image: it reveals, the second stays a box.
-        let in_first =
-            build_line_render(&snap, 0, &theme, 18.0, 2, &styles[0], &[], None, &[], &[]);
+        let in_first = build_line_render(
+            &snap,
+            0,
+            &theme,
+            18.0,
+            2,
+            &styles[0],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+        );
         assert_eq!(
             in_first.inline_images.len(),
             1,
@@ -956,8 +1051,19 @@ mod tests {
         assert!(in_first.text.contains("![a]"), "caret's image shown raw");
 
         // Caret on the line but between the images: both stay boxes.
-        let between =
-            build_line_render(&snap, 0, &theme, 18.0, 13, &styles[0], &[], None, &[], &[]);
+        let between = build_line_render(
+            &snap,
+            0,
+            &theme,
+            18.0,
+            13,
+            &styles[0],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+        );
         assert_eq!(
             between.inline_images.len(),
             2,
@@ -973,13 +1079,37 @@ mod tests {
 
         let mut single: Buffer = "> quoted line\n".parse().unwrap();
         let snap = single.render_snapshot();
-        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[], &[]);
+        let lr = build_line_render(
+            &snap,
+            0,
+            &theme,
+            18.0,
+            usize::MAX,
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+        );
         assert!(!lr.text.contains('▎'), "bar must not be a text glyph");
         assert_eq!(lr.quote_bar_bytes, vec![0], "one gutter at the line start");
 
         let mut nested: Buffer = "> > deeply quoted\n".parse().unwrap();
         let snap = nested.render_snapshot();
-        let lr = build_line_render(&snap, 0, &theme, 18.0, usize::MAX, &[], &[], None, &[], &[]);
+        let lr = build_line_render(
+            &snap,
+            0,
+            &theme,
+            18.0,
+            usize::MAX,
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+        );
         assert_eq!(lr.quote_bar_bytes.len(), 2, "one gutter per nesting level");
         assert_eq!(lr.quote_bar_bytes[0], 0, "outer gutter at line start");
         assert!(
@@ -1014,6 +1144,7 @@ mod tests {
             Some(ctx.clone()),
             &[],
             &[],
+            None,
         );
         assert!(off.table.is_some(), "off-cursor header is a grid row");
         assert!(off.text.is_empty(), "grid row text hidden");
@@ -1030,6 +1161,7 @@ mod tests {
             Some(ctx),
             &[],
             &[],
+            None,
         );
         assert!(on.table.is_none(), "cursor in block reveals raw text");
         assert_eq!(on.text, "| a | b |");
@@ -1063,6 +1195,7 @@ mod tests {
             Some(ctx),
             &[],
             &[],
+            None,
         );
         assert!(
             lr.table.is_none(),

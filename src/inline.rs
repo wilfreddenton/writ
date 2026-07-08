@@ -374,6 +374,12 @@ pub struct NakedUrl {
     pub github_ref: Option<GitHubRef>,
 }
 
+/// Whether `pos` falls inside any of `ranges`. Shared by the inline detectors so that
+/// "skip matches inside code spans / markdown links" is one predicate, not re-inlined.
+fn in_any(ranges: &[Range<usize>], pos: usize) -> bool {
+    ranges.iter().any(|r| r.contains(&pos))
+}
+
 /// Detect naked URLs in a single line of text.
 ///
 /// Returns URLs that are not inside markdown link syntax or code spans.
@@ -391,14 +397,11 @@ pub fn detect_naked_urls(
 ) -> Vec<NakedUrl> {
     let mut urls = Vec::new();
 
-    let is_in_code = |abs_pos: usize| -> bool { code_ranges.iter().any(|r| r.contains(&abs_pos)) };
-    let is_in_link = |abs_pos: usize| -> bool { link_ranges.iter().any(|r| r.contains(&abs_pos)) };
-
     for m in NAKED_URL_RE.find_iter(line) {
         let abs_range = (line_byte_offset + m.start())..(line_byte_offset + m.end());
 
         // Skip if inside code span or markdown link
-        if is_in_code(abs_range.start) || is_in_link(abs_range.start) {
+        if in_any(code_ranges, abs_range.start) || in_any(link_ranges, abs_range.start) {
             continue;
         }
 
@@ -454,6 +457,7 @@ pub fn detect_github_references_in_line(
     line_byte_offset: usize,
     github_context: Option<&GitHubContext>,
     code_ranges: &[Range<usize>],
+    link_ranges: &[Range<usize>],
 ) -> Vec<RawGitHubMatch> {
     // Cheap pre-filter: a line with no `#`/`@`/`/` and no 7+ run of ascii-hex can't
     // contain any reference, so skip all the regex passes (the common prose case).
@@ -463,8 +467,10 @@ pub fn detect_github_references_in_line(
     let mut matches = Vec::new();
     let mut matched_ranges: Vec<Range<usize>> = Vec::new();
 
-    // Helper to check if an absolute byte position is inside a code span
-    let is_in_code = |abs_pos: usize| -> bool { code_ranges.iter().any(|r| r.contains(&abs_pos)) };
+    // A reference inside a code span or a markdown link (`[fixes #123](url)`) is not a
+    // standalone ref — skip it so the link stays clickable and the ref isn't double-styled.
+    let is_skipped =
+        |abs_pos: usize| -> bool { in_any(code_ranges, abs_pos) || in_any(link_ranges, abs_pos) };
 
     // Helper to check if a range overlaps with already matched ranges
     let overlaps_matched = |range: &Range<usize>, matched: &[Range<usize>]| -> bool {
@@ -487,7 +493,7 @@ pub fn detect_github_references_in_line(
         for cap in re.captures_iter(line) {
             let full = cap.get(1).unwrap();
             let abs_range = (line_byte_offset + full.start())..(line_byte_offset + full.end());
-            if is_in_code(abs_range.start) {
+            if is_skipped(abs_range.start) {
                 continue;
             }
             matched_ranges.push(abs_range.clone());
@@ -508,9 +514,14 @@ pub fn detect_github_references_in_line(
 
     // User mentions: @username
     for cap in USER_RE.captures_iter(line) {
-        let full = cap.get(1).unwrap();
+        let full = cap.get(1).unwrap(); // `@username`; `full.start()` is the `@`
         let abs_range = (line_byte_offset + full.start())..(line_byte_offset + full.end());
-        if is_in_code(abs_range.start) {
+        if is_skipped(abs_range.start) {
+            continue;
+        }
+        // Left word-boundary: without this, an email like `foo@example.com` matches
+        // `@example` and underlines "example" (and fires a needless validation request).
+        if full.start() > 0 && !is_word_boundary(full.start() - 1) {
             continue;
         }
         if overlaps_matched(&abs_range, &matched_ranges) {
@@ -531,7 +542,7 @@ pub fn detect_github_references_in_line(
                 let match_start = full_match.start();
                 let match_end = full_match.end();
                 let abs_start = line_byte_offset + match_start;
-                if is_in_code(abs_start) {
+                if is_skipped(abs_start) {
                     continue;
                 }
                 // Check word boundaries
@@ -562,7 +573,7 @@ pub fn detect_github_references_in_line(
             let m = cap.get(1).unwrap();
             let start = m.start();
             let abs_start = line_byte_offset + start;
-            if is_in_code(abs_start) {
+            if is_skipped(abs_start) {
                 continue;
             }
             let abs_range = abs_start..(line_byte_offset + m.end());
@@ -1120,7 +1131,7 @@ mod tests {
     fn test_github_issue_ref() {
         let line = "See #123 for details";
         let ctx = github_ctx();
-        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[]);
+        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[], &[]);
 
         assert_eq!(matches.len(), 1);
         assert!(matches!(
@@ -1135,7 +1146,7 @@ mod tests {
     fn test_github_issue_at_start() {
         let line = "#456 is fixed";
         let ctx = github_ctx();
-        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[]);
+        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[], &[]);
 
         assert_eq!(matches.len(), 1);
         assert!(matches!(
@@ -1149,7 +1160,7 @@ mod tests {
     fn test_github_gh_format() {
         let line = "Fixed in GH-789";
         let ctx = github_ctx();
-        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[]);
+        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[], &[]);
 
         assert_eq!(matches.len(), 1);
         assert!(matches!(
@@ -1161,7 +1172,7 @@ mod tests {
     #[test]
     fn test_github_user_mention() {
         let line = "Thanks @torvalds for the review";
-        let matches = detect_github_references_in_line(line, 0, None, &[]);
+        let matches = detect_github_references_in_line(line, 0, None, &[], &[]);
 
         assert_eq!(matches.len(), 1);
         assert!(matches!(
@@ -1174,7 +1185,7 @@ mod tests {
     #[test]
     fn test_github_cross_repo_issue() {
         let line = "See tokio-rs/tokio#1234";
-        let matches = detect_github_references_in_line(line, 0, None, &[]);
+        let matches = detect_github_references_in_line(line, 0, None, &[], &[]);
 
         assert_eq!(matches.len(), 1);
         assert!(matches!(
@@ -1188,7 +1199,7 @@ mod tests {
     fn test_github_sha_ref() {
         let line = "Fixed in a1b2c3d";
         let ctx = github_ctx();
-        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[]);
+        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[], &[]);
 
         assert_eq!(matches.len(), 1);
         assert!(matches!(
@@ -1200,7 +1211,7 @@ mod tests {
     #[test]
     fn test_github_cross_repo_commit() {
         let line = "See tokio-rs/tokio@abc1234";
-        let matches = detect_github_references_in_line(line, 0, None, &[]);
+        let matches = detect_github_references_in_line(line, 0, None, &[], &[]);
 
         assert_eq!(matches.len(), 1);
         assert!(matches!(
@@ -1221,16 +1232,44 @@ mod tests {
             0,
             Some(&ctx),
             std::slice::from_ref(&code_range),
+            &[],
         );
 
         assert!(matches.is_empty(), "Should not match inside code span");
     }
 
     #[test]
+    fn test_github_ref_inside_link_is_skipped() {
+        let ctx = GitHubContext {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        // `#123` and `@user` inside a markdown link belong to the link, not a ref.
+        let line = "see [fixes #123 by @bob](http://x)";
+        let link = 4..24; // the `[...](...)` span
+        let matches =
+            detect_github_references_in_line(line, 0, Some(&ctx), &[], std::slice::from_ref(&link));
+        assert!(matches.is_empty(), "refs inside a link must be skipped");
+    }
+
+    #[test]
+    fn test_email_domain_is_not_a_mention() {
+        // `foo@example.com` must not match `@example` (no left word boundary).
+        let matches = detect_github_references_in_line("mail foo@example.com", 0, None, &[], &[]);
+        assert!(
+            matches.is_empty(),
+            "email domain should not become an @mention: {matches:?}"
+        );
+        // A real mention after a boundary still matches.
+        let m2 = detect_github_references_in_line("hi @bob there", 0, None, &[], &[]);
+        assert_eq!(m2.len(), 1);
+    }
+
+    #[test]
     fn test_github_no_context_no_simple_refs() {
         let line = "Issue #123 and commit a1b2c3d";
         // Without context, simple #123 and bare SHA should not be detected
-        let matches = detect_github_references_in_line(line, 0, None, &[]);
+        let matches = detect_github_references_in_line(line, 0, None, &[], &[]);
 
         assert!(matches.is_empty(), "Simple refs need GitHub context");
     }
@@ -1239,7 +1278,7 @@ mod tests {
     fn test_github_multiple_refs() {
         let line = "#1 #2 @user rust-lang/rust#3";
         let ctx = github_ctx();
-        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[]);
+        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[], &[]);
 
         // Should find: #1, #2, @user, rust-lang/rust#3
         assert_eq!(matches.len(), 4);
@@ -1250,7 +1289,7 @@ mod tests {
         // Simulate a line that starts at byte 100 in the buffer
         let line = "See #123";
         let ctx = github_ctx();
-        let matches = detect_github_references_in_line(line, 100, Some(&ctx), &[]);
+        let matches = detect_github_references_in_line(line, 100, Some(&ctx), &[], &[]);
 
         assert_eq!(matches.len(), 1);
         // Byte range should be absolute (100 + 4 = 104, 100 + 8 = 108)
@@ -1286,7 +1325,7 @@ mod tests {
     fn test_github_refs_to_styled_regions() {
         let line = "See #123";
         let ctx = github_ctx();
-        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[]);
+        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[], &[]);
 
         // Simulate validation - mark the issue as valid (no hover data needed for this test)
         let cache = GitHubValidationCache::new();
@@ -1311,7 +1350,7 @@ mod tests {
     fn test_github_unvalidated_ref_not_styled() {
         let line = "See #999999";
         let ctx = github_ctx();
-        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[]);
+        let matches = detect_github_references_in_line(line, 0, Some(&ctx), &[], &[]);
 
         // Empty cache - nothing validated
         let cache = GitHubValidationCache::new();

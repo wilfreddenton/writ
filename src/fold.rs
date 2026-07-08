@@ -13,6 +13,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
+use crate::callout::CalloutInfo;
 use crate::marker::{HeadingInfo, ListItemInfo};
 
 /// Lines hidden when `headings[idx]` folds: from the line after the heading down to
@@ -55,45 +56,96 @@ pub fn list_item_is_foldable(items: &[ListItemInfo], idx: usize) -> bool {
     items[idx].fold_end_line > items[idx].line + 1
 }
 
-/// The hidden-line extent for a folded offset, whichever kind of foldable it anchors —
-/// heading or list item. `None` if `offset` no longer matches either (stale after an edit).
-pub fn extent_for_offset(
-    headings: &[HeadingInfo],
-    list_items: &[ListItemInfo],
-    offset: usize,
-    line_count: usize,
-) -> Option<Range<usize>> {
-    if let Some(idx) = headings.iter().position(|h| h.byte_offset == offset) {
-        return Some(heading_extent(headings, idx, line_count));
-    }
-    let idx = list_items.iter().position(|i| i.byte_offset == offset)?;
-    Some(list_item_extent(list_items, idx))
+/// Which kind of block a [`FoldAnchor`] came from. Matters only for the two per-kind
+/// gestures: the recursive fold gathers same-kind descendants, and "fold all at this
+/// level" groups by heading *level* vs list/callout nesting *depth*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldKind {
+    Heading,
+    List,
+    Callout,
 }
 
-/// Merged, sorted hidden-line ranges for every folded heading AND list item. Nested
-/// folds (a folded parent + a folded child, or a heading enclosing a folded list)
-/// produce subset ranges, so the coalesce below collapses them into the enclosing range.
-pub fn hidden_line_ranges(
+/// A foldable block, projected to the fields every fold operation needs, so headings,
+/// list items, and callouts share one code path (extent lookup, hidden ranges, the
+/// recursive/level gestures, chevron placement). Only blocks that hide ≥1 line when
+/// folded become anchors.
+#[derive(Debug, Clone)]
+pub struct FoldAnchor {
+    /// Byte offset of the anchor line's start — the fold-set key (survives edits).
+    pub byte_offset: usize,
+    /// 0-based line of the anchor (heading / bullet / callout header).
+    pub line: usize,
+    /// Lines hidden when this anchor folds (half-open).
+    pub extent: Range<usize>,
+    pub kind: FoldKind,
+    /// Grouping key for "fold all at this level": heading level (1–6) or list/callout depth.
+    pub level: u32,
+}
+
+/// Every foldable block in the document — headings, list items, and callouts — projected
+/// to [`FoldAnchor`]s, grouped by kind (all headings, then list items, then callouts), not
+/// in document order. Consumers look anchors up by `byte_offset`/kind/extent, so order is
+/// irrelevant. Non-foldable blocks (no hidden body) are omitted.
+pub fn fold_anchors(
     headings: &[HeadingInfo],
     list_items: &[ListItemInfo],
-    folded: &HashSet<usize>,
+    callouts: &[CalloutInfo],
     line_count: usize,
-) -> Vec<Range<usize>> {
-    if folded.is_empty() {
-        return Vec::new();
+) -> Vec<FoldAnchor> {
+    let mut anchors = Vec::new();
+    for (i, h) in headings.iter().enumerate() {
+        if heading_is_foldable(headings, i, line_count) {
+            anchors.push(FoldAnchor {
+                byte_offset: h.byte_offset,
+                line: h.line,
+                extent: heading_extent(headings, i, line_count),
+                kind: FoldKind::Heading,
+                level: h.level as u32,
+            });
+        }
     }
-    let mut ranges: Vec<Range<usize>> = headings
+    for (i, li) in list_items.iter().enumerate() {
+        if list_item_is_foldable(list_items, i) {
+            anchors.push(FoldAnchor {
+                byte_offset: li.byte_offset,
+                line: li.line,
+                extent: list_item_extent(list_items, i),
+                kind: FoldKind::List,
+                level: li.depth as u32,
+            });
+        }
+    }
+    for c in callouts {
+        if c.is_foldable() {
+            anchors.push(FoldAnchor {
+                byte_offset: c.byte_offset,
+                line: c.header_line,
+                extent: c.body_extent(),
+                kind: FoldKind::Callout,
+                level: c.depth as u32,
+            });
+        }
+    }
+    anchors
+}
+
+/// The hidden-line extent for a folded offset. `None` if it no longer anchors a foldable
+/// block (stale after an edit).
+pub fn extent_for_offset(anchors: &[FoldAnchor], offset: usize) -> Option<Range<usize>> {
+    anchors
         .iter()
-        .enumerate()
-        .filter(|(_, h)| folded.contains(&h.byte_offset))
-        .map(|(i, _)| heading_extent(headings, i, line_count))
-        .chain(
-            list_items
-                .iter()
-                .enumerate()
-                .filter(|(_, li)| folded.contains(&li.byte_offset))
-                .map(|(i, _)| list_item_extent(list_items, i)),
-        )
+        .find(|a| a.byte_offset == offset)
+        .map(|a| a.extent.clone())
+}
+
+/// Merged, sorted hidden-line ranges for every folded anchor. Nested folds (a folded
+/// parent + a folded child) produce subset ranges, coalesced into the enclosing range.
+pub fn hidden_line_ranges(anchors: &[FoldAnchor], folded: &HashSet<usize>) -> Vec<Range<usize>> {
+    let mut ranges: Vec<Range<usize>> = anchors
+        .iter()
+        .filter(|a| folded.contains(&a.byte_offset))
+        .map(|a| a.extent.clone())
         .filter(|r| r.end > r.start)
         .collect();
     ranges.sort_by_key(|r| r.start);
@@ -136,6 +188,40 @@ mod tests {
         }
     }
 
+    fn callout(header_line: usize, end_line: usize, foldable: bool) -> CalloutInfo {
+        CalloutInfo {
+            kind: crate::callout::CalloutKind::Note,
+            title: "Note".into(),
+            foldable,
+            default_collapsed: false,
+            header_line,
+            byte_offset: header_line * 100,
+            end_line,
+            depth: 1,
+        }
+    }
+
+    #[test]
+    fn callout_extent_and_union() {
+        // A foldable callout on line 5 (body 6..8) unions with a folded heading.
+        let hs = [h(1, 0)];
+        let cs = [callout(5, 8, true)];
+        let anchors = fold_anchors(&hs, &[], &cs, 3);
+        let folded: HashSet<usize> = [hs[0].byte_offset, cs[0].byte_offset].into();
+        assert_eq!(hidden_line_ranges(&anchors, &folded), vec![1..3, 6..8]);
+        assert_eq!(extent_for_offset(&anchors, 500), Some(6..8));
+    }
+
+    #[test]
+    fn non_opted_in_callout_never_folds() {
+        // A callout without `+`/`-` isn't a foldable anchor, so it can't fold.
+        let cs = [callout(2, 5, false)];
+        let anchors = fold_anchors(&[], &[], &cs, 10);
+        assert!(anchors.is_empty());
+        let folded: HashSet<usize> = [cs[0].byte_offset].into();
+        assert!(hidden_line_ranges(&anchors, &folded).is_empty());
+    }
+
     #[test]
     fn extent_stops_at_same_level_sibling() {
         // # A(0)  body(1..2)  # B(3)
@@ -167,14 +253,20 @@ mod tests {
         let hs = [h(1, 0), h(2, 2), h(3, 4), h(1, 6)];
         // Folding both A and its child B: A's range 1..6 subsumes B's 3..6.
         let folded: HashSet<usize> = [hs[0].byte_offset, hs[1].byte_offset].into();
-        assert_eq!(hidden_line_ranges(&hs, &[], &folded, 10), vec![1..6]);
+        assert_eq!(
+            hidden_line_ranges(&fold_anchors(&hs, &[], &[], 10), &folded),
+            vec![1..6]
+        );
     }
 
     #[test]
     fn disjoint_folds_stay_separate() {
         let hs = [h(1, 0), h(1, 3), h(1, 6)];
         let folded: HashSet<usize> = [hs[0].byte_offset, hs[2].byte_offset].into();
-        assert_eq!(hidden_line_ranges(&hs, &[], &folded, 10), vec![1..3, 7..10]);
+        assert_eq!(
+            hidden_line_ranges(&fold_anchors(&hs, &[], &[], 10), &folded),
+            vec![1..3, 7..10]
+        );
     }
 
     #[test]
@@ -194,7 +286,10 @@ mod tests {
         // Parent li(0,3) subsumes child li(1,3) when both folded.
         let items = [li(0, 3), li(1, 3)];
         let folded: HashSet<usize> = [items[0].byte_offset, items[1].byte_offset].into();
-        assert_eq!(hidden_line_ranges(&[], &items, &folded, 10), vec![1..3]);
+        assert_eq!(
+            hidden_line_ranges(&fold_anchors(&[], &items, &[], 10), &folded),
+            vec![1..3]
+        );
     }
 
     #[test]
@@ -204,18 +299,21 @@ mod tests {
         let items = [li(5, 8)]; // list item at line 5 → extent 6..8
         let folded: HashSet<usize> = [hs[0].byte_offset, items[0].byte_offset].into();
         assert_eq!(
-            hidden_line_ranges(&hs, &items, &folded, 3),
+            hidden_line_ranges(&fold_anchors(&hs, &items, &[], 3), &folded),
             vec![1..3, 6..8]
         );
     }
 
     #[test]
-    fn extent_for_offset_resolves_both_kinds() {
+    fn extent_for_offset_resolves_all_kinds() {
         let hs = [h(1, 0)];
         let items = [li(5, 8)];
-        assert_eq!(extent_for_offset(&hs, &items, 0, 3), Some(1..3)); // heading
-        assert_eq!(extent_for_offset(&hs, &items, 500, 3), Some(6..8)); // list (line 5 * 100)
-        assert_eq!(extent_for_offset(&hs, &items, 999, 3), None); // stale
+        let cs = [callout(9, 12, true)];
+        let anchors = fold_anchors(&hs, &items, &cs, 3);
+        assert_eq!(extent_for_offset(&anchors, 0), Some(1..3)); // heading
+        assert_eq!(extent_for_offset(&anchors, 500), Some(6..8)); // list (line 5 * 100)
+        assert_eq!(extent_for_offset(&anchors, 900), Some(10..12)); // callout (line 9 * 100)
+        assert_eq!(extent_for_offset(&anchors, 999), None); // stale
     }
 
     #[test]

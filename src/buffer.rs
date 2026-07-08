@@ -9,6 +9,7 @@ use undo::Record;
 /// Global counter for unique buffer versions.
 static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
 
+use crate::callout::CalloutInfo;
 use crate::highlight::{HighlightSpan, Highlighter};
 use crate::inline::{StyledRegion, extract_all_inline_styles, styles_in_range};
 use crate::marker::{
@@ -20,7 +21,7 @@ use crate::math::MathBlock;
 #[cfg(feature = "mermaid")]
 use crate::mermaid::MermaidBlock;
 use crate::parser::{MarkdownParser, MarkdownTree};
-use crate::table::{RowKind, TableInfo};
+use crate::table::{RowKind, TableInfo, row_kind_at_line};
 
 /// Compute the byte range for a line (excludes trailing newline).
 fn compute_line_byte_range(rope: &Rope, line_idx: usize) -> Range<usize> {
@@ -192,24 +193,28 @@ impl RenderSnapshot {
         (offset < table.block.end).then_some(table)
     }
 
-    /// Map a buffer line to the table and row role it belongs to, if any. A line
-    /// belongs to a row when the row's `line` byte range contains the line's start.
+    /// Map a buffer line to the table and row role it belongs to, if any. Compares by
+    /// line *number* (not byte containment): tree-sitter's error recovery can start a
+    /// row node mid-line (after the leading `|`), so a byte-range `contains` would miss
+    /// the row's own line.
     pub fn table_row_at_line(&self, line_idx: usize) -> Option<(&TableInfo, RowKind)> {
         let line_start = self.line_byte_range(line_idx).start;
         let table = self.table_containing_offset(line_start)?;
+        let kind = row_kind_at_line(table, line_idx, |b| self.rope.byte_to_line(b))?;
+        Some((table, kind))
+    }
 
-        if table.header.line.contains(&line_start) {
-            return Some((table, RowKind::Header));
-        }
-        if table.delimiter_line.contains(&line_start) {
-            return Some((table, RowKind::Delimiter));
-        }
-        for (i, row) in table.body.iter().enumerate() {
-            if row.line.contains(&line_start) {
-                return Some((table, RowKind::Body(i)));
-            }
-        }
-        None
+    /// Every detected callout, in document order.
+    pub fn callouts(&self) -> &[CalloutInfo] {
+        &self.parsed.callouts
+    }
+
+    /// The callout whose `[!type]` header is on `line_idx`, if any.
+    pub fn callout_header_at_line(&self, line_idx: usize) -> Option<&CalloutInfo> {
+        self.parsed
+            .callouts
+            .iter()
+            .find(|c| c.header_line == line_idx)
     }
 
     /// All ```` ```mermaid ```` fences in the document, scanned once. Computed per build
@@ -717,30 +722,11 @@ impl BufferContent {
         self.text.len_bytes() == 0
     }
 
-    /// Check if buffer ends with the given string (efficient, doesn't copy whole buffer).
-    pub fn ends_with(&self, suffix: &str) -> bool {
-        let len = self.text.len_bytes();
-        let suffix_len = suffix.len();
-        if len < suffix_len {
-            return false;
-        }
-        let start = len - suffix_len;
-        self.text
-            .byte_slice(start..len)
-            .as_str()
-            .map(|s| s == suffix)
-            .unwrap_or(false)
-    }
-
-    /// Get a single byte at the given offset, if it exists.
+    /// Get a single byte at the given offset, if it exists. `get_byte` indexes the rope
+    /// by byte directly — never slicing — so it's safe when `offset` is the interior byte
+    /// of a multi-byte UTF-8 codepoint (a `byte_slice(offset..offset+1)` would panic there).
     pub fn byte_at(&self, offset: usize) -> Option<u8> {
-        if offset >= self.text.len_bytes() {
-            return None;
-        }
-        self.text
-            .byte_slice(offset..offset + 1)
-            .as_str()
-            .and_then(|s| s.bytes().next())
+        self.text.get_byte(offset)
     }
 
     pub fn rope(&self) -> &Rope {
@@ -766,6 +752,11 @@ impl BufferContent {
     /// Rc-cached with the parse tree, so auto-invalidated on edit.
     pub fn list_items(&self) -> &[ListItemInfo] {
         &self.parsed().list_items
+    }
+
+    /// Callouts in document order. Rc-cached with the parse tree.
+    pub fn callouts(&self) -> &[CalloutInfo] {
+        &self.parsed().callouts
     }
 
     /// Compute LineMarkers for a specific line on demand.
@@ -1125,6 +1116,17 @@ impl FromStr for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_at_handles_multibyte_boundaries() {
+        // `é` is 0xC3 0xA9; `byte_at` must return each byte without panicking (the old
+        // `byte_slice(offset..offset+1)` panicked on the interior byte of a codepoint).
+        let buf: Buffer = "é!".parse().unwrap();
+        assert_eq!(buf.byte_at(0), Some(0xC3));
+        assert_eq!(buf.byte_at(1), Some(0xA9));
+        assert_eq!(buf.byte_at(2), Some(b'!'));
+        assert_eq!(buf.byte_at(3), None);
+    }
 
     fn apply_diff(old: &str, new: &str) -> String {
         let (start, old_end, replacement) = minimal_diff(old, new);

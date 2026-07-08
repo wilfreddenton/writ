@@ -6,6 +6,8 @@
 
 A hybrid markdown editor combining raw text editing with live inline rendering.
 
+![writ rendering Markdown inline — a clean heading, styled prose, and a syntax-highlighted Rust code block](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/hero.png)
+
 ## Install
 
 ```bash
@@ -55,7 +57,9 @@ comment = "#7A88B8"
 
 ### Inline git diff
 
-When the open file lives in a git repository, writ renders a live inline diff against `HEAD`: added lines and words are tinted green, deleted lines appear as red "ghost" rows above their position, all with the same markdown rendering as the rest of the document. writ watches the file, so edits made by an external tool (e.g. an AI agent) reload and re-diff live.
+When the open file lives in a git repository, writ renders a live inline diff against `HEAD`: added lines and words are tinted green, deleted lines appear as red "ghost" rows above their position, all with the same markdown rendering as the rest of the document. writ watches both the file and the repository's `HEAD`, so edits made by an external tool (e.g. an AI agent) reload and re-diff live — and committing, amending, or switching branches re-bases the diff immediately, even when the working file itself is untouched.
+
+![Inline git diff: red ghost rows for deletions above green added lines, with word-level highlighting, all rendered as Markdown](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/diff.png)
 
 ### GitHub integration
 
@@ -96,11 +100,7 @@ On Linux, using a faster linker significantly improves build times. See [Zed's l
 
 ### Build Profiles
 
-Debug builds are significantly slower, especially for image loading and text rendering. For day-to-day development with better performance, use the `release-fast` profile:
-
-```bash
-cargo run --profile release-fast -- --file path/to/document.md
-```
+The dev profile optimizes dependencies (`opt-level = 2` for all deps, via `[profile.dev.package."*"]`) while keeping writ's own code unoptimized and debuggable — so a plain `cargo run` is comfortably interactive (the graphics/parsing stack — wgpu, Vello, Parley, tree-sitter — runs at full speed). Dependencies compile once, so incremental writ builds stay fast.
 
 For maximum runtime performance (slower compile times), use a full release build:
 
@@ -108,7 +108,7 @@ For maximum runtime performance (slower compile times), use a full release build
 cargo run --release -- --file path/to/document.md
 ```
 
-The release profile enables thin LTO and single codegen unit for best optimization. The `release-fast` profile trades some runtime performance for faster compilation by disabling LTO and using parallel codegen units.
+The release profile enables thin LTO and a single codegen unit for best optimization; the `release-fast` profile (`cargo run --profile release-fast`) trades some of that for faster compilation by disabling LTO and using parallel codegen units.
 
 ## Features
 
@@ -126,6 +126,12 @@ Unordered list markers (`-`) are replaced with bullet symbols when the cursor is
 
 Nesting is fully supported. A task item inside a blockquote is represented internally as a stack of layers, and each layer contributes its visual treatment independently.
 
+### Callouts
+
+Obsidian-style callouts — a blockquote whose first line is `> [!note]` (or `tip`, `warning`, `danger`, `success`, `question`, `example`, `quote`, …) — render inline with a type icon and accent color. Twelve types with their aliases are recognized. Add `+`/`-` after the type (`> [!tip]-`) to make a callout foldable (and start it collapsed); callouts nest, and each nesting level folds independently with the same gutter-chevron gestures as headings and lists. A custom title after the type (`> [!warning] Be careful`) replaces the default. As with other markers, the raw `[!type]` syntax reveals while your cursor is on the header line.
+
+![Obsidian-style callouts: note, foldable tip, warning, and danger, each with its own icon and accent color](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/callouts.png)
+
 ### Smart Enter and Tab
 
 Enter inserts a raw newline—no magic. Shift+Enter continues the current container by copying markers from the current line (e.g., on `- item|`, Shift+Enter creates `\n- `). Shift+Alt+Enter creates an indented continuation for nested paragraphs within list items.
@@ -142,7 +148,9 @@ Full selection support with click, drag (with edge auto-scroll), shift+arrow key
 
 ### GFM Tables
 
-Pipe tables render as a live grid — bold header, per-column alignment (`:--`/`:-:`/`--:`), and inline styles (bold, code, links) inside cells. Move your cursor into a table and it reveals the raw pipe source for editing; move out and it snaps back to the grid. Type a header row like `| Name | Age |` and press Shift+Enter to scaffold the delimiter and a body row; Tab moves between cells (and appends a row from the last cell).
+Pipe tables render as a live grid — bold header, per-column alignment (`:--`/`:-:`/`--:`), and inline styles (bold, code, links) inside cells. Move your cursor into a table and it reveals the raw pipe source for editing; move out and it snaps back to the grid. Type a header row like `| Name | Age |` and press Shift+Enter to scaffold the delimiter and a body row; Tab moves between cells (and appends a row from the last cell). Type a new column into the header and the delimiter and every body row grow to match — in place, wherever you added it. Backspace on a freshly-added empty row removes it in one press.
+
+![A GFM table rendered as a grid with a bold header and right-aligned numeric columns](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/tables.png)
 
 ### Find and Replace
 
@@ -150,15 +158,21 @@ Ctrl+F opens a find bar docked above the status bar; Ctrl+H adds the replace row
 
 ### Folding
 
-Headings and nested lists fold from the gutter. Hover the left margin to reveal a chevron on any foldable line and click to collapse its section; the outline mirrors what's folded. Modifier-clicks scope the fold: Ctrl folds every section at that level, Shift folds recursively, Ctrl+Shift folds that level and everything deeper. Jumping to a hidden line auto-unfolds it. Task lists fold the same way, so a long checklist collapses to its parent item.
+Headings, nested lists, and callouts all fold from the gutter through one unified model. Hover the left margin to reveal a chevron on any foldable line and click to collapse its section; the outline mirrors what's folded. Modifier-clicks scope the fold: Ctrl folds every section at that level, Shift folds recursively, Ctrl+Shift folds that level and everything deeper. Jumping to a hidden line auto-unfolds it. Task lists fold the same way, so a long checklist collapses to its parent item.
+
+![A collapsed callout showing its gutter chevron, above a foldable heading section and a nested list](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/folding.png)
 
 ### Mermaid Diagrams
 
 Fenced ` ```mermaid ` blocks render inline as diagrams. Rendering runs off the UI thread and is cached, so scrolling stays smooth. Drag a selection through a diagram (or move the cursor onto its block) and it de-sugars back to the raw source you're actually editing, then snaps back to the rendered diagram when you leave.
 
+![A Mermaid flowchart rendered inline in writ](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/mermaid.png)
+
 ### Math
 
 LaTeX math renders inline via RaTeX with the KaTeX fonts embedded. Block `$$…$$` renders as centered display math on its own line; inline `$…$` renders as a baseline-aligned box within the text (the GitHub/pandoc rule keeps prose like "$5 and $10" literal). Glyphs take the theme foreground color. As with mermaid, moving the cursor into a span reveals its raw source for editing.
+
+![Inline and block LaTeX math rendered in writ](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/math.png)
 
 ## Library Usage
 
@@ -229,7 +243,7 @@ and opt into only what you need:
 
 ```toml
 # render-only: pulls in none of tokio/reqwest/gix/github/winit
-writ = { version = "0.15", default-features = false }
+writ = { version = "0.16", default-features = false }
 ```
 
 | Feature | Adds |
@@ -269,12 +283,6 @@ This manual extraction approach was chosen over tree-sitter's built-in injection
 
 Currently Rust and Bash are supported; adding a language requires just the grammar crate and a highlights.scm query file. Highlights are cached and only recomputed after edits.
 
-## Known Issues
+## Limitations
 
-### Short Headings Not Styled While Typing
-
-When typing `# Hello`, tree-sitter doesn't recognize it as a heading until enough content is present or a newline is added. This is a quirk of the tree-sitter-md grammar. The heading styling appears once you press Enter or type enough characters.
-
-### Ordered List Continuation Shows Wrong Number
-
-Pressing Shift+Enter on an ordered list item inserts `1. ` as a placeholder. The correct number appears after you start typing, when tree-sitter recognizes the list structure and auto-numbering corrects it.
+Only **ATX** headings (`# Heading`) are recognized — setext headings (a line underlined with `===` or `---`) render as plain text and don't appear in the outline or fold. This is deliberate: setext text and its underline live on separate lines, so full support means both collecting *and* rendering it across the pair, for a syntax `#` dominates in practice.

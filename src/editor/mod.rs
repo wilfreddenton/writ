@@ -7,7 +7,7 @@ pub use theme::EditorTheme;
 use crate::buffer::Buffer;
 use crate::cursor::{Cursor, Selection, grapheme_column, offset_at_column, prev_grapheme_boundary};
 use crate::marker::{LineMarkers, MarkerKind, OrderedMarker, UnorderedMarker};
-use crate::table::{RowKind, TableCell, TableInfo};
+use crate::table::{RowKind, TableCell, TableInfo, row_kind_at_line};
 
 /// Context about the line at the cursor, used by smart editing actions.
 struct LineContext {
@@ -61,7 +61,10 @@ fn unescaped_pipe_indices(s: &str) -> Vec<usize> {
 /// Column count of a candidate pipe-header row: split the trimmed line on its
 /// unescaped pipes and drop the empty leading/trailing segments the surrounding
 /// pipes produce. `pipes` are byte indices into `trimmed`.
-fn pipe_row_ncols(trimmed: &str, pipes: &[usize]) -> usize {
+/// Cell contents of a pipe row (segments between pipes), dropping the empty leading/
+/// trailing segments produced by the outer `|` bars. Index 0 is the cell after the
+/// leading pipe (i.e. between `pipes[0]` and `pipes[1]` for a bounded row).
+fn pipe_row_cells<'a>(trimmed: &'a str, pipes: &[usize]) -> Vec<&'a str> {
     let mut segs: Vec<&str> = Vec::with_capacity(pipes.len() + 1);
     let mut start = 0;
     for &p in pipes {
@@ -75,7 +78,11 @@ fn pipe_row_ncols(trimmed: &str, pipes: &[usize]) -> usize {
     if segs.last().is_some_and(|s| s.is_empty()) {
         segs.pop();
     }
-    segs.len()
+    segs
+}
+
+fn pipe_row_ncols(trimmed: &str, pipes: &[usize]) -> usize {
+    pipe_row_cells(trimmed, pipes).len()
 }
 
 /// Whether a trimmed line is a GFM table delimiter row (only `| - : ` chars, with
@@ -221,6 +228,11 @@ impl EditorState {
         // This handles the case where tab cycling created an incomplete checkbox line
         // (e.g., "- [ ] ") and typing content makes it parseable by tree-sitter.
         self.propagate_checkbox_after_edit();
+        // Growing a table header's column count grows the rest of the table to match.
+        // Only for single-line inserts (typing) — a multi-line paste isn't a column edit.
+        if !text.contains('\n') {
+            self.maybe_sync_table_columns(insert_pos);
+        }
     }
 
     fn find_line_at(&self, byte_pos: usize) -> Option<(usize, LineMarkers)> {
@@ -1001,19 +1013,10 @@ impl EditorState {
             .tables
             .iter()
             .find(|t| line_start >= t.block.start && line_start < t.block.end)?;
-
-        let kind = if table.header.line.contains(&line_start) {
-            RowKind::Header
-        } else if table.delimiter_line.contains(&line_start) {
-            RowKind::Delimiter
-        } else {
-            RowKind::Body(
-                table
-                    .body
-                    .iter()
-                    .position(|r| r.line.contains(&line_start))?,
-            )
-        };
+        // Line-number match (not byte containment) — the twin of `table_row_at_line`, so a
+        // tree-sitter error-recovery row starting mid-line still resolves (else Tab cell-nav
+        // and row insertion silently no-op while the grid still renders).
+        let kind = row_kind_at_line(table, line_idx, |b| self.buffer.byte_to_line(b))?;
         Some((table, kind))
     }
 
@@ -1029,11 +1032,7 @@ impl EditorState {
     /// keeping any trailing newline. Returns the offset of the new row's first
     /// cell's typing position (just after its `| `).
     fn insert_table_row_after_line(&mut self, line_idx: usize, ncols: usize) -> usize {
-        let content_end = if line_idx + 1 < self.buffer.line_count() {
-            self.buffer.line_to_byte(line_idx + 1).saturating_sub(1)
-        } else {
-            self.buffer.len_bytes()
-        };
+        let content_end = self.line_content_end(line_idx);
         let row = format!("|{}", "  |".repeat(ncols));
         self.set_cursor(content_end);
         self.insert_text(&format!("\n{row}"));
@@ -1238,6 +1237,170 @@ impl EditorState {
         true
     }
 
+    /// Backspace convenience: if the caret sits in an all-empty table body row (e.g. one
+    /// just added with Shift+Enter/Tab that you changed your mind about), remove the whole
+    /// row in one press and land at the end of the previous row. Returns true if it fired.
+    fn maybe_remove_empty_table_row(&mut self) -> bool {
+        let Some((table, RowKind::Body(i))) = self.table_context_at_cursor() else {
+            return false;
+        };
+        // Only when every cell is empty — otherwise backspace deletes a character normally.
+        if !table.body[i]
+            .cells
+            .iter()
+            .all(|c| c.content.start >= c.content.end)
+        {
+            return false;
+        }
+        let line_idx = self.buffer.byte_to_line(self.cursor().offset);
+        let line_start = self.buffer.line_to_byte(line_idx);
+        // First body row must still have a real row above it (header/delimiter), so
+        // `line_start` is never 0 — the caret lands at the previous line's content end.
+        let line_end = if line_idx + 1 < self.buffer.line_count() {
+            self.buffer.line_to_byte(line_idx + 1)
+        } else {
+            self.buffer.len_bytes()
+        };
+        // Delete the row's line plus its own trailing newline, leaving the previous row's
+        // newline intact so it joins cleanly with whatever followed the table.
+        let cursor = self.cursor().offset;
+        self.buffer.delete(line_start..line_end, cursor);
+        let landing = line_start.saturating_sub(1);
+        self.selection = Selection::new(landing, landing);
+        true
+    }
+
+    /// When the caret's line is a table header that has gained a column (more cells than
+    /// its delimiter row on the next line), append matching empty cells to the delimiter
+    /// and every following body row so the whole table grows the column. Additive only —
+    /// deleting a header column never removes body data.
+    ///
+    /// Detected on the RAW lines, not the parsed table: a header wider than its delimiter
+    /// isn't a valid GFM table, so tree-sitter stops recognizing it the instant you type
+    /// the new column — we have to spot the mismatch ourselves and heal it back to a table.
+    /// Called after `insert_text`; a no-op away from that exact situation.
+    /// Byte offset of the end of line `l`'s content (before its trailing newline), or
+    /// `len_bytes` for the last line. Insertions land here to append to the line.
+    fn line_content_end(&self, l: usize) -> usize {
+        if l + 1 < self.buffer.line_count() {
+            self.buffer.line_to_byte(l + 1).saturating_sub(1)
+        } else {
+            self.buffer.len_bytes()
+        }
+    }
+
+    /// A line's text (including its trailing newline, if any).
+    fn line_str(&self, l: usize) -> String {
+        let ls = self.buffer.line_to_byte(l);
+        let le = if l + 1 < self.buffer.line_count() {
+            self.buffer.line_to_byte(l + 1)
+        } else {
+            self.buffer.len_bytes()
+        };
+        self.buffer.slice_cow(ls..le).into_owned()
+    }
+
+    fn maybe_sync_table_columns(&mut self, insert_pos: usize) {
+        let hl = self.buffer.byte_to_line(self.cursor().offset);
+        let dl = hl + 1;
+        if dl >= self.buffer.line_count() {
+            return;
+        }
+        let hls = self.buffer.line_to_byte(hl);
+        let header_line = self.line_str(hl);
+        let header = header_line.trim();
+        let hpipes = unescaped_pipe_indices(header);
+        // A bounded pipe row followed by a delimiter row is the header-of-a-table signal.
+        if hpipes.is_empty() || !header.starts_with('|') {
+            return;
+        }
+        let delim = self.line_str(dl);
+        if !looks_like_delimiter_row(delim.trim()) {
+            return;
+        }
+        let target = pipe_row_ncols(header, &hpipes);
+        let delim_trim = delim.trim();
+        if target <= pipe_row_ncols(delim_trim, &unescaped_pipe_indices(delim_trim)) {
+            return; // header no wider than the delimiter → nothing to grow
+        }
+
+        // Which column the user added. Base guess: the cell just left of the edit position
+        // (`hp` pipes precede it), which is right when the name was typed before the pipe
+        // (`X |`). Inserting a bare `|` instead leaves an empty cell on the *other* side, so
+        // prefer a lone empty header cell — but ONLY when it's adjacent to the edit (at the
+        // base column or one past it). Requiring adjacency stops a *pre-existing* empty cell
+        // (e.g. `| A |  | C |` then appending `D`) from stealing the insert position.
+        let hp = unescaped_pipe_indices(&header_line)
+            .iter()
+            .filter(|&&p| hls + p < insert_pos)
+            .count();
+        let positional = hp.saturating_sub(1);
+        let hcells = pipe_row_cells(header, &hpipes);
+        let empties: Vec<usize> = hcells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.trim().is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        let col = match empties.as_slice() {
+            [e] if *e == positional || *e == positional + 1 => *e,
+            _ => positional,
+        };
+
+        // The delimiter, then every following body row (until a blank / pipe-less line).
+        let mut rows: Vec<(usize, bool)> = vec![(dl, true)];
+        let mut l = dl + 1;
+        while l < self.buffer.line_count() {
+            let t = self.line_str(l);
+            if t.trim().is_empty() || !t.contains('|') {
+                break;
+            }
+            rows.push((l, false));
+            l += 1;
+        }
+
+        // For each short row, insert the missing cell(s) at column `col`: right after that
+        // row's `col`-th pipe (0-indexed), so the new cell lands at the same position as
+        // the header's. If the row has no pipe there (shorter/unbounded), append at the end.
+        let mut edits: Vec<(usize, String)> = Vec::new();
+        for (line, is_delim) in rows {
+            let text = self.line_str(line);
+            let trimmed = text.trim();
+            let cells = pipe_row_ncols(trimmed, &unescaped_pipe_indices(trimmed));
+            if cells >= target {
+                continue;
+            }
+            let ls = self.buffer.line_to_byte(line);
+            let pipes: Vec<usize> = unescaped_pipe_indices(&text)
+                .iter()
+                .map(|p| ls + p)
+                .collect();
+            let cell = if is_delim { " --- |" } else { "   |" };
+            let body = cell.repeat(target - cells);
+            let (off, ins) = if col < pipes.len() {
+                (pipes[col] + 1, body) // right after the col-th pipe
+            } else {
+                // Append at content end, opening a pipe first if the row lacks a trailing one.
+                let content_end = self.line_content_end(line);
+                let ins = if trimmed.ends_with('|') {
+                    body
+                } else {
+                    format!("|{body}")
+                };
+                (content_end, ins)
+            };
+            edits.push((off, ins));
+        }
+
+        // Apply bottom-up so earlier offsets stay valid. Every edit is below the caret (in
+        // the header), so the caret's byte position is unchanged.
+        edits.sort_by_key(|(off, _)| std::cmp::Reverse(*off));
+        let cursor = self.cursor().offset;
+        for (off, ins) in edits {
+            self.buffer.insert(off, &ins, cursor);
+        }
+    }
+
     /// Smart enter: creates paragraph break or exits container on empty line.
     /// Enter: just insert a raw newline. No magic.
     pub fn enter(&mut self) {
@@ -1395,6 +1558,12 @@ impl EditorState {
         }
 
         if self.cursor().offset == 0 {
+            return;
+        }
+
+        // One backspace removes a just-added (still-empty) table row wholesale.
+        if self.maybe_remove_empty_table_row() {
+            self.propagate_checkbox_after_edit();
             return;
         }
 
@@ -2785,6 +2954,89 @@ mod tests {
                 "| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |\n"
             );
             assert_eq!(state.cursor().offset, 36);
+        }
+
+        #[test]
+        fn typing_a_header_column_grows_the_whole_table() {
+            let mut state = EditorState::new("| A | B |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n");
+            state.set_cursor(9); // end of the header line, after the final '|'
+            state.insert_text(" C"); // add a third header cell
+            assert_eq!(
+                state.text(),
+                "| A | B | C\n| - | - | --- |\n| 1 | 2 |   |\n| 3 | 4 |   |\n"
+            );
+            // And it's a valid 3-column table again.
+            let t = &state.buffer.parsed().tables[0];
+            assert_eq!(t.ncols, 3);
+            assert_eq!(t.body.len(), 2);
+        }
+
+        #[test]
+        fn adding_a_middle_header_column_inserts_body_columns_in_place() {
+            let mut state = EditorState::new("| A | B | C |\n| - | - | - |\n| 1 | 2 | 3 |\n");
+            state.set_cursor(9); // right after the pipe following B, before " C"
+            state.insert_text(" X |"); // insert a new column between B and C
+            assert_eq!(
+                state.text(),
+                "| A | B | X | C |\n| - | - | --- | - |\n| 1 | 2 |   | 3 |\n"
+            );
+        }
+
+        #[test]
+        fn middle_column_via_empty_cell_lands_in_place() {
+            // A bare pipe creates an empty header cell between B and C; the body column
+            // must land at that same index, not on the far right.
+            let mut state = EditorState::new("| A | B | C |\n| - | - | - |\n| 1 | 2 | 3 |\n");
+            state.set_cursor(9); // right after the pipe following B
+            state.insert_text("|");
+            assert_eq!(
+                state.text(),
+                "| A | B || C |\n| - | - | --- | - |\n| 1 | 2 |   | 3 |\n"
+            );
+        }
+
+        #[test]
+        fn column_grow_ignores_preexisting_empty_header_cell() {
+            // Header already has an empty middle cell; appending a column at the right must
+            // grow the body at the RIGHT, not steal the pre-existing empty cell's position.
+            let mut state = EditorState::new("| A |  | C |\n| - | - | - |\n| 1 | 2 | 3 |\n");
+            let header_end = state.text().find('\n').unwrap();
+            state.set_cursor(header_end);
+            state.insert_text(" D");
+            assert_eq!(
+                state.text(),
+                "| A |  | C | D\n| - | - | - | --- |\n| 1 | 2 | 3 |   |\n"
+            );
+        }
+
+        #[test]
+        fn typing_in_a_body_cell_does_not_grow_columns() {
+            // Editing a body cell must never trigger column growth.
+            let mut state = EditorState::new("| A | B |\n| - | - |\n| 1 | 2 |\n");
+            let pos = state.text().rfind('1').unwrap() + 1;
+            state.set_cursor(pos);
+            state.insert_text("x");
+            assert_eq!(state.text(), "| A | B |\n| - | - |\n| 1x | 2 |\n");
+        }
+
+        #[test]
+        fn backspace_removes_just_added_empty_table_row() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(26); // inside body[0]
+            state.shift_enter(); // adds an empty row, caret inside it
+            assert!(state.text().ends_with("|  |  |\n"));
+            state.delete_backward(); // one backspace removes the whole empty row
+            assert_eq!(state.text(), TABLE_2X1);
+        }
+
+        #[test]
+        fn backspace_in_nonempty_table_row_deletes_char_not_row() {
+            let mut state = EditorState::new("| a | b |\n| --- | --- |\n| xy | 2 |\n");
+            let pos = state.text().find('y').unwrap() + 1; // just after 'y'
+            state.set_cursor(pos);
+            state.delete_backward();
+            // The 'y' is deleted; the row (and its cells) survive.
+            assert!(state.text().contains("| x | 2 |"));
         }
 
         // --- Issue 2: Tab lands on cell content, never on a pipe ---

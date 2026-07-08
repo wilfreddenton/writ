@@ -3,9 +3,10 @@
 //! position). Drawn as opaque strips above/below the editor, which is inset between
 //! them. CSD (custom window frame) and the async-blocked overlays are deferred.
 
+use parley::Layout;
 use vello::Scene;
 use vello::kurbo::{Affine, Line, Rect, RoundedRect, Stroke};
-use vello::peniko::{Color, Fill};
+use vello::peniko::{Brush, Color, Fill};
 
 use crate::consts::{FIND_ROW_H, PADDING, UI_LINE_HEIGHT};
 use crate::core::{FieldFocus, FindMode, FindState};
@@ -319,6 +320,44 @@ fn draw_find_replace_row(
     FindButtonRects { replace, all }
 }
 
+/// Draw a right-anchored pill: a rounded fill (+ optional border) sized to `layout` plus
+/// `cpad` on each side and `row_h * h_factor` tall, with the label centered inside. Returns
+/// the pill rect (its `x0` is the left edge, for right-to-left chaining). Shared geometry of
+/// the find-bar buttons and toggle chips.
+#[allow(clippy::too_many_arguments)]
+fn draw_pill(
+    engine: &mut TextEngine,
+    scene: &mut Scene,
+    layout: &Layout<Brush>,
+    right_x: f32,
+    row_top: f32,
+    row_h: f32,
+    cpad: f32,
+    h_factor: f32,
+    bg: Color,
+    border: Option<Color>,
+    scale: f32,
+) -> Rect {
+    let w = layout.width() + 2.0 * cpad;
+    let h = row_h * h_factor;
+    let x0 = right_x - w;
+    let cy = row_top + (row_h - h) / 2.0;
+    let rect = Rect::new(x0 as f64, cy as f64, right_x as f64, (cy + h) as f64);
+    let rr = RoundedRect::from_rect(rect, 4.0 * scale as f64);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, bg, None, &rr);
+    if let Some(border) = border {
+        scene.stroke(
+            &Stroke::new(scale as f64),
+            Affine::IDENTITY,
+            peniko_color(border),
+            None,
+            &rr,
+        );
+    }
+    engine.draw_line(scene, layout, (x0 + cpad, cy + (h - layout.height()) / 2.0));
+    rect
+}
+
 /// A boxed action button drawn against its right edge `right_x`; returns its left edge (so
 /// buttons chain right-to-left) and its click rect. `primary` buttons (Replace All) read
 /// greenish; plain buttons use a subtle neutral fill.
@@ -334,10 +373,18 @@ fn draw_find_button(
     primary: bool,
     scale: f32,
 ) -> (f32, ScreenRect) {
-    let color = if primary {
-        theme.green
+    let (color, bg, border) = if primary {
+        (
+            theme.green,
+            peniko_color_alpha(theme.green, 0.20),
+            theme.green,
+        )
     } else {
-        theme.foreground
+        (
+            theme.foreground,
+            peniko_color_alpha(theme.comment, 0.12),
+            theme.selection,
+        )
     };
     let layout = engine.build_line(
         label,
@@ -348,37 +395,20 @@ fn draw_find_button(
         None,
         &[],
     );
-    let cpad = 8.0 * scale;
-    let w = layout.width() + 2.0 * cpad;
-    let h = row_h * 0.78;
-    let x0 = right_x - w;
-    let cy = row_top + (row_h - h) / 2.0;
-    let rect = Rect::new(x0 as f64, cy as f64, right_x as f64, (cy + h) as f64);
-    let rr = RoundedRect::from_rect(rect, 4.0 * scale as f64);
-    let bg = if primary {
-        peniko_color_alpha(theme.green, 0.20)
-    } else {
-        peniko_color_alpha(theme.comment, 0.12)
-    };
-    scene.fill(Fill::NonZero, Affine::IDENTITY, bg, None, &rr);
-    let border = if primary {
-        theme.green
-    } else {
-        theme.selection
-    };
-    scene.stroke(
-        &Stroke::new(scale as f64),
-        Affine::IDENTITY,
-        peniko_color(border),
-        None,
-        &rr,
-    );
-    engine.draw_line(
+    let rect = draw_pill(
+        engine,
         scene,
         &layout,
-        (x0 + cpad, cy + (h - layout.height()) / 2.0),
+        right_x,
+        row_top,
+        row_h,
+        8.0 * scale,
+        0.78,
+        bg,
+        Some(border),
+        scale,
     );
-    (x0, (rect.x0, rect.y0, rect.x1, rect.y1))
+    (rect.x0 as f32, (rect.x0, rect.y0, rect.x1, rect.y1))
 }
 
 /// A row label left-aligned at `left` (so `Find`/`Replace` line up with the document's
@@ -434,27 +464,25 @@ fn draw_find_chip(
         None,
         &[],
     );
-    let cpad = 6.0 * scale;
-    let w = layout.width() + 2.0 * cpad;
-    let h = row_h * 0.72;
-    let x0 = right_x - w;
-    let cy = row_top + (row_h - h) / 2.0;
-    let rr = RoundedRect::from_rect(
-        Rect::new(x0 as f64, cy as f64, right_x as f64, (cy + h) as f64),
-        4.0 * scale as f64,
-    );
     let bg = if active {
         peniko_color_alpha(theme.purple, 0.22)
     } else {
         peniko_color_alpha(theme.comment, 0.10)
     };
-    scene.fill(Fill::NonZero, Affine::IDENTITY, bg, None, &rr);
-    engine.draw_line(
+    draw_pill(
+        engine,
         scene,
         &layout,
-        (x0 + cpad, cy + (h - layout.height()) / 2.0),
-    );
-    x0
+        right_x,
+        row_top,
+        row_h,
+        6.0 * scale,
+        0.72,
+        bg,
+        None,
+        scale,
+    )
+    .x0 as f32
 }
 
 /// A boxed text field: a lighter (document-background) rounded fill with a border —

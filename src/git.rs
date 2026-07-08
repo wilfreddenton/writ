@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::inline::GitHubContext;
 
@@ -42,14 +42,21 @@ fn parse_github_url(url: &str) -> Option<GitHubContext> {
     })
 }
 
+/// Canonicalize `path` and discover the repository that contains it, returning both
+/// (the absolute path is needed to make the file path relative to the workdir).
+fn discover_repo(path: &Path) -> Option<(PathBuf, gix::Repository)> {
+    let abs = path.canonicalize().ok()?;
+    let repo = gix::discover(abs.parent()?).ok()?;
+    Some((abs, repo))
+}
+
 /// Read the git HEAD version of the file at `path` as a UTF-8 string.
 ///
 /// Used as the base for the inline diff view. Returns `None` when there's no
 /// repository, no HEAD commit, the file isn't tracked in HEAD (new file), or
 /// the blob isn't valid UTF-8 — in all of which cases there's no diff base.
 pub fn head_blob_text(path: &Path) -> Option<String> {
-    let abs = path.canonicalize().ok()?;
-    let repo = gix::discover(abs.parent()?).ok()?;
+    let (abs, repo) = discover_repo(path)?;
     let workdir = repo.workdir()?.canonicalize().ok()?;
     let rel = abs.strip_prefix(&workdir).ok()?;
 
@@ -59,6 +66,49 @@ pub fn head_blob_text(path: &Path) -> Option<String> {
     // Vec behind) to avoid deep-copying the whole file.
     let mut blob = entry.object().ok()?;
     String::from_utf8(std::mem::take(&mut blob.data)).ok()
+}
+
+/// The git directories to watch so the inline diff can refresh when HEAD moves
+/// (commit, amend, reset, checkout, rebase) even when the working file itself is
+/// untouched. Returns `(git_dir, common_dir)`:
+/// - `git_dir` holds this worktree's `HEAD` (a branch switch / detached move rewrites it);
+/// - `common_dir/refs` (and `common_dir/packed-refs`) hold the branch refs a commit moves.
+///
+/// For a normal repo `git_dir == common_dir`; they differ only for linked worktrees,
+/// where refs live in the shared common dir. Returns `None` when `path` isn't in a repo.
+pub fn git_watch_dirs(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let (_, repo) = discover_repo(path)?;
+    Some((
+        repo.git_dir().to_path_buf(),
+        repo.common_dir().to_path_buf(),
+    ))
+}
+
+/// True if `p` (an event path under a watched git dir) is one whose change moves the
+/// diff base: `HEAD`, `packed-refs`, or a loose ref under `refs/`. Excludes the churny
+/// `index`, `objects/`, `logs/`, and intermediate `*.lock` files.
+pub fn is_git_base_path(p: &Path) -> bool {
+    if p.extension().is_some_and(|e| e == "lock") {
+        return false;
+    }
+    // The reflog (`logs/HEAD`, `logs/refs/…`) mirrors every HEAD move but is redundant
+    // with the ref / HEAD update itself, so skip it to avoid a double refresh. Its `logs`
+    // dir always sits ABOVE `refs`, so only exclude a `logs` that isn't already under
+    // `refs/` — otherwise a branch legitimately named `logs` (`refs/heads/logs`) would
+    // never refresh the diff.
+    let mut saw_refs = false;
+    for c in p.components() {
+        match c.as_os_str().to_str() {
+            Some("refs") => saw_refs = true,
+            Some("logs") if !saw_refs => return false,
+            _ => {}
+        }
+    }
+    let name = p.file_name().and_then(|n| n.to_str());
+    if matches!(name, Some("HEAD" | "packed-refs")) {
+        return true;
+    }
+    p.components().any(|c| c.as_os_str() == "refs")
 }
 
 /// Parse a "owner/repo" string into GitHubContext.
@@ -157,5 +207,41 @@ mod head_blob_tests {
     #[test]
     fn head_blob_none_for_missing() {
         assert!(head_blob_text(std::path::Path::new("does/not/exist.md")).is_none());
+    }
+
+    #[test]
+    fn git_watch_dirs_resolves_repo() {
+        // Run from the writ repo: git_dir should exist and be named `.git`; common_dir
+        // equals git_dir for a normal (non-worktree) checkout.
+        let (git_dir, common_dir) = git_watch_dirs(Path::new("Cargo.toml")).unwrap();
+        assert!(git_dir.ends_with(".git"), "git_dir: {git_dir:?}");
+        assert_eq!(git_dir, common_dir);
+        assert!(common_dir.join("HEAD").exists());
+    }
+
+    #[test]
+    fn git_watch_dirs_none_outside_repo() {
+        assert!(git_watch_dirs(Path::new("/does/not/exist.md")).is_none());
+    }
+
+    #[test]
+    fn is_git_base_path_classifies() {
+        // HEAD moves and ref updates are base-changing.
+        assert!(is_git_base_path(Path::new("/repo/.git/HEAD")));
+        assert!(is_git_base_path(Path::new("/repo/.git/packed-refs")));
+        assert!(is_git_base_path(Path::new("/repo/.git/refs/heads/main")));
+        // Churn and intermediate lockfiles are not.
+        assert!(!is_git_base_path(Path::new("/repo/.git/index")));
+        assert!(!is_git_base_path(Path::new("/repo/.git/HEAD.lock")));
+        assert!(!is_git_base_path(Path::new(
+            "/repo/.git/refs/heads/main.lock"
+        )));
+        assert!(!is_git_base_path(Path::new("/repo/.git/logs/HEAD")));
+        assert!(!is_git_base_path(Path::new(
+            "/repo/.git/logs/refs/heads/main"
+        )));
+        assert!(!is_git_base_path(Path::new("/repo/.git/objects/ab/cdef")));
+        // A branch legitimately named `logs` still moves the base.
+        assert!(is_git_base_path(Path::new("/repo/.git/refs/heads/logs")));
     }
 }

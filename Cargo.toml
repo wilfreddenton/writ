@@ -9,6 +9,9 @@ repository = "https://github.com/wilfreddenton/writ"
 homepage = "https://github.com/wilfreddenton/writ"
 documentation = "https://docs.rs/writ"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lints.clippy]
 too_many_arguments = "allow"
 
@@ -99,6 +102,14 @@ tree-sitter-md = "0.5"
 tree-sitter-rust = "0.24"
 undo = "0.52"
 notify-debouncer-full = { version = "0.5", optional = true }
+
+# Optimize dependencies even in dev/test builds. writ's own code stays unoptimized
+# (fast incremental compile + debuggable), but the graphics/parsing stack (wgpu, vello,
+# parley/swash, tree-sitter, gix, …) runs at opt-level 2. Without this a debug build shapes
+# text ~10× slower and its large unoptimized working set page-faults in over the first ~30s
+# of use — making the editor feel sluggish at startup even though release is smooth.
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 lto = "thin"

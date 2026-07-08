@@ -56,9 +56,8 @@ fn same_column_offset(
     offset: usize,
     target_line: usize,
 ) -> usize {
-    let from_start = buffer.line_to_byte(from_line);
-    let column = buffer.slice_cow(from_start..offset).graphemes(true).count();
-    offset_at_column(buffer, target_line, column)
+    debug_assert_eq!(from_line, buffer.byte_to_line(offset));
+    offset_at_column(buffer, target_line, grapheme_column(buffer, offset))
 }
 
 /// Grapheme column of `offset` within its own line.

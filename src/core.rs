@@ -22,12 +22,14 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, ne
 use regex::Regex;
 use std::time::SystemTime;
 
+use ropey::Rope;
+
 use crate::buffer::{Buffer, RenderSnapshot};
 use crate::cursor::Selection;
 use crate::diff::DiffState;
 use crate::editor::{Direction, EditorState};
 use crate::fold;
-use crate::git::head_blob_text;
+use crate::git::{git_watch_dirs, head_blob_text, is_git_base_path};
 use crate::github::GitHubClient;
 #[cfg(feature = "math")]
 use crate::inline::detect_inline_math;
@@ -39,6 +41,17 @@ use crate::marker::MarkerKind;
 use crate::paste::{PasteContext, transform_paste};
 use crate::text_input::TextField;
 use crate::validation::{GitHubValidationCache, IssueStatus};
+
+/// What a file-watch notification refers to. The working file changing is reloaded
+/// (with a self-write guard); a git dir changing only re-reads the HEAD diff base, so
+/// a commit/checkout that leaves the working file untouched still updates the diff.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WatchKind {
+    /// The opened file changed on disk.
+    File,
+    /// A git dir moved HEAD (commit/amend/reset/checkout/rebase) — refresh the base.
+    GitBase,
+}
 
 /// The kind of autocomplete triggered at the cursor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -125,7 +138,7 @@ pub struct Editor {
     // --- GitHub autolink detection ---
     github_context: Option<GitHubContext>,
     github_client: Option<GitHubClient>,
-    /// Shared (Arc<Mutex>) validation cache; the shell's tokio tasks write results
+    /// Shared (`Arc<Mutex>`) validation cache; the shell's tokio tasks write results
     /// into it off-thread and the render path reads it to color validated refs.
     github_validation_cache: GitHubValidationCache,
     naked_urls_by_line: HashMap<usize, Vec<NakedUrl>>,
@@ -159,9 +172,67 @@ pub struct Editor {
     /// Debounced watcher: coalesces the burst of fs events a single save emits (and
     /// handles atomic-save/rename) into one notification instead of several.
     file_watcher: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
-    file_watcher_rx: Option<mpsc::Receiver<()>>,
+    file_watcher_rx: Option<mpsc::Receiver<WatchKind>>,
     /// mtime after our own last save, so the watcher can skip self-writes.
     last_save_mtime: Option<SystemTime>,
+}
+
+/// Common prefix/suffix diff of two ropes → the single splice (`prefix..old_end`, a byte
+/// range in `before`, plus the length `delta`) that turns `before` into `after`. Scans
+/// bytes inward from both ends without allocating; ropey's `bytes()` iterates in place.
+fn splice_bounds(before: &Rope, after: &Rope) -> (usize, usize, isize) {
+    let (blen, alen) = (before.len_bytes(), after.len_bytes());
+    let mut prefix = 0;
+    for (x, y) in before.bytes().zip(after.bytes()) {
+        if x != y {
+            break;
+        }
+        prefix += 1;
+    }
+    let max_suffix = (blen - prefix).min(alen - prefix);
+    let suffix = common_suffix_len(before, after, max_suffix);
+    let old_end = blen - suffix; // end (in `before`) of the replaced region
+    let delta = alen as isize - blen as isize;
+    (prefix, old_end, delta)
+}
+
+/// Length (bytes, ≤ `max`) of the common suffix of two ropes. ropey 1.6's `Bytes`/`Chunks`
+/// aren't double-ended, so walk each rope's chunks backward via `chunk_at_byte` (striding
+/// one chunk per step) and compare their bytes tail-first — O(n) and allocation-free.
+fn common_suffix_len(a: &Rope, b: &Rope, max: usize) -> usize {
+    let (mut apos, mut bpos) = (a.len_bytes(), b.len_bytes());
+    let (mut abuf, mut bbuf): (&[u8], &[u8]) = (&[], &[]);
+    let mut n = 0;
+    while n < max {
+        if abuf.is_empty() {
+            if apos == 0 {
+                break;
+            }
+            let (chunk, start, _, _) = a.chunk_at_byte(apos - 1);
+            abuf = &chunk.as_bytes()[..apos - start];
+            apos = start;
+        }
+        if bbuf.is_empty() {
+            if bpos == 0 {
+                break;
+            }
+            let (chunk, start, _, _) = b.chunk_at_byte(bpos - 1);
+            bbuf = &chunk.as_bytes()[..bpos - start];
+            bpos = start;
+        }
+        let k = abuf.len().min(bbuf.len()).min(max - n);
+        let mut matched = 0;
+        while matched < k && abuf[abuf.len() - 1 - matched] == bbuf[bbuf.len() - 1 - matched] {
+            matched += 1;
+        }
+        n += matched;
+        if matched < k {
+            break; // mismatch inside the overlap → suffix ends here
+        }
+        abuf = &abuf[..abuf.len() - matched];
+        bbuf = &bbuf[..bbuf.len() - matched];
+    }
+    n
 }
 
 impl Editor {
@@ -197,6 +268,7 @@ impl Editor {
         let mut editor = Self::new(&content);
         editor.file_path = Some(path.to_path_buf());
         editor.refresh_git_base();
+        editor.seed_default_collapsed_callouts();
         editor
     }
 
@@ -283,15 +355,18 @@ impl Editor {
     /// diff so a new mutator can't silently skip the refresh. Cursor-only ops that don't
     /// touch the buffer (click/drag/move/select_all) deliberately bypass this.
     fn edit<R>(&mut self, f: impl FnOnce(&mut EditorState) -> R) -> R {
-        // Snapshot the text (only when something is folded) so fold offsets can be remapped
+        // Snapshot the rope (only when something is folded) so fold offsets can be remapped
         // across the edit from the actual splice — computed from the common prefix/suffix,
         // NOT the caret, since some edits (e.g. checkbox toggle) mutate away from the caret.
-        let before = (!self.folded_headings.is_empty()).then(|| self.state.buffer.text());
+        // The snapshot is a `Rope::clone` (O(1) — ropey shares nodes via Arc), so this no
+        // longer materializes the whole document into a `String` twice per keystroke.
+        let before = (!self.folded_headings.is_empty()).then(|| self.state.buffer.rope().clone());
         let result = f(&mut self.state);
         if let Some(before) = before {
-            let after = self.state.buffer.text();
-            if before != after {
-                self.remap_folds(&before, &after);
+            let after = self.state.buffer.rope();
+            if before != *after {
+                let (prefix, old_end, delta) = splice_bounds(&before, after);
+                self.remap_folds(prefix, old_end, delta);
             }
         }
         self.recompute_diff();
@@ -299,24 +374,10 @@ impl Editor {
         result
     }
 
-    /// Remap folded heading/list offsets across a single-splice edit, derived from the
-    /// common prefix/suffix of the old and new text. Offsets before the splice are fixed,
-    /// those after shift by the length delta, and any inside the replaced region drop.
-    fn remap_folds(&mut self, before: &str, after: &str) {
-        let (bb, ab) = (before.as_bytes(), after.as_bytes());
-        let mut prefix = 0;
-        while prefix < bb.len() && prefix < ab.len() && bb[prefix] == ab[prefix] {
-            prefix += 1;
-        }
-        let mut suffix = 0;
-        while suffix < bb.len() - prefix
-            && suffix < ab.len() - prefix
-            && bb[bb.len() - 1 - suffix] == ab[ab.len() - 1 - suffix]
-        {
-            suffix += 1;
-        }
-        let old_end = bb.len() - suffix; // end (in `before`) of the replaced region
-        let delta = ab.len() as isize - bb.len() as isize;
+    /// Remap folded heading/list offsets across a single-splice edit `prefix..old_end`
+    /// (byte range in the old text) with length `delta`. Offsets before the splice are
+    /// fixed, those after shift by the delta, and any inside the replaced region drop.
+    fn remap_folds(&mut self, prefix: usize, old_end: usize, delta: isize) {
         let old = std::mem::take(&mut self.folded_headings);
         self.folded_headings = old
             .into_iter()
@@ -614,6 +675,13 @@ impl Editor {
                 .filter(|s| s.style.code)
                 .map(|s| s.full_range.clone())
                 .collect();
+            // Markdown-link spans are skipped by BOTH detectors: a `#123`/`@user`/URL
+            // inside `[text](url)` is part of the link, not a standalone ref/autolink.
+            let link_ranges: Vec<_> = inline_styles
+                .iter()
+                .filter(|s| s.link_url.is_some())
+                .map(|s| s.full_range.clone())
+                .collect();
 
             if let Some(github_context) = &self.github_context {
                 let matches = detect_github_references_in_line(
@@ -621,17 +689,13 @@ impl Editor {
                     line_range.start,
                     Some(github_context),
                     &code_ranges,
+                    &link_ranges,
                 );
                 if !matches.is_empty() {
                     github_matches_by_line.insert(line_idx, matches);
                 }
             }
 
-            let link_ranges: Vec<_> = inline_styles
-                .iter()
-                .filter(|s| s.link_url.is_some())
-                .map(|s| s.full_range.clone())
-                .collect();
             let urls = detect_naked_urls(&line_text, line_range.start, &code_ranges, &link_ranges);
             if !urls.is_empty() {
                 urls_by_line.insert(line_idx, urls);
@@ -776,43 +840,66 @@ impl Editor {
         self.state.buffer.line_count()
     }
 
-    /// Merged, sorted line ranges the layout should collapse to zero height.
-    pub fn hidden_line_ranges(&self) -> Vec<Range<usize>> {
-        fold::hidden_line_ranges(
+    /// Every foldable block — heading, list item, or callout — as a unified
+    /// [`fold::FoldAnchor`], so all fold operations share one code path.
+    pub fn fold_anchors(&self) -> Vec<fold::FoldAnchor> {
+        fold::fold_anchors(
             self.state.buffer.headings(),
             self.state.buffer.list_items(),
-            &self.folded_headings,
+            self.state.buffer.callouts(),
             self.state.buffer.line_count(),
         )
+    }
+
+    /// Merged, sorted line ranges the layout should collapse to zero height.
+    pub fn hidden_line_ranges(&self) -> Vec<Range<usize>> {
+        // Cheap early-out for the common (nothing folded) case, before building anchors.
+        if self.folded_headings.is_empty() {
+            return Vec::new();
+        }
+        fold::hidden_line_ranges(&self.fold_anchors(), &self.folded_headings)
     }
 
     pub fn is_heading_folded(&self, byte_offset: usize) -> bool {
         self.folded_headings.contains(&byte_offset)
     }
 
-    /// Whether `byte_offset` anchors a list-item fold (vs a heading) — lets the shell
-    /// route list-chevron clicks to the item semantics instead of the heading level ones.
-    pub fn is_list_fold_offset(&self, byte_offset: usize) -> bool {
-        self.state
+    /// On initial load, collapse callouts that opted into starting collapsed (`[!type]-`).
+    /// Applied once (from `open`), so a manual expand later isn't re-folded on the next edit.
+    pub fn seed_default_collapsed_callouts(&mut self) {
+        let offs: Vec<usize> = self
+            .state
             .buffer
-            .list_items()
+            .callouts()
             .iter()
-            .any(|i| i.byte_offset == byte_offset)
+            .filter(|c| c.default_collapsed && c.is_foldable())
+            .map(|c| c.byte_offset)
+            .collect();
+        self.folded_headings.extend(offs);
     }
 
-    /// Apply a fold-gutter click at `byte_offset`, dispatching on the modifier scope and
-    /// the fold kind (heading vs list item). Ctrl = breadth (all at this heading level /
-    /// list depth), Shift = depth (recursive: this item + everything nested), Ctrl+Shift =
-    /// both, plain = just this one. The recursive/plain cases are kind-agnostic.
+    /// Apply a fold-gutter click at `byte_offset` — same escalating scope for every
+    /// foldable kind: plain = just this block, **Shift** = recursive (this + everything
+    /// nested inside it), **Ctrl** = all at this level, **Ctrl+Shift** = this level and
+    /// deeper. "This level" is the only per-kind difference: headings group by heading
+    /// level (H1–H6, replacing the fold set), lists/callouts additively by nesting depth.
+    /// No-op if `byte_offset` isn't a foldable anchor.
     pub fn apply_fold_gesture(&mut self, byte_offset: usize, ctrl: bool, shift: bool) {
-        let is_list = self.is_list_fold_offset(byte_offset);
+        let Some(kind) = self
+            .fold_anchors()
+            .iter()
+            .find(|a| a.byte_offset == byte_offset)
+            .map(|a| a.kind)
+        else {
+            return;
+        };
         match (ctrl, shift) {
-            (true, true) if is_list => self.toggle_fold_list_level_deep_at(byte_offset),
-            (true, false) if is_list => self.toggle_fold_list_level_at(byte_offset),
-            (true, true) => self.toggle_fold_level_deep_at(byte_offset),
-            (true, false) => self.toggle_fold_level_at(byte_offset),
-            (false, true) => self.toggle_fold_recursive(byte_offset),
             (false, false) => self.toggle_fold(byte_offset),
+            (false, true) => self.toggle_fold_recursive(byte_offset),
+            (true, _) if kind == fold::FoldKind::Heading => {
+                self.toggle_heading_level(byte_offset, shift)
+            }
+            (true, _) => self.toggle_depth_level(byte_offset, shift),
         }
     }
 
@@ -849,107 +936,66 @@ impl Editor {
         self.clamp_cursor_to_visible();
     }
 
-    /// The anchor `byte_offset` plus every foldable descendant nested inside its extent:
-    /// deeper headings under a heading, or nested items under a list item. Empty if the
-    /// offset isn't a foldable anchor. Kind is resolved from the offset (heading vs list).
+    /// The anchor `byte_offset` plus every foldable anchor of the **same kind** nested
+    /// inside its extent (deeper headings under a heading, nested items under an item,
+    /// nested callouts under a callout). Empty if the offset isn't a foldable anchor.
     fn recursive_fold_set(&self, byte_offset: usize) -> Vec<usize> {
-        let line_count = self.state.buffer.line_count();
-        let headings = self.state.buffer.headings();
-        if let Some(idx) = headings.iter().position(|h| h.byte_offset == byte_offset) {
-            if !fold::heading_is_foldable(headings, idx, line_count) {
-                return Vec::new();
+        let anchors = self.fold_anchors();
+        let Some(clicked) = anchors.iter().find(|a| a.byte_offset == byte_offset) else {
+            return Vec::new();
+        };
+        let mut offs = vec![byte_offset];
+        for a in &anchors {
+            if a.byte_offset != byte_offset
+                && a.kind == clicked.kind
+                && clicked.extent.contains(&a.line)
+            {
+                offs.push(a.byte_offset);
             }
-            let extent = fold::heading_extent(headings, idx, line_count);
-            let mut offs = vec![byte_offset];
-            for (j, h) in headings.iter().enumerate().skip(idx + 1) {
-                if h.line >= extent.end {
-                    break;
-                }
-                if fold::heading_is_foldable(headings, j, line_count) {
-                    offs.push(h.byte_offset);
-                }
-            }
-            return offs;
         }
-        let items = self.state.buffer.list_items();
-        if let Some(idx) = items.iter().position(|i| i.byte_offset == byte_offset) {
-            if !fold::list_item_is_foldable(items, idx) {
-                return Vec::new();
-            }
-            let extent = fold::list_item_extent(items, idx);
-            let mut offs = vec![byte_offset];
-            for (j, it) in items.iter().enumerate().skip(idx + 1) {
-                if it.line >= extent.end {
-                    break;
-                }
-                if fold::list_item_is_foldable(items, j) {
-                    offs.push(it.byte_offset);
-                }
-            }
-            return offs;
-        }
-        Vec::new()
+        offs
     }
 
-    /// Ctrl+click a list chevron: fold every foldable list item at the clicked item's
-    /// nesting depth (the list analogue of [`toggle_fold_level_at`] for headings). Additive
-    /// — leaves heading folds and other-depth list folds alone; toggles the group off if the
-    /// clicked item is already folded.
-    pub fn toggle_fold_list_level_at(&mut self, byte_offset: usize) {
-        self.toggle_list_level(byte_offset, false);
-    }
-
-    /// Ctrl+Shift+click a list chevron: like [`toggle_fold_list_level_at`] but folds this
-    /// depth AND every deeper one, so expanding a peer reveals its children collapsed.
-    pub fn toggle_fold_list_level_deep_at(&mut self, byte_offset: usize) {
-        self.toggle_list_level(byte_offset, true);
-    }
-
-    fn toggle_list_level(&mut self, byte_offset: usize, deep: bool) {
-        let items = self.state.buffer.list_items();
-        let Some(depth) = items
-            .iter()
-            .find(|i| i.byte_offset == byte_offset)
-            .map(|i| i.depth)
-        else {
+    /// Ctrl(+Shift)+click a list or callout chevron: additively toggle every foldable
+    /// anchor of the clicked one's kind at its nesting depth (or, `deep`, that depth and
+    /// deeper). The additive counterpart to headings' replace-the-set level fold — it
+    /// leaves folds of other kinds and other depths alone.
+    fn toggle_depth_level(&mut self, byte_offset: usize, deep: bool) {
+        let anchors = self.fold_anchors();
+        let Some(clicked) = anchors.iter().find(|a| a.byte_offset == byte_offset) else {
             return;
         };
-        let offs: Vec<usize> = items
+        let (kind, depth) = (clicked.kind, clicked.level);
+        let offs: Vec<usize> = anchors
             .iter()
-            .enumerate()
-            .filter(|(i, it)| {
-                fold::list_item_is_foldable(items, *i)
+            .filter(|a| {
+                a.kind == kind
                     && if deep {
-                        it.depth >= depth
+                        a.level >= depth
                     } else {
-                        it.depth == depth
+                        a.level == depth
                     }
             })
-            .map(|(_, it)| it.byte_offset)
+            .map(|a| a.byte_offset)
             .collect();
         self.apply_group_fold(byte_offset, offs);
     }
 
-    /// Fold the thing the cursor is in: the innermost foldable list item the caret sits
-    /// inside, else the nearest heading section at or above the caret.
+    /// Fold the thing the cursor is in: the innermost non-heading block (list item /
+    /// callout) the caret sits inside, else the nearest heading section at or above it.
     pub fn fold_at_cursor(&mut self) {
         let line = self.line_of(self.cursor_position());
-        let line_count = self.state.buffer.line_count();
-        let items = self.state.buffer.list_items();
-        let list_off = items
-            .iter()
-            .enumerate()
-            .filter(|(i, it)| {
-                fold::list_item_is_foldable(items, *i)
-                    && (it.line..fold::list_item_extent(items, *i).end).contains(&line)
-            })
-            .max_by_key(|(_, it)| it.line)
-            .map(|(_, it)| it.byte_offset);
-        if let Some(off) = list_off {
-            self.folded_headings.insert(off);
+        let inner = self
+            .fold_anchors()
+            .into_iter()
+            .filter(|a| a.kind != fold::FoldKind::Heading && (a.line..a.extent.end).contains(&line))
+            .max_by_key(|a| a.line);
+        if let Some(a) = inner {
+            self.folded_headings.insert(a.byte_offset);
             self.clamp_cursor_to_visible();
             return;
         }
+        let line_count = self.state.buffer.line_count();
         let headings = self.state.buffer.headings();
         let Some(idx) = fold::section_heading(headings, line) else {
             return;
@@ -990,19 +1036,10 @@ impl Editor {
         self.folded_headings.clear();
     }
 
-    /// Ctrl+click a chevron: fold every section at the clicked heading's level (a mouse
-    /// path to [`fold_to_level`]). Toggles — if that heading is already folded, unfold all.
-    pub fn toggle_fold_level_at(&mut self, byte_offset: usize) {
-        self.toggle_level(byte_offset, false);
-    }
-
-    /// Ctrl+Shift+click a chevron: like [`toggle_fold_level_at`] but deep — every section
-    /// at this level *and* deeper folds, so expanding one reveals its children collapsed.
-    pub fn toggle_fold_level_deep_at(&mut self, byte_offset: usize) {
-        self.toggle_level(byte_offset, true);
-    }
-
-    fn toggle_level(&mut self, byte_offset: usize, deep: bool) {
+    /// Ctrl(+Shift)+click a heading chevron: fold every section at the clicked heading's
+    /// level (a mouse path to [`Self::fold_to_level`]), or `deep`: that level and deeper.
+    /// Replaces the fold set; toggles — if the heading is already folded, unfold all.
+    fn toggle_heading_level(&mut self, byte_offset: usize, deep: bool) {
         let level = self
             .state
             .buffer
@@ -1045,7 +1082,7 @@ impl Editor {
         self.fold_headings_where(|l| l == level);
     }
 
-    /// Deep variant of [`fold_to_level`]: fold every foldable heading at `level` or deeper,
+    /// Deep variant of [`Self::fold_to_level`]: fold every foldable heading at `level` or deeper,
     /// pre-collapsing descendants so expanding a section reveals its children still folded.
     pub fn fold_to_level_deep(&mut self, level: u8) {
         self.fold_headings_where(|l| l >= level);
@@ -1060,19 +1097,15 @@ impl Editor {
             return false;
         }
         let cursor_line = self.line_of(self.cursor_position());
-        let line_count = self.state.buffer.line_count();
         let to_remove: Vec<usize> = {
-            let headings = self.state.buffer.headings();
-            let items = self.state.buffer.list_items();
+            let anchors = self.fold_anchors();
             self.folded_headings
                 .iter()
                 .copied()
-                .filter(
-                    |&off| match fold::extent_for_offset(headings, items, off, line_count) {
-                        Some(ext) => ext.contains(&cursor_line),
-                        None => true, // stale offset (heading/item edited away): drop
-                    },
-                )
+                .filter(|&off| match fold::extent_for_offset(&anchors, off) {
+                    Some(ext) => ext.contains(&cursor_line),
+                    None => true, // stale offset (anchor edited away): drop
+                })
                 .collect()
         };
         for off in &to_remove {
@@ -1158,7 +1191,7 @@ impl Editor {
         self.find_step(true)
     }
 
-    /// Retreat to the previous match (wrapping); otherwise like [`find_next`].
+    /// Retreat to the previous match (wrapping); otherwise like [`Self::find_next`].
     pub fn find_prev(&mut self) -> Option<Range<usize>> {
         self.find_step(false)
     }
@@ -1570,6 +1603,14 @@ impl Editor {
             });
     }
 
+    /// Build a diff-base entry — the base text paired with its render snapshot — parsing
+    /// and snapshotting `text`. Parsing a `Buffer` is infallible.
+    fn make_head_base(text: String) -> (String, RenderSnapshot) {
+        let mut base: Buffer = text.parse().expect("Buffer parsing is infallible");
+        let snapshot = base.render_snapshot();
+        (text, snapshot)
+    }
+
     /// Load the git HEAD blob for the current file, snapshot it as the diff base,
     /// and recompute. No-op (clears the base) if there's no file or no HEAD blob.
     pub fn refresh_git_base(&mut self) {
@@ -1577,19 +1618,13 @@ impl Editor {
             .file_path
             .as_ref()
             .and_then(|path| head_blob_text(path))
-            .map(|text| {
-                let mut base: Buffer = text.parse().expect("Buffer parsing is infallible");
-                let snapshot = base.render_snapshot();
-                (text, snapshot)
-            });
+            .map(Self::make_head_base);
         self.recompute_diff();
     }
 
     /// Directly set the diff base (test/headless helper) from raw text.
     pub fn set_head_base(&mut self, base_text: &str) {
-        let mut base: Buffer = base_text.parse().expect("Buffer parsing is infallible");
-        let snapshot = base.render_snapshot();
-        self.head_base = Some((base_text.to_string(), snapshot));
+        self.head_base = Some(Self::make_head_base(base_text.to_string()));
         self.recompute_diff();
     }
 
@@ -1618,7 +1653,7 @@ impl Editor {
     /// save), reload it and refresh the diff base. Returns true if reloaded.
     /// Hand the file-watch receiver to the shell so it can forward change
     /// notifications into the event loop (waking it) instead of polling on a timer.
-    pub fn take_file_watch_rx(&mut self) -> Option<mpsc::Receiver<()>> {
+    pub fn take_file_watch_rx(&mut self) -> Option<mpsc::Receiver<WatchKind>> {
         self.file_watcher_rx.take()
     }
 
@@ -1631,12 +1666,18 @@ impl Editor {
     /// off the render thread — the diff hot path must not touch disk on the UI thread.
     /// Returns `(new_content, head_base_text)`, or `None` to skip (our own save, or a
     /// read error). The cheap parse/snapshot/diff is done on the main thread by
-    /// [`apply_reload`].
+    /// [`Self::apply_reload`].
+    /// `ignore_self_write` skips the mtime guard: a git-dir change (commit/checkout)
+    /// leaves the working file's mtime — possibly equal to our last save — untouched, so
+    /// the guard would wrongly skip it. `apply_reload`'s `content_eq` check makes the
+    /// re-read a no-op for the (unchanged) buffer anyway; only the HEAD base updates.
     pub fn read_reload(
         path: &Path,
         last_save_mtime: Option<SystemTime>,
+        ignore_self_write: bool,
     ) -> Option<(String, Option<String>)> {
-        if let Some(last) = last_save_mtime
+        if !ignore_self_write
+            && let Some(last) = last_save_mtime
             && let Ok(meta) = std::fs::metadata(path)
             && let Ok(mtime) = meta.modified()
             && mtime == last
@@ -1656,24 +1697,20 @@ impl Editor {
             // splice (external edits are usually a localized change), the same way a
             // local edit does. `set_text` leaves `folded_headings` untouched, so without
             // this the old offsets would land on the wrong lines in the new content.
-            let before = (!self.folded_headings.is_empty()).then(|| self.state.buffer.text());
+            let before =
+                (!self.folded_headings.is_empty()).then(|| self.state.buffer.rope().clone());
             let cursor_line = self.state.buffer.byte_to_line(self.state.selection.head);
             self.set_text(&content);
             if let Some(before) = before {
-                self.remap_folds(&before, &content);
+                let after = self.state.buffer.rope();
+                let (prefix, old_end, delta) = splice_bounds(&before, after);
+                self.remap_folds(prefix, old_end, delta);
             }
             let line = cursor_line.min(self.state.buffer.line_count().saturating_sub(1));
             let offset = self.state.buffer.line_to_byte(line);
             self.state.selection = Selection::new(offset, offset);
         }
-        match base_text {
-            Some(text) => {
-                let mut base: Buffer = text.parse().expect("Buffer parsing is infallible");
-                let snapshot = base.render_snapshot();
-                self.head_base = Some((text, snapshot));
-            }
-            None => self.head_base = None,
-        }
+        self.head_base = base_text.map(Self::make_head_base);
         self.recompute_diff();
     }
 
@@ -1683,22 +1720,54 @@ impl Editor {
             return Ok(());
         };
         let (tx, rx) = mpsc::channel();
+        let watched_file = path.clone();
         // 150ms debounce collapses a save's event burst (and atomic-save temp→rename)
         // into a single reload notification.
         let mut debouncer = new_debouncer(
             Duration::from_millis(150),
             None,
             move |result: DebounceEventResult| {
-                if let Ok(events) = result
-                    && events
-                        .iter()
-                        .any(|e| matches!(e.kind, EventKind::Modify(_) | EventKind::Create(_)))
-                {
-                    let _ = tx.send(());
+                let Ok(events) = result else { return };
+                let mut file = false;
+                let mut git = false;
+                for e in &events {
+                    if !matches!(e.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                        continue;
+                    }
+                    for p in &e.paths {
+                        if *p == watched_file {
+                            file = true;
+                        } else if is_git_base_path(p) {
+                            git = true;
+                        }
+                    }
+                }
+                if file {
+                    let _ = tx.send(WatchKind::File);
+                }
+                if git {
+                    let _ = tx.send(WatchKind::GitBase);
                 }
             },
         )?;
         debouncer.watch(&path, RecursiveMode::NonRecursive)?;
+        // Also watch the git dirs so a commit/checkout that moves HEAD refreshes the
+        // inline diff even when the working file is untouched. Watch the *directories*
+        // (not the files) so the watch survives git's lockfile→rename ref updates; the
+        // callback filters to HEAD/refs via `is_git_base_path`. Best-effort: a missing
+        // dir or a non-repo file just skips git watching.
+        if let Some((git_dir, common_dir)) = git_watch_dirs(&path) {
+            let mut seen: HashSet<PathBuf> = HashSet::new();
+            for (dir, mode) in [
+                (git_dir.clone(), RecursiveMode::NonRecursive),
+                (common_dir.clone(), RecursiveMode::NonRecursive),
+                (common_dir.join("refs"), RecursiveMode::Recursive),
+            ] {
+                if seen.insert(dir.clone()) {
+                    let _ = debouncer.watch(&dir, mode);
+                }
+            }
+        }
         self.file_watcher = Some(debouncer);
         self.file_watcher_rx = Some(rx);
         Ok(())
@@ -1708,7 +1777,79 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::time::Instant;
+
+    #[test]
+    fn splice_bounds_reports_the_edited_region() {
+        let diff = |a: &str, b: &str| splice_bounds(&Rope::from_str(a), &Rope::from_str(b));
+        // Pure insertion in the middle: prefix..old_end is empty, delta is the inserted len.
+        assert_eq!(diff("abcXYZ", "abcQWXYZ"), (3, 3, 2));
+        // Deletion in the middle.
+        assert_eq!(diff("abcQWXYZ", "abcXYZ"), (3, 5, -2));
+        // Replacement: the common prefix/suffix bracket the changed span.
+        assert_eq!(diff("hello world", "hello brave world"), (6, 6, 6));
+        // No change → empty splice at the end.
+        assert_eq!(diff("same", "same"), (4, 4, 0));
+        // Append only (no common suffix).
+        assert_eq!(diff("abc", "abcdef"), (3, 3, 3));
+    }
+
+    #[test]
+    fn splice_bounds_handles_large_multichunk_middle_edit() {
+        // Force multiple rope chunks so the backward chunk-walk in `common_suffix_len`
+        // strides across chunk boundaries rather than a single flat buffer.
+        let a = "x".repeat(5000) + "OLD" + &"y".repeat(5000);
+        let b = "x".repeat(5000) + "BRANDNEW" + &"y".repeat(5000);
+        let (prefix, old_end, delta) = splice_bounds(&Rope::from_str(&a), &Rope::from_str(&b));
+        assert_eq!(prefix, 5000);
+        assert_eq!(old_end, 5003); // 5000 + "OLD"
+        assert_eq!(delta, "BRANDNEW".len() as isize - "OLD".len() as isize);
+    }
+
+    /// End-to-end proof that a `git commit` which leaves the working file untouched still
+    /// wakes the watcher with `WatchKind::GitBase` (so the inline diff refreshes). Uses a
+    /// real temp repo + real fs events, so it's `#[ignore]`d out of CI (fs-event timing is
+    /// flaky in containers); run manually with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "spawns git + relies on fs-event timing; run manually"]
+    fn git_commit_wakes_watcher() {
+        let dir = std::env::temp_dir().join(format!("writ-gitwatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let note = dir.join("note.md");
+        std::fs::write(&note, "# v1\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+
+        let mut editor = Editor::open(&note);
+        editor.watch_file().unwrap();
+        let rx = editor.take_file_watch_rx().unwrap();
+
+        // Move HEAD WITHOUT touching note.md: commit a different file.
+        std::fs::write(dir.join("other.md"), "x\n").unwrap();
+        git(&["add", "other.md"]);
+        git(&["commit", "-qm", "second"]);
+
+        // The commit updated refs/heads/… → expect a GitBase wake within a few seconds.
+        let kind = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("watcher should wake on commit");
+        assert_eq!(kind, WatchKind::GitBase);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Secondary find-feature spike: measure whether a full-document scan per keystroke
     /// (rope→String, then `match_indices`) is cheap enough to run live. Not asserted on
@@ -2122,7 +2263,13 @@ let code = target(); // fenced block line
         // Folding the parent hides its two child items; the sibling is untouched.
         editor.toggle_fold(parent);
         assert_eq!(editor.hidden_line_ranges(), vec![1..3]);
-        assert!(editor.is_list_fold_offset(parent) && !editor.is_list_fold_offset(999));
+        let anchors = editor.fold_anchors();
+        assert!(
+            anchors
+                .iter()
+                .any(|a| a.byte_offset == parent && a.kind == fold::FoldKind::List)
+        );
+        assert!(!anchors.iter().any(|a| a.byte_offset == 999));
         assert!(!editor.is_heading_folded(sibling));
 
         // The parent checkbox still toggles while its children are folded (checking a task
@@ -2193,7 +2340,7 @@ let code = target(); // fenced block line
 
         // Ctrl+click a top-level (depth-1) item folds BOTH top-level foldable items (p, q),
         // not the deeper `- a`. Additive; doesn't touch depth-2.
-        editor.toggle_fold_list_level_at(off(0));
+        editor.apply_fold_gesture(off(0), true, false);
         assert!(editor.is_heading_folded(off(0)) && editor.is_heading_folded(off(4)));
         assert!(
             !editor.is_heading_folded(off(1)),
@@ -2201,11 +2348,11 @@ let code = target(); // fenced block line
         );
 
         // Toggling the same group off clears it.
-        editor.toggle_fold_list_level_at(off(0));
+        editor.apply_fold_gesture(off(0), true, false);
         assert!(editor.hidden_line_ranges().is_empty());
 
         // Deep variant folds this depth and deeper: p, q (depth 1) AND a (depth 2).
-        editor.toggle_fold_list_level_deep_at(off(0));
+        editor.apply_fold_gesture(off(0), true, true);
         assert!(
             editor.is_heading_folded(off(0))
                 && editor.is_heading_folded(off(4))
@@ -2258,12 +2405,12 @@ let code = target(); // fenced block line
         let d = editor.state.buffer.headings()[3].byte_offset;
 
         // Ctrl+clicking the H2 "B" folds every H2 (B and D), not just B.
-        editor.toggle_fold_level_at(b);
+        editor.apply_fold_gesture(b, true, false);
         assert!(editor.is_heading_folded(b) && editor.is_heading_folded(d));
         assert!(!editor.is_heading_folded(a) && !editor.is_heading_folded(c));
 
         // Ctrl+clicking a now-folded heading unfolds everything.
-        editor.toggle_fold_level_at(b);
+        editor.apply_fold_gesture(b, true, false);
         assert!(editor.hidden_line_ranges().is_empty());
     }
 
@@ -2276,12 +2423,12 @@ let code = target(); // fenced block line
         let c = editor.state.buffer.headings()[2].byte_offset;
 
         // Ctrl+Shift on the H2 folds this level and deeper: B and C, but not the H1s.
-        editor.toggle_fold_level_deep_at(b);
+        editor.apply_fold_gesture(b, true, true);
         assert!(editor.is_heading_folded(b) && editor.is_heading_folded(c));
         assert!(!editor.is_heading_folded(a));
 
         // Toggles off when the clicked heading is already folded.
-        editor.toggle_fold_level_deep_at(b);
+        editor.apply_fold_gesture(b, true, true);
         assert!(editor.hidden_line_ranges().is_empty());
     }
 
@@ -2539,6 +2686,52 @@ let code = target(); // fenced block line
             "a a a\n",
             "one undo reverts the whole replace-all"
         );
+    }
+
+    #[test]
+    fn callout_folds_and_seeds_default_collapsed() {
+        // line 0-2: foldable note; 3: blank; 4-5: default-collapsed warning.
+        let doc = "> [!note]+ Foldable\n> body one\n> body two\n\n> [!warning]- Closed\n> hidden\n";
+        let mut e = Editor::new(doc);
+        let cs = e.state.buffer.callouts().to_vec();
+        assert_eq!(cs.len(), 2);
+        // `new()` doesn't seed, so nothing is folded yet.
+        assert!(e.hidden_line_ranges().is_empty());
+
+        // The gesture folds the foldable callout's body, and toggles it back.
+        let note_off = cs[0].byte_offset;
+        e.apply_fold_gesture(note_off, false, false);
+        assert_eq!(e.hidden_line_ranges(), vec![1..3]);
+        e.apply_fold_gesture(note_off, false, false);
+        assert!(e.hidden_line_ranges().is_empty());
+
+        // Seeding collapses only the `-` callout.
+        e.seed_default_collapsed_callouts();
+        assert_eq!(e.hidden_line_ranges(), vec![5..6]);
+    }
+
+    #[test]
+    fn callout_recursive_and_level_gestures() {
+        // Outer tip (depth 1, lines 0-2) with a nested note (depth 2, lines 1-2).
+        let doc = "> [!tip]+ Outer\n> > [!note]+ Inner\n> > inner body\n";
+        let mut e = Editor::new(doc);
+        let cs = e.state.buffer.callouts().to_vec();
+        assert_eq!(cs.len(), 2);
+        let outer = cs.iter().find(|c| c.header_line == 0).unwrap().byte_offset;
+        let inner = cs.iter().find(|c| c.header_line == 1).unwrap().byte_offset;
+
+        // Shift-click (recursive) the outer folds it AND the nested inner.
+        e.apply_fold_gesture(outer, false, true);
+        assert!(e.is_heading_folded(outer) && e.is_heading_folded(inner));
+        assert_eq!(e.hidden_line_ranges(), vec![1..3]);
+        // Toggling recursively again unfolds both.
+        e.apply_fold_gesture(outer, false, true);
+        assert!(e.hidden_line_ranges().is_empty());
+
+        // Ctrl-click (level) the inner folds only depth-2 callouts (not the outer).
+        e.apply_fold_gesture(inner, true, false);
+        assert!(e.is_heading_folded(inner) && !e.is_heading_folded(outer));
+        assert_eq!(e.hidden_line_ranges(), vec![2..3]);
     }
 
     #[test]

@@ -82,7 +82,7 @@ pub fn transform_paste(text: &str, ctx: &PasteContext) -> String {
         return normalized;
     }
 
-    normalized
+    let transformed = normalized
         .lines()
         .enumerate()
         .map(|(i, line)| {
@@ -95,7 +95,15 @@ pub fn transform_paste(text: &str, ctx: &PasteContext) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    // `lines()` swallows a trailing newline; re-add it so a paste ending in `\n` keeps
+    // the following content on its own line instead of merging onto the last quoted line
+    // (the non-blockquote path above preserves it verbatim).
+    if normalized.ends_with('\n') {
+        format!("{transformed}\n")
+    } else {
+        transformed
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +164,13 @@ mod tests {
         let ctx = ctx(false, "> ");
         let result = transform_paste("para 1\n\npara 2", &ctx);
         assert_eq!(result, "para 1\n>\n> para 2");
+    }
+
+    #[test]
+    fn test_paste_multiline_in_blockquote_preserves_trailing_newline() {
+        let ctx = ctx(false, "> ");
+        let result = transform_paste("line 1\nline 2\n", &ctx);
+        assert_eq!(result, "line 1\n> line 2\n");
     }
 
     #[test]

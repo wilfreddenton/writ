@@ -61,6 +61,29 @@ pub enum RowKind {
     Body(usize),
 }
 
+/// Which row of `table` line `line_idx` is. Compares by line *number* (not byte
+/// containment): tree-sitter's error recovery can start a row node mid-line (after the
+/// leading `|`), so a byte-range `contains` would miss the row's own line. `byte_to_line`
+/// maps a byte offset to its 0-based line. Shared by `RenderSnapshot::table_row_at_line`
+/// and `EditorState::table_context_at_line` so both agree.
+pub fn row_kind_at_line(
+    table: &TableInfo,
+    line_idx: usize,
+    byte_to_line: impl Fn(usize) -> usize,
+) -> Option<RowKind> {
+    if byte_to_line(table.header.line.start) == line_idx {
+        return Some(RowKind::Header);
+    }
+    if byte_to_line(table.delimiter_line.start) == line_idx {
+        return Some(RowKind::Delimiter);
+    }
+    table
+        .body
+        .iter()
+        .position(|r| byte_to_line(r.line.start) == line_idx)
+        .map(RowKind::Body)
+}
+
 /// Trim leading/trailing ASCII whitespace off a cell node's byte range using the
 /// rope, so the stored content range covers just the cell text.
 fn trim_cell_range(rope: &Rope, mut start: usize, mut end: usize) -> Range<usize> {
@@ -142,19 +165,120 @@ pub fn extract_table(node: &Node, rope: &Rope) -> Option<TableInfo> {
     let header = header?;
     let delimiter_line = delimiter_line?;
 
+    // Anchor the block to the header's LINE start, not the tree-sitter node's start_byte.
+    // On an all-empty-row ERROR, tree-sitter can extend a following table's `pipe_table`
+    // node *backwards* over the poisoned rows / a blank line / a heading, so node.start_byte
+    // lands far above the real header — the block then overlaps the previous table and the
+    // binary-search row lookup mis-attributes lines. The header row is always where the
+    // real header begins.
+    let block_start = rope.char_to_byte(rope.line_to_char(rope.byte_to_line(header.line.start)));
+
+    // Heal rows tree-sitter dropped. An all-empty row followed by a newline
+    // (`|  |  |  |\n`) makes tree-sitter-md emit an ERROR that truncates the `pipe_table`,
+    // silently dropping that row AND the real row before it (verified). That's exactly
+    // what `Editor::insert_table_row_after_line` produces, so a Tab-added empty row would
+    // otherwise render the last filled row as raw pipes. Recover by scanning the source
+    // lines immediately after the parsed table and re-attaching any that still look like
+    // table rows (non-blank + contains a pipe) — per GFM those ARE part of the table.
+    let mut block_end = node.end_byte();
+    let start_line = body
+        .last()
+        .map(|r| r.line.start)
+        .unwrap_or(delimiter_line.start);
+    let mut line = rope.byte_to_line(start_line);
+    while line + 1 < rope.len_lines() {
+        line += 1;
+        let ls = rope.char_to_byte(rope.line_to_char(line));
+        let le = if line + 1 < rope.len_lines() {
+            rope.char_to_byte(rope.line_to_char(line + 1))
+        } else {
+            rope.len_bytes()
+        };
+        let text = rope.slice(rope.byte_to_char(ls)..rope.byte_to_char(le));
+        // A GFM table continues over consecutive non-blank lines that contain a pipe; a
+        // blank line (or a pipe-less line) ends it. Healing an all-empty `|  |  |` row too
+        // means a mid-table empty row doesn't cut off the real rows below it.
+        let is_row = text.chars().any(|c| c == '|') && text.chars().any(|c| !c.is_whitespace());
+        if !is_row {
+            break;
+        }
+        let content_end = if le > ls && rope.get_byte(le - 1) == Some(b'\n') {
+            le - 1
+        } else {
+            le
+        };
+        body.push(row_from_raw_line(rope, ls, content_end));
+        block_end = content_end;
+    }
+
     let ncols = std::iter::once(header.cells.len())
         .chain(body.iter().map(|r| r.cells.len()))
         .max()
         .unwrap_or(0);
 
     Some(TableInfo {
-        block: node.start_byte()..node.end_byte(),
+        block: block_start..block_end,
         header,
         delimiter_line,
         aligns,
         body,
         ncols,
     })
+}
+
+/// Parse a raw table-row line (`| a | b | c |`) into cells, for rows tree-sitter dropped
+/// (see the healing in `extract_table`). Cells are the spans between consecutive unescaped
+/// `|`; the outer leading/trailing pipes bound the first/last cell. `start`/`end` are the
+/// line's buffer byte range (excluding the trailing newline).
+fn row_from_raw_line(rope: &Rope, start: usize, end: usize) -> TableRow {
+    let text: String = rope
+        .slice(rope.byte_to_char(start)..rope.byte_to_char(end))
+        .to_string();
+    let bytes = text.as_bytes();
+    let mut pipes: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2, // skip an escaped char (e.g. `\|`)
+            b'|' => {
+                pipes.push(start + i);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    // Cells are the spans between consecutive pipes, PLUS the text before the first
+    // pipe and after the last: per GFM the outer leading/trailing pipes are optional
+    // borders, so `1 | 2` is two cells, not one. Build every segment, then drop the
+    // first/last only when they are the empty span produced by a border pipe (keeping
+    // a genuinely empty first/last cell like `| | b |`).
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut seg_start = start;
+    for &p in &pipes {
+        segments.push((seg_start, p));
+        seg_start = p + 1;
+    }
+    segments.push((seg_start, end));
+    if segments.len() > 1 {
+        if trim_cell_range(rope, segments[0].0, segments[0].1).is_empty() {
+            segments.remove(0);
+        }
+        if let Some(&(s, e)) = segments.last()
+            && trim_cell_range(rope, s, e).is_empty()
+        {
+            segments.pop();
+        }
+    }
+    let cells = segments
+        .into_iter()
+        .map(|(s, e)| TableCell {
+            content: trim_cell_range(rope, s, e),
+        })
+        .collect();
+    TableRow {
+        line: start..end,
+        cells,
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +294,110 @@ mod tests {
         let tables = &buf.parsed().tables;
         assert_eq!(tables.len(), 1, "expected exactly one table");
         tables[0].clone()
+    }
+
+    #[test]
+    fn row_from_raw_line_handles_missing_outer_pipes() {
+        // A healed continuation row may omit its border pipes; GFM still reads it as
+        // multiple cells. `1 | 2` must be two cells, not one.
+        let buf: Buffer = "1 | 2 | 3".parse().unwrap();
+        let text = buf.text();
+        let row = row_from_raw_line(buf.rope(), 0, text.trim_end().len());
+        assert_eq!(row.cells.len(), 3);
+        assert_eq!(cell_text(&text, &row.cells[0]), "1");
+        assert_eq!(cell_text(&text, &row.cells[1]), "2");
+        assert_eq!(cell_text(&text, &row.cells[2]), "3");
+    }
+
+    #[test]
+    fn row_from_raw_line_keeps_empty_interior_cell() {
+        // `| | b |` — the empty first cell is real (between border and first inner pipe),
+        // only the border segments are dropped.
+        let buf: Buffer = "| | b |".parse().unwrap();
+        let text = buf.text();
+        let row = row_from_raw_line(buf.rope(), 0, text.trim_end().len());
+        assert_eq!(row.cells.len(), 2);
+        assert_eq!(cell_text(&text, &row.cells[0]), "");
+        assert_eq!(cell_text(&text, &row.cells[1]), "b");
+    }
+
+    #[test]
+    fn trailing_empty_row_is_healed() {
+        // An all-empty trailing row makes tree-sitter drop it AND the filled row before it;
+        // healing recovers both so the whole table still grid-renders.
+        let buf: Buffer = "| A | B |\n| - | - |\n| 1 | 2 |\n|   |   |\n"
+            .parse()
+            .unwrap();
+        let t = only_table(&buf);
+        assert_eq!(t.body.len(), 2, "filled + empty row both recovered");
+        assert_eq!(t.ncols, 2);
+        let text = buf.text();
+        assert_eq!(cell_text(&text, &t.body[0].cells[0]), "1");
+        assert_eq!(cell_text(&text, &t.body[0].cells[1]), "2");
+        assert!(
+            t.body[1]
+                .cells
+                .iter()
+                .all(|c| cell_text(&text, c).is_empty())
+        );
+        // The empty row is inside the block, so it renders as an (empty) grid row.
+        assert!(t.block.contains(&buf.line_to_byte(3)));
+    }
+
+    #[test]
+    fn mid_table_empty_row_does_not_truncate() {
+        let buf: Buffer = "| A | B |\n| - | - |\n| 1 | 2 |\n|   |   |\n| 3 | 4 |\n"
+            .parse()
+            .unwrap();
+        let t = only_table(&buf);
+        assert_eq!(
+            t.body.len(),
+            3,
+            "an empty row mid-table keeps the rows below it"
+        );
+        let text = buf.text();
+        assert_eq!(cell_text(&text, &t.body[2].cells[0]), "3");
+    }
+
+    #[test]
+    fn healing_stops_at_blank_line() {
+        // A blank line ends the table; a following pipe-containing paragraph isn't absorbed.
+        let buf: Buffer = "| A | B |\n| - | - |\n| 1 | 2 |\n\nafter | pipe\n"
+            .parse()
+            .unwrap();
+        let t = only_table(&buf);
+        assert_eq!(t.body.len(), 1);
+    }
+
+    #[test]
+    fn empty_row_does_not_corrupt_next_table() {
+        // An empty row in the first table used to make tree-sitter splice a phantom table
+        // whose block started inside the first table and swallowed the second — garbling it.
+        let src =
+            "| A | B |\n| - | - |\n| x | y |\n|   |   |\n\n## H\n| C | D |\n| - | - |\n| 1 | 2 |\n";
+        let buf: Buffer = src.parse().unwrap();
+        let ts = &buf.parsed().tables;
+        assert_eq!(ts.len(), 2, "two distinct tables");
+        assert!(
+            ts[0].block.end <= ts[1].block.start,
+            "table blocks must not overlap: {:?} vs {:?}",
+            ts[0].block,
+            ts[1].block
+        );
+        let text = buf.text();
+        assert_eq!(cell_text(&text, &ts[1].header.cells[0]), "C");
+        assert_eq!(cell_text(&text, &ts[1].body[0].cells[1]), "2");
+    }
+
+    #[test]
+    fn healed_row_cells_parse() {
+        let buf: Buffer = "| A | B |\n| - | - |\n| hi | yo |\n|   |   |\n"
+            .parse()
+            .unwrap();
+        let t = only_table(&buf);
+        let text = buf.text();
+        assert_eq!(cell_text(&text, &t.body[0].cells[0]), "hi");
+        assert_eq!(cell_text(&text, &t.body[0].cells[1]), "yo");
     }
 
     #[test]
