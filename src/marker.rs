@@ -1213,6 +1213,7 @@ pub fn is_line_in_code_block(nodes: &[NodeInfo], line_start: usize) -> bool {
 mod tests {
     use super::*;
     use crate::buffer::Buffer;
+    #[cfg(feature = "editor")]
     use crate::outline::current_heading_index;
 
     fn kinds(markers: &[Marker]) -> Vec<&MarkerKind> {
@@ -1631,6 +1632,7 @@ mod tests {
         assert_eq!(texts, vec!["Real", "After"]);
     }
 
+    #[cfg(feature = "editor")]
     #[test]
     fn test_current_heading_index() {
         let src = "intro line\n\n# First\n\nbody\n\n## Second\n\nmore\n";
