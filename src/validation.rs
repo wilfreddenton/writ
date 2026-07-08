@@ -2,7 +2,9 @@
 //!
 //! Pure data types (no network / async) shared between the render path and the
 //! feature-gated GitHub client: validated issue/PR/user data plus the
-//! thread-safe validation cache keyed by [`GitHubRef`](crate::inline::GitHubRef).
+//! thread-safe validation cache keyed by [`GitHubRef`].
+//!
+//! [`GitHubRef`]: crate::inline::GitHubRef
 
 use serde::Deserialize;
 use std::collections::HashMap;

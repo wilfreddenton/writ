@@ -150,6 +150,12 @@ impl Palette {
 fn parse_hex(s: &str) -> Result<Color, String> {
     let t = s.trim();
     let h = t.strip_prefix('#').unwrap_or(t);
+    // Reject non-ASCII first: `h.len()` is bytes, so a multi-byte char (e.g. `€000`, 6
+    // bytes) would pass the length match and then `h[i..i+2]` would slice inside the char
+    // and panic — crashing `config::load` at startup instead of falling back to defaults.
+    if !h.is_ascii() {
+        return Err(format!("invalid hex color '{s}'"));
+    }
     let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16);
     match h.len() {
         6 => match (byte(0), byte(2), byte(4)) {
@@ -263,6 +269,9 @@ mod tests {
         );
         assert!(parse_hex("#ZZ0000").is_err());
         assert!(parse_hex("#FFF").is_err());
+        // Non-ASCII of the right byte length must error, not panic (would crash startup).
+        assert!(parse_hex("€000").is_err());
+        assert!(parse_hex("#café00").is_err());
     }
 
     #[test]

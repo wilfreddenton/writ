@@ -3,6 +3,7 @@
 //! This module provides types for representing markers (blockquotes, lists,
 //! headings, etc.) and functions for extracting them from the parse tree.
 
+use crate::callout::{CalloutInfo, parse_callout_header};
 use crate::parser::MarkdownParser;
 use crate::table::{TableInfo, extract_table};
 use ropey::Rope;
@@ -83,6 +84,8 @@ pub struct ParsedNodes {
     pub headings: Vec<HeadingInfo>,
     /// List items in document order (parent before child), for list folding.
     pub list_items: Vec<ListItemInfo>,
+    /// Obsidian callouts (blockquotes with a `[!type]` header), in document order.
+    pub callouts: Vec<CalloutInfo>,
 }
 
 /// The unordered list marker character.
@@ -791,6 +794,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
     let mut tables = Vec::new();
     let mut headings = Vec::new();
     let mut list_items = Vec::new();
+    let mut callouts = Vec::new();
     let mut checked_task_stack: Vec<(usize, bool)> = Vec::new();
     let mut code_block_end: Option<usize> = None;
     // Ancestor kinds, pushed on descent and popped on ascent, so the current node's
@@ -904,6 +908,45 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
             tables.push(table);
         }
 
+        // Callouts: a `block_quote` whose first line (after its own `>` marker) is
+        // `[!type]`. Both top-level and nested blockquotes are considered — for a nested
+        // one, tree-sitter's inner `block_quote` node starts at the inner `>`, so reading
+        // from `node.start_byte()` (not the line start) strips exactly one `>` and matches
+        // `> > [!type]`. A plain outer quote wrapping an inner callout parses as `None` on
+        // the outer (its own first line isn't `[!type]`) and the callout on the inner.
+        if node.kind() == "block_quote" {
+            let header_line = rope.char_to_line(rope.byte_to_char(node.start_byte()));
+            let line_start = rope.char_to_byte(rope.line_to_char(header_line));
+            let line_end = if header_line + 1 < rope.len_lines() {
+                rope.char_to_byte(rope.line_to_char(header_line + 1))
+            } else {
+                rope.len_bytes()
+            };
+            let first_line = rope_slice_cow(rope, node.start_byte(), line_end);
+            if let Some((kind, title, foldable, default_collapsed)) =
+                parse_callout_header(&first_line)
+            {
+                // The blockquote's end byte can spill into a trailing blank/indent; take the
+                // last line that actually holds a byte of the node so a lone header (no body)
+                // yields `end_line == header_line + 1` (not foldable).
+                let last = node.end_byte().saturating_sub(1).max(node.start_byte());
+                let end_line = rope.char_to_line(rope.byte_to_char(last)) + 1;
+                // Ancestor `block_quote` nodes are already on `kind_stack`; count + 1 is
+                // this callout's nesting depth (top-level = 1).
+                let depth = kind_stack.iter().filter(|k| **k == "block_quote").count() + 1;
+                callouts.push(CalloutInfo {
+                    kind,
+                    title,
+                    foldable,
+                    default_collapsed,
+                    header_line,
+                    byte_offset: line_start,
+                    end_line: end_line.max(header_line + 1),
+                    depth,
+                });
+            }
+        }
+
         // ATX heading markers only appear at block level; tree-sitter never emits them
         // inside a fenced code block (its body is opaque `code_fence_content`), so
         // headings inside fences are naturally excluded.
@@ -917,9 +960,17 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
             } else {
                 rope.len_bytes()
             };
-            let text = rope_slice_cow(rope, node.end_byte(), line_end_byte)
-                .trim()
-                .to_string();
+            let raw = rope_slice_cow(rope, node.end_byte(), line_end_byte);
+            let trimmed = raw.trim();
+            // Strip an optional closing `#` sequence (`## Heading ##`). Per GFM it only
+            // closes when preceded by whitespace, so a glued `#` (`Heading#`) stays text.
+            let no_close = trimmed.trim_end_matches('#');
+            let text = if no_close.len() < trimmed.len() && no_close.ends_with(char::is_whitespace)
+            {
+                no_close.trim_end().to_string()
+            } else {
+                trimmed.to_string()
+            };
             headings.push(HeadingInfo {
                 level,
                 text,
@@ -969,6 +1020,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
                     tables,
                     headings,
                     list_items,
+                    callouts,
                 };
             }
             kind_stack.pop();
@@ -1130,18 +1182,31 @@ pub fn markers_at_from_infos(
     markers
 }
 
-/// Check if a line is inside a checked task by finding the first node that starts
-/// within the line range.
-pub fn is_line_in_checked_task(nodes: &[NodeInfo], line_start: usize) -> bool {
-    let idx = find_node_info_index(nodes, line_start);
-    nodes.get(idx).map(|n| n.in_checked_task).unwrap_or(false)
+/// True if any node at `line_start` — or a container spanning it — has `flag` set.
+///
+/// Several nodes can share a line-start byte (e.g. a `list` container and its
+/// `list_item`); a single binary-search hit would read whichever one the search
+/// happened to land on, so the flag must be OR'd across every node beginning at
+/// the byte plus the one container that opened earlier and still spans it.
+fn line_has_flag(nodes: &[NodeInfo], line_start: usize, flag: impl Fn(&NodeInfo) -> bool) -> bool {
+    let start = nodes.partition_point(|n| n.start_byte < line_start);
+    let end = nodes.partition_point(|n| n.start_byte <= line_start);
+    let at_line = nodes[start..end].iter().any(&flag);
+    let spanning = start
+        .checked_sub(1)
+        .and_then(|i| nodes.get(i))
+        .is_some_and(|n| n.end_byte > line_start && flag(n));
+    at_line || spanning
 }
 
-/// Check if a line is inside a fenced code block by finding the first node that starts
-/// within the line range.
+/// Check if a line is inside a checked task.
+pub fn is_line_in_checked_task(nodes: &[NodeInfo], line_start: usize) -> bool {
+    line_has_flag(nodes, line_start, |n| n.in_checked_task)
+}
+
+/// Check if a line is inside a fenced code block.
 pub fn is_line_in_code_block(nodes: &[NodeInfo], line_start: usize) -> bool {
-    let idx = find_node_info_index(nodes, line_start);
-    nodes.get(idx).map(|n| n.in_code_block).unwrap_or(false)
+    line_has_flag(nodes, line_start, |n| n.in_code_block)
 }
 
 #[cfg(test)]
@@ -1477,6 +1542,79 @@ mod tests {
     }
 
     #[test]
+    fn test_callouts_collected() {
+        use crate::callout::CalloutKind;
+        let buf: Buffer = concat!(
+            "> [!note]\n",
+            "> body line\n",
+            "\n",
+            "> [!tip]- Fold me\n",
+            "> hidden\n",
+            "\n",
+            "> not a callout\n",
+        )
+        .parse()
+        .unwrap();
+        let cs = buf.callouts();
+        assert_eq!(cs.len(), 2, "two callouts, the plain quote excluded");
+
+        assert_eq!(cs[0].kind, CalloutKind::Note);
+        assert_eq!(cs[0].title, "Note");
+        assert_eq!(cs[0].header_line, 0);
+        assert_eq!(cs[0].byte_offset, buf.line_to_byte(0));
+        assert!(!cs[0].foldable);
+        assert_eq!(cs[0].body_extent(), 1..2);
+
+        assert_eq!(cs[1].kind, CalloutKind::Tip);
+        assert_eq!(cs[1].title, "Fold me");
+        assert_eq!(cs[1].header_line, 3);
+        assert!(cs[1].foldable && cs[1].default_collapsed);
+        assert!(cs[1].is_foldable());
+        assert_eq!(cs[1].body_extent(), 4..5);
+    }
+
+    #[test]
+    fn test_nested_callouts_collected() {
+        use crate::callout::CalloutKind;
+        let buf: Buffer = concat!(
+            "> [!note] Outer\n",
+            "> > [!warning] Inner\n",
+            "> > inner body\n",
+        )
+        .parse()
+        .unwrap();
+        let cs = buf.callouts();
+        assert_eq!(cs.len(), 2, "outer note + nested warning");
+
+        assert_eq!(cs[0].kind, CalloutKind::Note);
+        assert_eq!(cs[0].title, "Outer");
+        assert_eq!(cs[0].header_line, 0);
+        assert_eq!(cs[0].body_extent(), 1..3); // hides the nested callout + its body
+
+        assert_eq!(cs[1].kind, CalloutKind::Warning);
+        assert_eq!(cs[1].title, "Inner");
+        assert_eq!(cs[1].header_line, 1);
+        assert_eq!(cs[1].body_extent(), 2..3);
+    }
+
+    #[test]
+    fn test_callout_nested_in_plain_quote() {
+        use crate::callout::CalloutKind;
+        // A plain outer blockquote wrapping a callout: only the inner is a callout.
+        let buf: Buffer = "> outer plain text\n> > [!tip] Nested\n".parse().unwrap();
+        let cs = buf.callouts();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].kind, CalloutKind::Tip);
+        assert_eq!(cs[0].header_line, 1);
+    }
+
+    #[test]
+    fn test_callout_not_detected_in_code_fence() {
+        let buf: Buffer = "```\n> [!note]\n> body\n```\n".parse().unwrap();
+        assert!(buf.callouts().is_empty(), "fenced text isn't a blockquote");
+    }
+
+    #[test]
     fn test_heading_trailing_space_trimmed() {
         let buf: Buffer = "#   Spaced heading   \n".parse().unwrap();
         let hs = buf.headings();
@@ -1634,6 +1772,19 @@ mod tests {
         let buf: Buffer = "---\n".parse().unwrap();
         let lines = buf.lines();
         assert_eq!(kinds(&lines[0].markers), vec![&MarkerKind::ThematicBreak]);
+    }
+
+    #[test]
+    fn test_multiline_checked_task_flag_all_lines() {
+        // A checked task with a soft-wrapped continuation: both the marker line
+        // and the continuation must report in_checked_task, otherwise the
+        // strikethrough would render on only the first line. The list container
+        // and list_item share the marker line's start byte, so a single
+        // binary-search hit could read the wrong (unflagged) node.
+        let buf: Buffer = "- [x] done\n  still done\n".parse().unwrap();
+        let lines = buf.lines();
+        assert!(lines[0].in_checked_task);
+        assert!(lines[1].in_checked_task);
     }
 
     #[test]

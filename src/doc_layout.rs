@@ -35,7 +35,8 @@ use crate::mermaid;
 #[cfg(feature = "math")]
 use crate::render::InlineMathRef;
 use crate::render::{
-    ImageRef, InlineImageRef, LineRender, TableCtx, build_cell_render, build_line_render,
+    CalloutHeader, ImageRef, InlineImageRef, LineRender, TableCtx, build_cell_render,
+    build_line_render,
 };
 use crate::segment_map::SegmentMap;
 use crate::table::{Align, RowKind, TableInfo, TableRow};
@@ -367,20 +368,39 @@ fn table_grid_ok(t: &TableInfo) -> bool {
         && (t.body.len() + 1).saturating_mul(t.ncols.max(1)) <= TABLE_MAX_CELLS
 }
 
-/// Content hash keying a `TableLayout`: same text + width + font ⇒ identical grid.
+/// Content hash keying a `TableLayout`: same text + width + font ⇒ identical grid. Keyed
+/// on the table's own bytes (NOT the buffer version) so an edit elsewhere in the document
+/// is a cache hit — only the table you're actually editing rebuilds its grid. This is the
+/// difference between O(1) and re-measuring every cell of every table on every keystroke.
 fn table_key(
-    version: u64,
+    content_hash: u64,
     block_start: usize,
     scale: f32,
     font_size: f32,
     max_advance: f32,
 ) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    version.hash(&mut h);
+    content_hash.hash(&mut h);
     block_start.hash(&mut h);
     scale.to_bits().hash(&mut h);
     font_size.to_bits().hash(&mut h);
     max_advance.to_bits().hash(&mut h);
+    h.finish()
+}
+
+/// Hash of a table block's source bytes — its layout-affecting content.
+fn table_content_hash(snapshot: &RenderSnapshot, block: &Range<usize>) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let rope = &snapshot.rope;
+    let end = block.end.min(rope.len_bytes());
+    if block.start < end {
+        for chunk in rope
+            .slice(rope.byte_to_char(block.start)..rope.byte_to_char(end))
+            .chunks()
+        {
+            chunk.hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -692,6 +712,7 @@ fn build_ghosts_before(
             None,
             &[],
             &[],
+            None,
         );
         let layout = engine.build_line_hanging(
             &lr.text,
@@ -878,12 +899,15 @@ fn resolve_inline_math(
                     let mut h = loaded.display_h * scale;
                     // Descent (px below the math baseline) → shift the image down so the
                     // math baseline lands on the text baseline Parley aligns the box to.
-                    let descent =
+                    let mut descent =
                         (loaded.display_h - loaded.baseline.unwrap_or(loaded.display_h)) * scale;
                     if w > max_advance && w > 0.0 {
                         let s = max_advance / w;
                         w = max_advance;
                         h *= s;
+                        // The whole box (descent included) shrinks by `s`, else the baseline
+                        // shift over-shoots for math clamped to the wrap width.
+                        descent *= s;
                     }
                     let brush = Some((
                         loaded.brush.clone(),
@@ -1461,6 +1485,14 @@ impl DocLayout {
                     kind,
                 });
 
+            // Callout header styling for this line (icon + title in the accent color),
+            // when line `i` is a `[!type]` header. `build_line_render` reveals raw syntax
+            // while the caret is on the line.
+            let callout_ctx = snapshot.callout_header_at_line(i).map(|c| CalloutHeader {
+                display: format!("{} {}", c.kind.icon(), c.title),
+                color: peniko_color(c.kind.color(theme)),
+            });
+
             let extra = github.map(|g| g.extra_regions(i)).unwrap_or_default();
             // Byte ranges on this line to LaTeX-highlight: the content of a revealed inline
             // `$…$` span (caret inside it) or a revealed `$$…$$` block line (caret in the
@@ -1501,6 +1533,7 @@ impl DocLayout {
             // a version bump); all others key on (version, line, cursor-on-line).
             let lr = if extra.is_empty() {
                 let tc = table_ctx.clone();
+                let cc = callout_ctx.clone();
                 render_cache.get_or_build(rkey, || {
                     Rc::new(build_line_render(
                         snapshot,
@@ -1513,6 +1546,7 @@ impl DocLayout {
                         tc,
                         math_spans.get(&i).map_or(&[][..], |v| v.as_slice()),
                         &latex_ranges,
+                        cc,
                     ))
                 })
             } else {
@@ -1527,6 +1561,7 @@ impl DocLayout {
                     table_ctx.clone(),
                     math_spans.get(&i).map_or(&[][..], |v| v.as_slice()),
                     &latex_ranges,
+                    callout_ctx,
                 ))
             };
             #[cfg_attr(not(feature = "math"), allow(unused_mut))]
@@ -1647,8 +1682,13 @@ impl DocLayout {
                     .table_row_at_line(i)
                     .filter(|(t, _)| table_grid_ok(t))
                     .map(|(t, kind)| {
-                        let tkey =
-                            table_key(version, t.block.start, scale, base_font_size, max_advance);
+                        let tkey = table_key(
+                            table_content_hash(snapshot, &t.block),
+                            t.block.start,
+                            scale,
+                            base_font_size,
+                            max_advance,
+                        );
                         let tl = table_cache.get_or_build(tkey, || {
                             Rc::new(build_table_layout(
                                 engine,

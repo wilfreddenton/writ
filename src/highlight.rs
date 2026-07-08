@@ -50,6 +50,8 @@ pub struct HighlightSpan {
 /// color. For the hand-written tokenizers (mermaid, latex), which emit categories by name
 /// rather than via a tree-sitter query. An unknown name resolves to a sentinel that renders
 /// as the plain foreground.
+///
+/// [`EditorTheme::color_for_highlight`]: crate::editor::EditorTheme::color_for_highlight
 pub fn highlight_id(name: &str) -> usize {
     HIGHLIGHT_NAMES
         .iter()
