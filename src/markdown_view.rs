@@ -76,6 +76,16 @@ impl MarkdownView {
         }
     }
 
+    /// Register a font (TTF/OTF bytes) and make it the document body family. Required in
+    /// environments with no system fonts (wasm/browser); the bundled face must be monospace
+    /// to preserve writ's deterministic wrapping. Invalidates any built layout.
+    pub fn register_font(&mut self, data: Vec<u8>) {
+        if let Some(family) = self.text_engine.register_font(data) {
+            self.text_engine.set_font_family(Some(family));
+            self.invalidate_layout();
+        }
+    }
+
     /// Discard the built layout so the next `layout`/`render` rebuilds.
     fn invalidate_layout(&mut self) {
         self.doc = None;

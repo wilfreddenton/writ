@@ -4,7 +4,9 @@
 
 use std::borrow::Cow;
 use std::ops::Range;
+use std::sync::Arc;
 
+use parley::fontique::Blob;
 use parley::{
     Affinity, Alignment, AlignmentOptions, CHROMIUM_LINE_BREAK_OVERRIDE, Cluster, Cursor,
     FontContext, FontFamily, FontFamilyName, FontStyle, FontWeight, GenericFamily, IndentOptions,
@@ -71,6 +73,16 @@ impl TextEngine {
     /// fixed-pitch via [`is_monospace`](Self::is_monospace) before trusting a user value.
     pub fn set_font_family(&mut self, family: Option<String>) {
         self.font_family = family;
+    }
+
+    /// Register a font from raw bytes (TTF/OTF) into the layout collection and return the
+    /// family name it registered under, or `None` if the data held no usable family. Needed
+    /// in environments with no system font source (e.g. wasm/browser), where
+    /// [`FontContext::new`] finds nothing to resolve `monospace` against.
+    pub fn register_font(&mut self, data: Vec<u8>) -> Option<String> {
+        let blob = Blob::new(Arc::new(data) as Arc<dyn AsRef<[u8]> + Send + Sync>);
+        let (family_id, _) = self.fcx.collection.register_fonts(blob, None).into_iter().next()?;
+        self.fcx.collection.family_name(family_id).map(str::to_string)
     }
 
     /// The default font for a line: the configured family with a monospace fallback, or
