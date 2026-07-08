@@ -81,8 +81,16 @@ impl TextEngine {
     /// [`FontContext::new`] finds nothing to resolve `monospace` against.
     pub fn register_font(&mut self, data: Vec<u8>) -> Option<String> {
         let blob = Blob::new(Arc::new(data) as Arc<dyn AsRef<[u8]> + Send + Sync>);
-        let (family_id, _) = self.fcx.collection.register_fonts(blob, None).into_iter().next()?;
-        self.fcx.collection.family_name(family_id).map(str::to_string)
+        let (family_id, _) = self
+            .fcx
+            .collection
+            .register_fonts(blob, None)
+            .into_iter()
+            .next()?;
+        self.fcx
+            .collection
+            .family_name(family_id)
+            .map(str::to_string)
     }
 
     /// The default font for a line: the configured family with a monospace fallback, or
