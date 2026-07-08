@@ -1799,7 +1799,9 @@ impl DocLayout {
             img_label_size: 14.0 * scale,
             image_border: peniko_color(theme.comment),
             image_bg: peniko_color_alpha(theme.comment, 0.08),
-            code_bg: peniko_color_alpha(theme.comment, 0.22),
+            // No background chip: green + monospace already reads as inline code, and a
+            // translucent fill only muddies the diff line tint and selection it composites with.
+            code_bg: Color::TRANSPARENT,
             table_lines,
             table_cell_pad_x: TABLE_CELL_PAD_X * scale,
             table_cell_pad_y: TABLE_CELL_PAD_Y * scale,
@@ -2119,6 +2121,12 @@ impl DocLayout {
         top_y: f64,
         color: Color,
     ) {
+        // A transparent fill paints nothing — skip the geometry. Lets the inline-code
+        // "chip" be disabled by a transparent `code_bg` with no wasted per-frame draw
+        // (diff tints are always opaque, so they're unaffected).
+        if color == Color::TRANSPARENT {
+            return;
+        }
         self.fill_display_ranges(scene, layout, ranges, self.pad_x as f64, top_y, color);
     }
 
