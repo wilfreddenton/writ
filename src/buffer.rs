@@ -437,7 +437,8 @@ pub struct BufferContent {
     /// Sorted by start position for efficient binary search lookup.
     /// Wrapped in Rc for O(1) cloning in render snapshots.
     inline_styles: Rc<Vec<StyledRegion>>,
-    /// Version counter, incremented on each edit. Used by Editor to detect changes.
+    /// Globally unique revision, refreshed on edits so replacement buffers cannot
+    /// reuse an older buffer's render or detection cache entries.
     version: u64,
     /// When set, `apply_edit` skips the whole-doc `update_caches` (nodes + inline styles).
     /// Used to batch a compound action (a checkbox toggle cascades through many
@@ -461,7 +462,7 @@ impl BufferContent {
         }
     }
 
-    /// Returns the current version number. Incremented on each edit.
+    /// Returns the current globally unique revision, refreshed on each edit.
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -532,7 +533,7 @@ impl BufferContent {
             self.update_caches();
         }
         self.code_highlight_cache.valid = false;
-        self.version += 1;
+        self.version = NEXT_VERSION.fetch_add(1, Ordering::Relaxed);
     }
 
     /// True if the byte range `start..end` lies within (or on the boundary of) an
@@ -1116,6 +1117,29 @@ impl FromStr for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revisions_are_unique_across_edits_and_replacement_buffers() {
+        let mut first: Buffer = "first".parse().unwrap();
+        let mut versions = vec![first.version()];
+        let second = Buffer::new();
+        versions.push(second.version());
+
+        first.insert(0, "edited ", 0);
+        versions.push(first.version());
+        let replacement: Buffer = "replacement".parse().unwrap();
+        versions.push(replacement.version());
+
+        first.undo().unwrap();
+        versions.push(first.version());
+        first.redo().unwrap();
+        versions.push(first.version());
+
+        assert!(
+            versions.windows(2).all(|pair| pair[0] < pair[1]),
+            "each new revision must be newer than every prior buffer revision: {versions:?}"
+        );
+    }
 
     #[test]
     fn typescript_fence_highlights_track_edits_and_undo() {

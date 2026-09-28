@@ -12,6 +12,7 @@
 //! in a later phase. Detection (the synchronous scan) lives here.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf, absolute};
 use std::sync::mpsc;
@@ -175,6 +176,7 @@ pub struct Editor {
     file_watcher_rx: Option<mpsc::Receiver<WatchKind>>,
     /// mtime after our own last save, so the watcher can skip self-writes.
     last_save_mtime: Option<SystemTime>,
+    save_generation: u64,
 }
 
 /// Common prefix/suffix diff of two ropes → the single splice (`prefix..old_end`, a byte
@@ -258,6 +260,7 @@ impl Editor {
             file_watcher: None,
             file_watcher_rx: None,
             last_save_mtime: None,
+            save_generation: 0,
         }
     }
 
@@ -439,6 +442,17 @@ impl Editor {
     }
 
     pub fn move_in_direction(&mut self, direction: Direction, extend: bool) {
+        if !extend && let Some(range) = self.selection_range() {
+            let edge = match direction {
+                Direction::Left => Some(range.start),
+                Direction::Right => Some(range.end),
+                _ => None,
+            };
+            if let Some(edge) = edge {
+                self.state.set_cursor(edge);
+                return;
+            }
+        }
         let new_cursor = self.state.cursor_in_direction(direction);
         if extend {
             self.state.selection = self.state.selection.extend_to(new_cursor.offset);
@@ -1166,7 +1180,17 @@ impl Editor {
             Err(_) => Vec::new(),
         };
 
-        let cursor = self.cursor_position();
+        // Refining a query should keep its current occurrence, rather than starting
+        // after the selected match. Buffer edits and manual caret moves still use the caret.
+        let cursor = find
+            .active
+            .and_then(|i| find.matches.get(i))
+            .filter(|range| {
+                focused
+                    && find.scanned.as_ref().is_some_and(|key| key.0 == version)
+                    && self.state.selection.range() == **range
+            })
+            .map_or_else(|| self.cursor_position(), |range| range.start);
         let active = (!matches.is_empty())
             .then(|| matches.iter().position(|m| m.start >= cursor).unwrap_or(0));
         // Only pull the document selection onto the active match when the bar owns focus.
@@ -1243,7 +1267,7 @@ impl Editor {
 
     /// Recompile the exact `Regex` `find_rescan` used for the current query (literal
     /// queries are `regex::escape`d, `(?i)` prepended when case-insensitive) so replace
-    /// can expand `$1`/`${name}` capture groups against a matched slice. `None` for an
+    /// can expand `$1`/`${name}` capture groups against the document. `None` for an
     /// empty or invalid pattern.
     /// Build the regex source for a find query: literal queries are `regex::escape`d, and
     /// `(?i)` is prepended when the search is case-insensitive.
@@ -1272,9 +1296,28 @@ impl Editor {
         Regex::new(&pattern).ok()
     }
 
+    fn expand_find_replacement(
+        re: &Regex,
+        text: &str,
+        range: &Range<usize>,
+        replacement: &str,
+    ) -> String {
+        // Assertions such as \B need the surrounding document, including for
+        // zero-width matches. Matching a sliced range loses that context.
+        let Some(captures) = re.captures_at(text, range.start) else {
+            return text[range.clone()].to_string();
+        };
+        if captures.get(0).is_none_or(|m| m.range() != *range) {
+            return text[range.clone()].to_string();
+        }
+        let mut expanded = String::new();
+        captures.expand(replacement, &mut expanded);
+        expanded
+    }
+
     /// Replace the active match with the replacement text (one undo step), then rescan
     /// and land on the next match. In regex mode the replacement's `$1`/`${name}` groups
-    /// expand from the matched slice; in literal mode it is inserted verbatim. No-op when
+    /// expand with the original document context; literal mode inserts verbatim. No-op when
     /// there is no active match.
     pub fn find_replace_current(&mut self) {
         let Some(find) = self.find.as_ref() else {
@@ -1291,8 +1334,7 @@ impl Editor {
             match self.find_regex() {
                 Some(re) => {
                     let text = self.state.buffer.text();
-                    re.replace(&text[range.clone()], replacement.as_str())
-                        .into_owned()
+                    Self::expand_find_replacement(&re, &text, &range, &replacement)
                 }
                 None => replacement,
             }
@@ -1340,19 +1382,28 @@ impl Editor {
             let head = s.buffer.undo_head();
             let text_before = s.buffer.text();
             let cursor_before = s.cursor().offset;
+            let mut cursor_after = cursor_before;
 
             for range in matches.iter().rev() {
                 let expanded = match (regex_mode, &re) {
-                    (true, Some(re)) => re
-                        .replace(&text_before[range.clone()], replacement.as_str())
-                        .into_owned(),
+                    (true, Some(re)) => {
+                        Self::expand_find_replacement(re, &text_before, range, &replacement)
+                    }
                     _ => replacement.clone(),
                 };
                 s.buffer.replace(range.clone(), &expanded, cursor_before);
+                if cursor_after >= range.end {
+                    cursor_after = cursor_after - range.len() + expanded.len();
+                } else if cursor_after > range.start {
+                    cursor_after = range.start + expanded.len();
+                }
             }
 
             let text_after = s.buffer.text();
-            let cursor_after = cursor_before.min(text_after.len());
+            let mut cursor_after = cursor_after.min(text_after.len());
+            while !text_after.is_char_boundary(cursor_after) {
+                cursor_after -= 1;
+            }
             // Collapse the per-match edits into one minimal undo entry.
             s.buffer
                 .coalesce_since(head, &text_before, &text_after, cursor_before, cursor_after);
@@ -1638,14 +1689,15 @@ impl Editor {
         };
         // Stream the rope's chunks straight to the file — no whole-document String alloc.
         let file = std::fs::File::create(&path)?;
-        self.state
-            .buffer
-            .rope()
-            .write_to(std::io::BufWriter::new(file))?;
+        let mut writer = std::io::BufWriter::new(file);
+        self.state.buffer.rope().write_to(&mut writer)?;
+        // BufWriter's drop ignores flush errors; only a confirmed write is a save.
+        writer.flush()?;
         if let Ok(metadata) = std::fs::metadata(&path) {
             self.last_save_mtime = metadata.modified().ok();
         }
         self.state.buffer.mark_clean();
+        self.save_generation += 1;
         Ok(())
     }
 
@@ -1657,6 +1709,10 @@ impl Editor {
 
     pub fn last_save_mtime(&self) -> Option<SystemTime> {
         self.last_save_mtime
+    }
+
+    pub fn save_generation(&self) -> u64 {
+        self.save_generation
     }
 
     /// The blocking half of an external-file reload: read the file + the git HEAD blob.
@@ -1690,6 +1746,11 @@ impl Editor {
     /// the cursor line) and set the diff base from `base_text`, then recompute the diff.
     /// Only parse/snapshot/diff work — no IO.
     pub fn apply_reload(&mut self, content: String, base_text: Option<String>) {
+        self.apply_file_content(content);
+        self.apply_git_base(base_text);
+    }
+
+    pub(crate) fn apply_file_content(&mut self, content: String) {
         if !self.state.buffer.content_eq(&content) {
             // Persist folds across the reload: remap their offsets from the actual
             // splice (external edits are usually a localized change), the same way a
@@ -1708,6 +1769,10 @@ impl Editor {
             let offset = self.state.buffer.line_to_byte(line);
             self.state.selection = Selection::new(offset, offset);
         }
+    }
+
+    /// Apply an off-thread HEAD read without replacing local edits or their undo history.
+    pub fn apply_git_base(&mut self, base_text: Option<String>) {
         self.head_base = base_text.map(Self::make_head_base);
         self.recompute_diff();
     }
@@ -1720,9 +1785,17 @@ impl Editor {
         let (tx, rx) = mpsc::channel();
         // notify emits absolute paths even when the CLI was given a relative path.
         let watched_file = absolute(&path)?;
+        let resolved_file = watched_file
+            .canonicalize()
+            .unwrap_or_else(|_| watched_file.clone());
         // Atomic saves replace the file's inode. Watching its parent keeps subsequent
         // saves visible, including deletion followed by recreation at the same path.
-        let watch_dir = watched_file.parent().unwrap_or(&watched_file).to_path_buf();
+        // A symlink's target may live elsewhere; keep watching the link as well so
+        // replacing the link itself still triggers a reload.
+        let watch_dirs: HashSet<PathBuf> = [&watched_file, &resolved_file]
+            .into_iter()
+            .map(|file| file.parent().unwrap_or(file).to_path_buf())
+            .collect();
         // 150ms debounce collapses a save's event burst (and atomic-save temp→rename)
         // into a single reload notification.
         let mut debouncer = new_debouncer(
@@ -1737,7 +1810,7 @@ impl Editor {
                         continue;
                     }
                     for p in &e.paths {
-                        if *p == watched_file {
+                        if *p == watched_file || *p == resolved_file {
                             file = true;
                         } else if is_git_base_path(p) {
                             git = true;
@@ -1752,7 +1825,9 @@ impl Editor {
                 }
             },
         )?;
-        debouncer.watch(&watch_dir, RecursiveMode::NonRecursive)?;
+        for dir in watch_dirs {
+            debouncer.watch(&dir, RecursiveMode::NonRecursive)?;
+        }
         // Also watch the git dirs so a commit/checkout that moves HEAD refreshes the
         // inline diff even when the working file is untouched. Watch the *directories*
         // (not the files) so the watch survives git's lockfile→rename ref updates; the
@@ -1779,6 +1854,8 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::process::Command;
     use std::time::Instant;
 
@@ -1831,6 +1908,39 @@ mod tests {
 
         std::fs::write(&note, "# After\n").unwrap();
         assert_watched_reload(&mut editor, &rx, "# After\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "relies on fs-event timing; run manually"]
+    fn file_watch_tracks_symlink_target_and_link_replacement() {
+        let dir = WatchTestDir::new("symlink");
+        let target_dir = dir.0.join("actual");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("note.md");
+        let link = dir.0.join("note.md");
+        std::fs::write(&target, "# Before\n").unwrap();
+        symlink(&target, &link).unwrap();
+        let mut editor = Editor::open(&link);
+        editor.watch_file().unwrap();
+        let rx = editor.take_file_watch_rx().unwrap();
+
+        std::fs::write(&target, "# Target write\n").unwrap();
+        assert_watched_reload(&mut editor, &rx, "# Target write\n");
+
+        for content in ["# Target replacement one\n", "# Target replacement two\n"] {
+            let temp = target_dir.join("note.tmp");
+            std::fs::write(&temp, content).unwrap();
+            std::fs::rename(&temp, &target).unwrap();
+            assert_watched_reload(&mut editor, &rx, content);
+        }
+
+        let temp = dir.0.join("note.tmp");
+        std::fs::write(&temp, "# Replaced link\n").unwrap();
+        std::fs::rename(&temp, &link).unwrap();
+        assert_watched_reload(&mut editor, &rx, "# Replaced link\n");
+        std::fs::write(&link, "# Regular file write\n").unwrap();
+        assert_watched_reload(&mut editor, &rx, "# Regular file write\n");
     }
 
     #[test]
@@ -2734,6 +2844,98 @@ let code = target(); // fenced block line
         set_replace(&mut e, "${1}Id");
         e.find_replace_all();
         assert_eq!(e.text(), "userId and roleId\n");
+    }
+
+    #[test]
+    fn find_refinement_preserves_current_occurrence() {
+        let mut e = Editor::new("quartz first\nquartz second\n");
+        e.open_find(false);
+        for query in ["q", "qu", "qua", "quar", "quart", "quartz"] {
+            set_query(&mut e, query);
+            assert_eq!(e.selection_range(), Some(0..query.len()));
+        }
+        e.find_next();
+        set_query(&mut e, "quart");
+        assert_eq!(e.selection_range(), Some(13..18));
+        e.find_toggle_case();
+        assert_eq!(e.selection_range(), Some(13..18));
+        e.find_toggle_regex();
+        assert_eq!(e.selection_range(), Some(13..18));
+
+        set_query(&mut e, "first");
+        assert_eq!(e.selection_range(), Some(7..12));
+    }
+
+    #[test]
+    fn find_regex_replacements_preserve_assertion_context() {
+        for replace_all in [false, true] {
+            for (query, replacement, expected) in [
+                (r"\B(foo)", "${1}bar", "afoobar"),
+                (r"\b", "X", if replace_all { "XafooX" } else { "Xafoo" }),
+            ] {
+                let mut e = Editor::new("afoo");
+                e.open_find(true);
+                e.find_toggle_regex();
+                set_query(&mut e, query);
+                set_replace(&mut e, replacement);
+                if replace_all {
+                    e.find_replace_all();
+                } else {
+                    e.find_replace_current();
+                }
+                assert_eq!(e.text(), expected, "query {query}, all={replace_all}");
+                e.undo();
+                assert_eq!(e.text(), "afoo");
+                e.redo();
+                assert_eq!(e.text(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn find_replace_all_keeps_unicode_cursor_and_undo_valid() {
+        let mut e = Editor::new("a a");
+        e.open_find(true);
+        set_query(&mut e, "a");
+        set_replace(&mut e, "é");
+        e.find_replace_all();
+        assert_eq!(e.text(), "é é");
+        assert_eq!(e.cursor_position(), 2);
+        e.close_find();
+        e.insert_str("X");
+        assert_eq!(e.text(), "éX é");
+        e.undo();
+        assert_eq!(e.text(), "é é");
+        e.undo();
+        assert_eq!(e.text(), "a a");
+        e.redo();
+        assert_eq!(e.text(), "é é");
+        assert_eq!(e.cursor_position(), 2);
+        e.redo();
+        assert_eq!(e.text(), "éX é");
+        assert!(e.text().is_char_boundary(e.cursor_position()));
+    }
+
+    #[test]
+    fn horizontal_arrows_collapse_selection_before_moving() {
+        for selection in [Selection::new(0, 5), Selection::new(5, 0)] {
+            for (direction, expected) in [(Direction::Left, 0), (Direction::Right, 5)] {
+                let mut e = Editor::new("hello world");
+                e.state.selection = selection;
+                e.move_in_direction(direction, false);
+                assert_eq!(e.cursor_position(), expected);
+                assert!(e.selection_range().is_none());
+            }
+        }
+        let mut e = Editor::new("hello world");
+        e.state.selection = Selection::new(0, 5);
+        e.move_in_direction(Direction::Left, true);
+        assert_eq!(e.selection_range(), Some(0..4));
+        e.move_in_direction(Direction::Right, true);
+        assert_eq!(e.selection_range(), Some(0..5));
+        e.set_cursor(5);
+        e.move_in_direction(Direction::Left, false);
+        assert_eq!(e.cursor_position(), 4);
     }
 
     #[test]

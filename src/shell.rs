@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use unicode_segmentation::UnicodeSegmentation;
 use vello::kurbo::{Affine, BezPath, Point, Rect, Stroke};
 use vello::peniko::Fill;
@@ -52,7 +52,7 @@ use crate::doc_layout::{
     ScreenRect, TableCache,
 };
 use crate::editor::{Direction, EditorTheme};
-use crate::git::{detect_github_context, parse_github_repo_string};
+use crate::git::{detect_github_context, head_blob_text, parse_github_repo_string};
 use crate::github::{GitHubClient, ValidationResult};
 use crate::image_cache::ImageCache;
 use crate::image_load::{RepaintSignal, load_local_images_blocking, spawn_image_loads};
@@ -213,11 +213,60 @@ fn demo_editor() -> Editor {
     editor
 }
 
-/// Wakeups sent from tokio worker tasks back into the winit loop. The work's
-/// results are already written to the shared `Arc<Mutex>` caches; the event just
-/// tells the loop to redraw (and, for autocomplete, drain the suggestion slot).
 /// `(new file content, git HEAD blob text)` read off-thread for a file reload.
 type ReloadData = (String, Option<String>);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReloadTicket {
+    file_generation: u64,
+    base_generation: u64,
+    buffer_version: u64,
+    save_generation: u64,
+}
+
+#[derive(Default)]
+struct ReloadState {
+    file_generation: u64,
+    base_generation: u64,
+}
+
+impl ReloadState {
+    fn begin_file(&mut self, editor: &Editor) -> ReloadTicket {
+        self.file_generation += 1;
+        ReloadTicket {
+            file_generation: self.file_generation,
+            base_generation: self.base_generation,
+            buffer_version: editor.state.buffer.version(),
+            save_generation: editor.save_generation(),
+        }
+    }
+
+    fn begin_base(&mut self) -> u64 {
+        self.base_generation += 1;
+        self.base_generation
+    }
+
+    fn apply_file(&self, editor: &mut Editor, ticket: ReloadTicket, data: ReloadData) -> bool {
+        // A slow disk read must not overwrite a newer read or edits made while it ran.
+        if ticket.file_generation != self.file_generation
+            || ticket.buffer_version != editor.state.buffer.version()
+            || ticket.save_generation != editor.save_generation()
+        {
+            return false;
+        }
+        editor.apply_file_content(data.0);
+        self.apply_base(editor, ticket.base_generation, data.1);
+        true
+    }
+
+    fn apply_base(&self, editor: &mut Editor, generation: u64, base: Option<String>) -> bool {
+        if generation != self.base_generation {
+            return false;
+        }
+        editor.apply_git_base(base);
+        true
+    }
+}
 
 /// Shared slot a debounced autocomplete fetch drops its results into for the main thread.
 type AcSlot = Arc<Mutex<Option<FetchedSuggestions>>>;
@@ -231,13 +280,10 @@ pub(crate) enum WritEvent {
     /// The watched file changed on disk (forwarded from the file-watcher thread). The
     /// loop kicks off a blocking read off-thread rather than touching disk here.
     FileChanged,
-    /// A watched git dir moved HEAD (commit/checkout, working file untouched). Like
-    /// `FileChanged` but the off-thread read ignores the self-write mtime guard so the
-    /// diff base refreshes; the (unchanged) buffer is left alone via `content_eq`.
+    /// A watched git dir moved HEAD; refresh the diff base without reloading the file.
     GitBaseChanged,
-    /// The off-thread file read finished; its `(content, base_text)` is in `reload_slot`,
-    /// ready for the cheap main-thread apply (buffer swap + diff).
-    FileReloaded,
+    FileReloaded(ReloadTicket, ReloadData),
+    GitBaseReloaded(u64, Option<String>),
 }
 
 /// Concrete `RepaintSignal` for the winit shell: wakes the loop with `ImageLoaded` so a
@@ -272,6 +318,47 @@ struct ActiveSurface {
     /// shared `viewport()` accessor can shrink the editor height without threading the
     /// editor's find state through its ten call sites; synced by `sync_find_chrome`.
     find_bar_h: f32,
+}
+
+struct SelectionDrag {
+    origin: (f32, f32),
+    position: (f32, f32),
+    threshold: f32,
+    active: bool,
+    pending: bool,
+}
+
+impl SelectionDrag {
+    fn new(position: (f32, f32), scale: f32) -> Self {
+        Self {
+            origin: position,
+            position,
+            threshold: 5.0 * scale,
+            active: false,
+            pending: false,
+        }
+    }
+
+    fn update(&mut self, position: (f32, f32)) -> bool {
+        if position == self.position {
+            return false;
+        }
+        self.position = position;
+        // Revealing raw Markdown can move text beneath a stationary pointer. Only
+        // physical travel from the press starts selection, independent of relayout.
+        if !self.active
+            && (position.0 - self.origin.0).hypot(position.1 - self.origin.1) < self.threshold
+        {
+            return false;
+        }
+        self.active = true;
+        self.pending = true;
+        true
+    }
+
+    fn take_pending(&mut self) -> bool {
+        std::mem::take(&mut self.pending)
+    }
 }
 
 struct FrameRetry {
@@ -379,7 +466,7 @@ struct App {
     doc_engine: DocEngine,
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
-    mouse_down: bool,
+    selection_drag: Option<SelectionDrag>,
     /// The OS cursor icon currently set on the window, so hover updates only call
     /// `set_cursor` on a real change (Ctrl-hover over a link → pointer, else default).
     cursor_icon: CursorIcon,
@@ -394,17 +481,11 @@ struct App {
     /// Timestamp of the last auto-scroll tick, so scrolling integrates against real
     /// elapsed time (frame-rate independent) rather than a fixed amount per tick.
     last_drag_tick: Option<std::time::Instant>,
-    /// The pointer moved during a drag; the next redraw extends the selection once.
-    /// Coalesces a flood of `CursorMoved` events (mice poll far faster than 60 Hz) into
-    /// one relayout per frame instead of one per event — a drag was doing hundreds.
-    drag_pending: bool,
     /// Set by async completions (validation/image); the next redraw does a single
     /// rebuild, coalescing many same-frame completions into one relayout.
     pending_rebuild: bool,
     frame_retry: FrameRetry,
-    /// Where the off-thread file read drops `(content, head_base_text)` for the
-    /// main-thread `apply_reload` (keeps disk IO off the render thread).
-    reload_slot: Arc<Mutex<Option<ReloadData>>>,
+    reloads: ReloadState,
     /// System clipboard for copy/cut/paste. Held for the app's lifetime (on Wayland the
     /// instance keeps serving the copied data). `None` if the platform init failed.
     clipboard: Option<arboard::Clipboard>,
@@ -492,16 +573,15 @@ impl App {
             },
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
-            mouse_down: false,
+            selection_drag: None,
             cursor_icon: CursorIcon::Default,
             last_click: None,
             click_count: 0,
             drag_scroll_dy: 0.0,
             last_drag_tick: None,
-            drag_pending: false,
             pending_rebuild: false,
             frame_retry: FrameRetry::default(),
-            reload_slot: Arc::new(Mutex::new(None)),
+            reloads: ReloadState::default(),
             clipboard: arboard::Clipboard::new().ok(),
             title,
             hovered: None,
@@ -768,6 +848,22 @@ fn drag_extend_step(
     doc_engine.refresh(w, scale, editor_h);
 }
 
+fn clipboard_copy_or_cut(
+    editor: &mut Editor,
+    cut: bool,
+    write: impl FnOnce(String) -> Result<()>,
+) -> Result<bool> {
+    let Some(selection) = editor.selected_text() else {
+        return Ok(false);
+    };
+    // A failed clipboard write must leave the selection and undo history intact.
+    write(selection)?;
+    if cut {
+        editor.backspace();
+    }
+    Ok(cut)
+}
+
 fn apply_key(
     editor: &mut Editor,
     modifiers: ModifiersState,
@@ -964,9 +1060,14 @@ impl DocEngine {
         self.editor.reveal_cursor();
         self.editor
             .refresh_detection(self.detection_range(editor_h));
-        let mut new_doc = self.relayout_at_anchor(device_width, scale, editor_h);
-        new_doc.scroll_to(self.editor.cursor_position(), editor_h);
-        self.doc = Some(new_doc);
+        self.doc = Some(self.relayout_at_anchor(device_width, scale, editor_h));
+        self.scroll_to_cursor(device_width, scale, editor_h);
+    }
+
+    fn scroll_to_cursor(&mut self, device_width: f32, scale: f32, editor_h: f32) {
+        if let Some(doc) = self.doc.as_mut() {
+            doc.scroll_to(self.editor.cursor_position(), editor_h);
+        }
         // A cursor jump (Ctrl+End / PageDown) can reveal lines outside the band built
         // around the old anchor; rebuild once around the new position so it's laid out.
         if self
@@ -1522,36 +1623,56 @@ impl ApplicationHandler<WritEvent> for App {
     /// A tokio task finished (validation/suggestion). Results are already in the
     /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WritEvent) {
-        // The watched file (or a git dir) changed: read it (fs + git HEAD) on a blocking
-        // worker so the render thread never touches disk, then finish on FileReloaded. A
-        // git-only change ignores the self-write mtime guard so the diff base still
-        // refreshes when the working file is untouched (`apply_reload` no-ops the buffer).
-        if matches!(event, WritEvent::FileChanged | WritEvent::GitBaseChanged) {
+        if matches!(event, WritEvent::GitBaseChanged) {
             let Some(path) = self.doc_engine.editor.file_path().map(|p| p.to_path_buf()) else {
                 return;
             };
-            let ignore_self_write = matches!(event, WritEvent::GitBaseChanged);
-            let last_mtime = self.doc_engine.editor.last_save_mtime();
-            let slot = self.reload_slot.clone();
+            let generation = self.reloads.begin_base();
             let proxy = self.proxy.clone();
             self.runtime.spawn_blocking(move || {
-                if let Some(data) = Editor::read_reload(&path, last_mtime, ignore_self_write) {
-                    *slot.lock().unwrap() = Some(data);
-                    let _ = proxy.send_event(WritEvent::FileReloaded);
+                let _ = proxy.send_event(WritEvent::GitBaseReloaded(
+                    generation,
+                    head_blob_text(&path),
+                ));
+            });
+            return;
+        }
+        if let WritEvent::GitBaseReloaded(generation, base_text) = event {
+            if self
+                .reloads
+                .apply_base(&mut self.doc_engine.editor, generation, base_text)
+            {
+                self.pending_rebuild = true;
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
+            return;
+        }
+        if matches!(event, WritEvent::FileChanged) {
+            let Some(path) = self.doc_engine.editor.file_path().map(|p| p.to_path_buf()) else {
+                return;
+            };
+            let ticket = self.reloads.begin_file(&self.doc_engine.editor);
+            let last_mtime = self.doc_engine.editor.last_save_mtime();
+            let proxy = self.proxy.clone();
+            self.runtime.spawn_blocking(move || {
+                if let Some(data) = Editor::read_reload(&path, last_mtime, false) {
+                    let _ = proxy.send_event(WritEvent::FileReloaded(ticket, data));
                 }
             });
             return;
         }
         // The off-thread read finished: apply it (cheap parse/diff) and treat it like an
         // edit (refresh detection / revalidate refs / reload images).
-        if matches!(event, WritEvent::FileReloaded) {
-            let data = self.reload_slot.lock().unwrap().take();
-            if let Some((content, base_text)) = data
+        if let WritEvent::FileReloaded(ticket, data) = event {
+            if self
+                .reloads
+                .apply_file(&mut self.doc_engine.editor, ticket, data)
                 && let Some(state) = self.state.as_ref()
             {
                 let (w, vh, scale) = state.viewport();
                 let window = state.window.clone();
-                self.doc_engine.editor.apply_reload(content, base_text);
                 apply_edit_effects(
                     &mut self.doc_engine,
                     &mut self.hovered,
@@ -1651,6 +1772,11 @@ impl ApplicationHandler<WritEvent> for App {
         };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(false) => {
+                self.selection_drag = None;
+                self.drag_scroll_dy = 0.0;
+                self.last_drag_tick = None;
+            }
             WindowEvent::Occluded(false) => state.window.request_redraw(),
             WindowEvent::Resized(size) => {
                 self.context.resize_surface(
@@ -1779,6 +1905,8 @@ impl ApplicationHandler<WritEvent> for App {
                     .find_state()
                     .is_some_and(|f| f.focused)
                 {
+                    let selection_before = self.doc_engine.editor.state.selection;
+                    let mut search_edited = false;
                     if !text.is_empty() {
                         let to_replace = self
                             .doc_engine
@@ -1793,12 +1921,23 @@ impl ApplicationHandler<WritEvent> for App {
                             }
                         }
                         if !to_replace {
-                            let (_, vh, _) = state.viewport();
+                            search_edited = true;
                             self.doc_engine.editor.find_rescan();
-                            if let Some(doc) = self.doc_engine.doc.as_mut() {
-                                doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
-                            }
                         }
+                    }
+                    if search_edited || self.doc_engine.editor.state.selection != selection_before {
+                        let (w, vh, scale) = state.viewport();
+                        apply_edit_effects(
+                            &mut self.doc_engine,
+                            &mut self.hovered,
+                            &self.runtime,
+                            &self.proxy,
+                            None,
+                            &state.window,
+                            w,
+                            scale,
+                            vh,
+                        );
                     }
                     state.window.request_redraw();
                     return;
@@ -1858,16 +1997,13 @@ impl ApplicationHandler<WritEvent> for App {
                     self.gutter_hover = new_gutter_hover;
                     state.window.request_redraw();
                 }
-                if self.mouse_down {
-                    let (_, vh, _) = state.viewport();
-                    // Record the edge auto-scroll velocity for the timer tick; the move
-                    // itself only extends the selection (dy=0), so scroll speed stays
-                    // fixed to the tick cadence rather than the mouse-move rate.
-                    self.drag_scroll_dy = drag_edge_velocity(self.mouse_pos.1, vh, state.scale);
-                    // Don't relayout per event — mice fire far faster than the display
-                    // refreshes. Mark it and let the next redraw extend the selection once.
-                    self.drag_pending = true;
-                    state.window.request_redraw();
+                if let Some(drag) = self.selection_drag.as_mut() {
+                    if drag.update(self.mouse_pos) {
+                        let (_, vh, _) = state.viewport();
+                        self.drag_scroll_dy = drag_edge_velocity(self.mouse_pos.1, vh, state.scale);
+                        // Coalesce pointer motion into one selection update per frame.
+                        state.window.request_redraw();
+                    }
                 } else if self.doc_engine.editor.autocomplete().is_some() {
                     // Autocomplete popup open: the highlighted row follows the pointer.
                     if let Some(row) = ac_row_at(&self.ac_row_rects, self.mouse_pos) {
@@ -1893,7 +2029,7 @@ impl ApplicationHandler<WritEvent> for App {
                 }
                 // I-beam over the body, hand on Ctrl-hover over a link, arrow over chrome
                 // and clickable gutter/popup widgets (skip while drag-selecting).
-                if !self.mouse_down {
+                if self.selection_drag.is_none() {
                     update_pointer_cursor(
                         &mut self.doc_engine,
                         state,
@@ -1910,7 +2046,9 @@ impl ApplicationHandler<WritEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                self.mouse_down = true;
+                self.selection_drag = None;
+                self.drag_scroll_dy = 0.0;
+                self.last_drag_tick = None;
                 let (w, vh, _) = state.viewport();
 
                 // Find-bar focus routing. The bar is docked at the bottom, so the document
@@ -2074,6 +2212,10 @@ impl ApplicationHandler<WritEvent> for App {
                     return;
                 }
 
+                if self.mouse_pos.1 >= vh {
+                    return;
+                }
+
                 if let Some(off) = self
                     .doc_engine
                     .doc
@@ -2147,6 +2289,7 @@ impl ApplicationHandler<WritEvent> for App {
                     {
                         self.doc_engine.editor.set_cursor(off2);
                     }
+                    self.selection_drag = Some(SelectionDrag::new(self.mouse_pos, state.scale));
                     // Moving the caret off an image line materializes it as an image
                     // block, whose URL now needs loading — so kick off fetches here too.
                     sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
@@ -2166,8 +2309,15 @@ impl ApplicationHandler<WritEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                self.mouse_down = false;
+                // A quick drag can release before its queued redraw. Flush only real
+                // pending motion, then discard the gesture so it cannot affect a later click.
+                if self.selection_drag.take().is_some_and(|drag| drag.pending) {
+                    let (w, vh, scale) = state.viewport();
+                    drag_extend_step(&mut self.doc_engine, self.mouse_pos, 0.0, w, scale, vh);
+                    state.window.request_redraw();
+                }
                 self.drag_scroll_dy = 0.0;
+                self.last_drag_tick = None;
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // Ctrl-W / Super-W closes the window (does not auto-save; use Ctrl-S).
@@ -2190,12 +2340,19 @@ impl ApplicationHandler<WritEvent> for App {
                     && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("h"));
                 if open_find || open_replace {
                     self.doc_engine.editor.open_find(open_replace);
-                    sync_find_chrome(&mut self.doc_engine, state);
-                    let (_, feh, _) = state.viewport();
-                    if let Some(doc) = self.doc_engine.doc.as_mut() {
-                        doc.scroll_to(self.doc_engine.editor.cursor_position(), feh);
-                    }
-                    state.window.request_redraw();
+                    state.find_bar_h = find_bar_height(&self.doc_engine.editor, state.scale);
+                    let (fw, feh, scale) = state.viewport();
+                    apply_edit_effects(
+                        &mut self.doc_engine,
+                        &mut self.hovered,
+                        &self.runtime,
+                        &self.proxy,
+                        None,
+                        &state.window,
+                        fw,
+                        scale,
+                        feh,
+                    );
                     return;
                 }
 
@@ -2243,9 +2400,8 @@ impl ApplicationHandler<WritEvent> for App {
                     if acted {
                         let (fw, feh, fscale) = state.viewport();
                         self.doc_engine.rebuild_preserving_scroll(fw, fscale, feh);
-                        if let Some(doc) = self.doc_engine.doc.as_mut() {
-                            doc.scroll_to(self.doc_engine.editor.cursor_position(), feh);
-                        }
+                        self.doc_engine.scroll_to_cursor(fw, fscale, feh);
+                        sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                         state.window.request_redraw();
                         return;
                     }
@@ -2299,6 +2455,8 @@ impl ApplicationHandler<WritEvent> for App {
                         );
                         return;
                     }
+                    let selection_before = self.doc_engine.editor.state.selection;
+                    let mut reveal_find_match = false;
                     match &event.logical_key {
                         Key::Named(NamedKey::Enter) => {
                             let replace_mode = self
@@ -2331,39 +2489,24 @@ impl ApplicationHandler<WritEvent> for App {
                                     state.scale,
                                     vh,
                                 );
+                                return;
                             } else {
-                                let hit = if shift {
+                                reveal_find_match = if shift {
                                     self.doc_engine.editor.find_prev()
                                 } else {
                                     self.doc_engine.editor.find_next()
-                                };
-                                if hit.is_some() {
-                                    // Jumping to a match inside a folded section reveals it.
-                                    if self.doc_engine.editor.reveal_cursor() {
-                                        self.doc_engine.rebuild_preserving_scroll(
-                                            w,
-                                            state.scale,
-                                            vh,
-                                        );
-                                    }
-                                    if let Some(doc) = self.doc_engine.doc.as_mut() {
-                                        doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
-                                    }
                                 }
+                                .is_some();
                             }
                         }
                         Key::Named(NamedKey::Tab) => self.doc_engine.editor.find_toggle_field(),
                         Key::Character(c) if alt && c.as_str().eq_ignore_ascii_case("r") => {
                             self.doc_engine.editor.find_toggle_regex();
-                            if let Some(doc) = self.doc_engine.doc.as_mut() {
-                                doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
-                            }
+                            reveal_find_match = true;
                         }
                         Key::Character(c) if alt && c.as_str().eq_ignore_ascii_case("c") => {
                             self.doc_engine.editor.find_toggle_case();
-                            if let Some(doc) = self.doc_engine.doc.as_mut() {
-                                doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
-                            }
+                            reveal_find_match = true;
                         }
                         _ => {
                             let ctrl_v = cmd
@@ -2373,6 +2516,11 @@ impl ApplicationHandler<WritEvent> for App {
                                 .editor
                                 .find_state()
                                 .is_some_and(|f| f.focus == FieldFocus::Replace);
+                            let query_before = self
+                                .doc_engine
+                                .editor
+                                .find_state()
+                                .map(|find| find.search.text().to_owned());
                             if ctrl_v {
                                 // Read the clipboard first, then insert — keeps the
                                 // clipboard borrow disjoint from the editor's.
@@ -2402,11 +2550,29 @@ impl ApplicationHandler<WritEvent> for App {
                             // bring the (new) active match into view.
                             if !to_replace {
                                 self.doc_engine.editor.find_rescan();
-                                if let Some(doc) = self.doc_engine.doc.as_mut() {
-                                    doc.scroll_to(self.doc_engine.editor.cursor_position(), vh);
-                                }
+                                reveal_find_match =
+                                    self.doc_engine.editor.find_state().is_some_and(|find| {
+                                        query_before.as_deref() != Some(find.search.text())
+                                    });
                             }
                         }
+                    }
+                    // Search can jump outside the materialized band or into hidden
+                    // Markdown. Scrolling the old layout alone draws empty placeholders.
+                    if reveal_find_match
+                        || self.doc_engine.editor.state.selection != selection_before
+                    {
+                        apply_edit_effects(
+                            &mut self.doc_engine,
+                            &mut self.hovered,
+                            &self.runtime,
+                            &self.proxy,
+                            None,
+                            &state.window,
+                            w,
+                            state.scale,
+                            vh,
+                        );
                     }
                     // Swallow unconditionally: no key reaches the buffer while open.
                     state.window.request_redraw();
@@ -2417,13 +2583,22 @@ impl ApplicationHandler<WritEvent> for App {
                 if cmd && let Key::Character(c) = &event.logical_key {
                     match c.as_str().to_ascii_lowercase().as_str() {
                         "c" | "x" if self.doc_engine.editor.selected_text().is_some() => {
-                            if let Some(sel) = self.doc_engine.editor.selected_text()
-                                && let Some(cb) = self.clipboard.as_mut()
-                            {
-                                let _ = cb.set_text(sel);
+                            let copied = clipboard_copy_or_cut(
+                                &mut self.doc_engine.editor,
+                                c.as_str().eq_ignore_ascii_case("x"),
+                                |selection| {
+                                    let clipboard = self
+                                        .clipboard
+                                        .as_mut()
+                                        .ok_or_else(|| anyhow!("clipboard unavailable"))?;
+                                    clipboard.set_text(selection)?;
+                                    Ok(())
+                                },
+                            );
+                            if let Err(error) = &copied {
+                                eprintln!("[writ] failed to copy selection: {error}");
                             }
-                            if c.as_str().eq_ignore_ascii_case("x") {
-                                self.doc_engine.editor.backspace(); // delete the selection
+                            if matches!(copied, Ok(true)) {
                                 apply_edit_effects(
                                     &mut self.doc_engine,
                                     &mut self.hovered,
@@ -2537,9 +2712,11 @@ impl ApplicationHandler<WritEvent> for App {
                     }
                 };
 
-                // Apply a coalesced drag move once per frame (see `drag_pending`).
-                if self.drag_pending {
-                    self.drag_pending = false;
+                if self
+                    .selection_drag
+                    .as_mut()
+                    .is_some_and(SelectionDrag::take_pending)
+                {
                     let (w, vh, scale) = state.viewport();
                     drag_extend_step(&mut self.doc_engine, self.mouse_pos, 0.0, w, scale, vh);
                 }
@@ -2682,7 +2859,9 @@ impl ApplicationHandler<WritEvent> for App {
         {
             state.window.request_redraw();
         }
-        let drag_deadline = if self.mouse_down && self.drag_scroll_dy != 0.0 {
+        let drag_deadline = if self.selection_drag.as_ref().is_some_and(|drag| drag.active)
+            && self.drag_scroll_dy != 0.0
+        {
             // Integrate velocity against real elapsed time: a first tick (no prior
             // timestamp) scrolls nothing and just starts the clock, so the amount can't
             // spike regardless of how the loop woke.
@@ -2981,6 +3160,288 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_cut_failure_preserves_document_selection_and_undo() {
+        let mut editor = Editor::new("hello world");
+        editor.insert_str("prefix ");
+        editor.click(8, false, 2);
+        let text = editor.text();
+        let selection = editor.state.selection;
+        let version = editor.state.buffer.version();
+        let undo_head = editor.state.buffer.undo_head();
+        let mut writes = 0;
+
+        let result = clipboard_copy_or_cut(&mut editor, true, |text| {
+            writes += 1;
+            assert_eq!(text, "hello");
+            Err(anyhow!("clipboard unavailable"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(writes, 1);
+        assert_eq!(editor.text(), text);
+        assert_eq!(editor.state.selection, selection);
+        assert_eq!(editor.state.buffer.version(), version);
+        assert_eq!(editor.state.buffer.undo_head(), undo_head);
+        editor.undo();
+        assert_eq!(editor.text(), "hello world");
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn clipboard_cut_success_copies_and_deletes_once() {
+        let mut editor = Editor::new("hello world");
+        editor.click(2, false, 2);
+        let mut writes = 0;
+        let changed = clipboard_copy_or_cut(&mut editor, true, |text| {
+            writes += 1;
+            assert_eq!(text, "hello");
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(writes, 1);
+        assert_eq!(editor.text(), " world");
+        assert_eq!(editor.cursor_position(), 0);
+        assert!(editor.selection_range().is_none());
+        editor.undo();
+        assert_eq!(editor.text(), "hello world");
+        assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn clipboard_copy_preserves_selection_and_document() {
+        let mut editor = Editor::new("hello world");
+        editor.click(2, false, 2);
+        let selection = editor.state.selection;
+        let changed = clipboard_copy_or_cut(&mut editor, false, |text| {
+            assert_eq!(text, "hello");
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(!changed);
+        assert_eq!(editor.text(), "hello world");
+        assert_eq!(editor.state.selection, selection);
+        assert!(!editor.can_undo());
+    }
+
+    fn test_doc_engine(text: &str) -> DocEngine {
+        DocEngine {
+            text_engine: TextEngine::new(),
+            line_cache: LineCache::new(),
+            render_cache: RenderCache::new(),
+            height_cache: HeightCache::new(),
+            table_cache: TableCache::new(),
+            theme: EditorTheme::dracula(),
+            font_size: FONT_SIZE,
+            editor: Editor::new(text),
+            doc: None,
+            images: ImageCache::new(),
+            preedit: None,
+        }
+    }
+
+    #[test]
+    fn git_base_reload_preserves_unsaved_text_selection_and_undo() {
+        let mut editor = Editor::new("original\n");
+        editor.insert_str("local ");
+        let text = editor.text();
+        let selection = editor.state.selection;
+        let version = editor.state.buffer.version();
+        let mut reloads = ReloadState::default();
+        let generation = reloads.begin_base();
+        assert!(reloads.apply_base(&mut editor, generation, Some("committed\n".into())));
+        assert_eq!(editor.text(), text);
+        assert_eq!(editor.state.selection, selection);
+        assert_eq!(editor.state.buffer.version(), version);
+        assert!(editor.is_dirty());
+        assert!(editor.can_undo());
+        assert!(editor.diff_state().is_some());
+        let generation = reloads.begin_base();
+        assert!(reloads.apply_base(&mut editor, generation, None));
+        assert!(editor.diff_state().is_none());
+        assert_eq!(editor.text(), text);
+        editor.undo();
+        assert_eq!(editor.text(), "original\n");
+    }
+
+    #[test]
+    fn stale_file_reads_cannot_overwrite_newer_reads_or_local_edits() {
+        let mut editor = Editor::new("original");
+        let mut reloads = ReloadState::default();
+        let older = reloads.begin_file(&editor);
+        let newer = reloads.begin_file(&editor);
+        assert!(!reloads.apply_file(&mut editor, older, ("stale".into(), None)));
+        assert_eq!(editor.text(), "original");
+        assert!(reloads.apply_file(&mut editor, newer, ("newer".into(), None)));
+        assert!(!reloads.apply_file(&mut editor, older, ("stale".into(), None)));
+        assert_eq!(editor.text(), "newer");
+
+        let pending = reloads.begin_file(&editor);
+        editor.insert_str("local ");
+        assert!(!reloads.apply_file(&mut editor, pending, ("newer".into(), None)));
+        assert_eq!(editor.text(), "local newer");
+        assert!(editor.is_dirty());
+        editor.undo();
+        assert_eq!(editor.text(), "newer");
+    }
+
+    #[test]
+    fn file_read_cannot_overwrite_an_intervening_save() {
+        let path = std::env::temp_dir().join(format!("writ-reload-save-{}.md", std::process::id()));
+        let mut editor = Editor::new("original");
+        editor.set_file_path(path.clone());
+        editor.save().unwrap();
+        editor.insert_str("local ");
+        let mut reloads = ReloadState::default();
+        let pending = reloads.begin_file(&editor);
+        let version = editor.state.buffer.version();
+        editor.save().unwrap();
+        assert_eq!(editor.state.buffer.version(), version);
+        assert!(!reloads.apply_file(&mut editor, pending, ("original".into(), None)));
+        assert_eq!(editor.text(), "local original");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), editor.text());
+        assert!(!editor.is_dirty());
+        assert!(editor.can_undo());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn file_reload_cannot_restore_an_outdated_git_base() {
+        let mut editor = Editor::new("old");
+        let mut reloads = ReloadState::default();
+        let file = reloads.begin_file(&editor);
+        let old_base = reloads.begin_base();
+        let new_base = reloads.begin_base();
+        assert!(reloads.apply_base(&mut editor, new_base, Some("new".into())));
+        assert!(!reloads.apply_base(&mut editor, old_base, Some("old".into())));
+        assert!(reloads.apply_file(&mut editor, file, ("new".into(), Some("old".into()))));
+        assert_eq!(editor.text(), "new");
+        assert!(editor.diff_state().is_none());
+    }
+
+    #[test]
+    fn find_jumps_materialize_distant_matches() {
+        let padding = "ordinary line\n".repeat(500);
+        let text = format!("{padding}quartz first\n{padding}quartz second\n");
+        let mut engine = test_doc_engine(&text);
+        let (w, vh, scale) = (800.0, 500.0, 1.0);
+        engine.editor.open_find(false);
+        engine.refresh(w, scale, vh);
+        engine
+            .editor
+            .find_state_mut()
+            .unwrap()
+            .search
+            .insert("quartz");
+        engine.editor.find_rescan();
+
+        let cursor = engine.editor.cursor_position();
+        let doc = engine.doc.as_mut().unwrap();
+        doc.scroll_to(cursor, vh);
+        assert!(
+            doc.needs_remeasure(vh),
+            "scroll alone leaves placeholders visible"
+        );
+
+        for step in 0..3 {
+            match step {
+                1 => {
+                    engine.editor.find_next();
+                }
+                2 => {
+                    engine.editor.find_prev();
+                }
+                _ => {}
+            }
+            engine.refresh(w, scale, vh);
+            let doc = engine.doc.as_ref().unwrap();
+            assert!(!doc.needs_remeasure(vh));
+            let selection = engine.editor.selection_range().unwrap();
+            assert!(
+                doc.selection_rects(selection)
+                    .iter()
+                    .any(|rect| rect.3 > 0.0 && rect.1 < f64::from(vh))
+            );
+        }
+        assert_eq!(engine.editor.text(), text);
+    }
+
+    #[test]
+    fn selection_drag_requires_pointer_travel_at_each_scale() {
+        for scale in [1.0, 1.5, 2.0] {
+            let origin = (100.0, 200.0);
+            let mut drag = SelectionDrag::new(origin, scale);
+            for dx in [0.0, 1.0, 2.0, 3.0, 4.0, 0.0] {
+                assert!(!drag.update((origin.0 + dx * scale, origin.1)));
+                assert!(!drag.active);
+                assert!(!drag.take_pending());
+            }
+            assert!(drag.update((origin.0 + 5.0 * scale, origin.1)));
+            assert!(drag.active);
+            assert!(drag.take_pending());
+            assert!(!drag.take_pending());
+
+            // Once dragging, returning inside the threshold still updates selection.
+            assert!(drag.update(origin));
+            assert!(drag.take_pending());
+            assert!(!drag.update(origin));
+            assert!(!drag.take_pending());
+        }
+    }
+
+    #[test]
+    fn table_reveal_does_not_turn_click_jitter_into_selection() {
+        let text = "Intro\n\n| Name | Value |\n| --- | --- |\n| Alpha | One |\n| Beta | Two |\n";
+        let mut engine = test_doc_engine(text);
+        let (w, vh, scale) = (800.0, 600.0, 1.0);
+        engine.refresh(w, scale, vh);
+        let doc = engine.doc.as_ref().unwrap();
+        let position = (
+            doc.body_left() + 80.0,
+            doc.line_top_screen(4).unwrap() + 2.0,
+        );
+        let clicked = doc.hit_test(position.0, position.1).unwrap();
+        assert_eq!(engine.editor.line_of(clicked), 4);
+        engine.editor.click(clicked, false, 1);
+        engine.refresh(w, scale, vh);
+        assert_ne!(
+            engine
+                .doc
+                .as_ref()
+                .unwrap()
+                .hit_test(position.0, position.1),
+            Some(clicked),
+            "revealing raw table text should move a different offset under the pointer"
+        );
+
+        let mut drag = SelectionDrag::new(position, scale);
+        for dx in [0.0, 1.0, -1.0, 2.0, 0.0] {
+            let jitter = (position.0 + dx, position.1);
+            if drag.update(jitter) && drag.take_pending() {
+                drag_extend_step(&mut engine, jitter, 0.0, w, scale, vh);
+            }
+        }
+        assert_eq!(engine.editor.cursor_position(), clicked);
+        assert!(engine.editor.selection_range().is_none());
+        assert!(
+            !drag.pending,
+            "a plain release must not hit-test the changed layout"
+        );
+
+        let moved = (position.0 + 60.0, position.1);
+        assert!(drag.update(moved));
+        assert!(
+            drag.pending,
+            "a release before redraw must retain the final drag update"
+        );
+        drag_extend_step(&mut engine, moved, 0.0, w, scale, vh);
+        assert!(engine.editor.selection_range().is_some());
+        assert_eq!(engine.editor.state.selection.anchor, clicked);
+    }
 
     #[test]
     fn skipped_frames_retry_without_input_and_back_off() {
