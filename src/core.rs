@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, absolute};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -1649,8 +1649,6 @@ impl Editor {
         Ok(())
     }
 
-    /// Poll the file watcher; if the file changed on disk (and it wasn't our own
-    /// save), reload it and refresh the diff base. Returns true if reloaded.
     /// Hand the file-watch receiver to the shell so it can forward change
     /// notifications into the event loop (waking it) instead of polling on a timer.
     pub fn take_file_watch_rx(&mut self) -> Option<mpsc::Receiver<WatchKind>> {
@@ -1720,7 +1718,11 @@ impl Editor {
             return Ok(());
         };
         let (tx, rx) = mpsc::channel();
-        let watched_file = path.clone();
+        // notify emits absolute paths even when the CLI was given a relative path.
+        let watched_file = absolute(&path)?;
+        // Atomic saves replace the file's inode. Watching its parent keeps subsequent
+        // saves visible, including deletion followed by recreation at the same path.
+        let watch_dir = watched_file.parent().unwrap_or(&watched_file).to_path_buf();
         // 150ms debounce collapses a save's event burst (and atomic-save temp→rename)
         // into a single reload notification.
         let mut debouncer = new_debouncer(
@@ -1750,7 +1752,7 @@ impl Editor {
                 }
             },
         )?;
-        debouncer.watch(&path, RecursiveMode::NonRecursive)?;
+        debouncer.watch(&watch_dir, RecursiveMode::NonRecursive)?;
         // Also watch the git dirs so a commit/checkout that moves HEAD refreshes the
         // inline diff even when the working file is untouched. Watch the *directories*
         // (not the files) so the watch survives git's lockfile→rename ref updates; the
@@ -1779,6 +1781,85 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::Instant;
+
+    struct WatchTestDir(PathBuf);
+
+    impl WatchTestDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!("writ-watch-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for WatchTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_watched_reload(editor: &mut Editor, rx: &mpsc::Receiver<WatchKind>, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let kind = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("external edit should wake the watcher");
+            if kind == WatchKind::File {
+                break;
+            }
+        }
+        let (content, base) =
+            Editor::read_reload(editor.file_path().unwrap(), editor.last_save_mtime(), false)
+                .expect("external edit should be readable");
+        editor.apply_reload(content, base);
+        assert_eq!(editor.text(), expected);
+    }
+
+    #[test]
+    #[ignore = "relies on fs-event timing; run manually"]
+    fn file_watch_reloads_relative_path() {
+        let dir = WatchTestDir::new("relative");
+        let note = dir.0.join("note.md");
+        std::fs::write(&note, "# Before\n").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut editor = Editor::open(note.strip_prefix(&cwd).unwrap());
+        editor.watch_file().unwrap();
+        let rx = editor.take_file_watch_rx().unwrap();
+
+        std::fs::write(&note, "# After\n").unwrap();
+        assert_watched_reload(&mut editor, &rx, "# After\n");
+    }
+
+    #[test]
+    #[ignore = "relies on fs-event timing; run manually"]
+    fn file_watch_survives_replacement_and_recreation() {
+        let dir = WatchTestDir::new("replacement");
+        let note = dir.0.join("note.md");
+        std::fs::write(&note, "# Before\n").unwrap();
+        let mut editor = Editor::open(&note);
+        editor.watch_file().unwrap();
+        let rx = editor.take_file_watch_rx().unwrap();
+
+        std::fs::write(dir.0.join("other.md"), "unrelated\n").unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(500)).is_err());
+
+        for content in ["# Replacement one\n", "# Replacement two\n"] {
+            let temp = dir.0.join("note.tmp");
+            std::fs::write(&temp, content).unwrap();
+            std::fs::rename(&temp, &note).unwrap();
+            assert_watched_reload(&mut editor, &rx, content);
+        }
+
+        std::fs::write(&note, "# In-place write\n").unwrap();
+        assert_watched_reload(&mut editor, &rx, "# In-place write\n");
+
+        std::fs::remove_file(&note).unwrap();
+        std::fs::write(&note, "# Recreated\n").unwrap();
+        assert_watched_reload(&mut editor, &rx, "# Recreated\n");
+    }
 
     #[test]
     fn splice_bounds_reports_the_edited_region() {
