@@ -5,6 +5,10 @@ use std::sync::Arc;
 use tree_sitter_highlight::{
     Highlight, HighlightConfiguration, HighlightEvent, Highlighter as TSHighlighter,
 };
+use tree_sitter_javascript::HIGHLIGHT_QUERY as JAVASCRIPT_HIGHLIGHT_QUERY;
+use tree_sitter_typescript::{
+    HIGHLIGHTS_QUERY as TYPESCRIPT_HIGHLIGHTS_QUERY, LANGUAGE_TYPESCRIPT,
+};
 
 use crate::tokenize;
 
@@ -121,6 +125,16 @@ impl Highlighter {
             );
         }
 
+        // TypeScript's query only covers its extensions to JavaScript. Later patterns
+        // win in tree-sitter-highlight, so keep the TypeScript-specific captures last.
+        let typescript_query =
+            format!("{JAVASCRIPT_HIGHLIGHT_QUERY}\n{TYPESCRIPT_HIGHLIGHTS_QUERY}");
+        if let Some(config) =
+            Self::create_config(LANGUAGE_TYPESCRIPT.into(), "typescript", &typescript_query)
+        {
+            register(&["typescript", "ts"], Backend::TreeSitter(Box::new(config)));
+        }
+
         // Tokenizer-backed languages (no publishable grammar crate). Registered ungated:
         // a ```mermaid / ```latex code fence highlights through the normal code-block path,
         // and revealed `$…$` math styles via `highlight(content, "latex")`.
@@ -182,12 +196,14 @@ impl Highlighter {
 
         // Convert events to spans
         let mut spans: Vec<HighlightSpan> = Vec::new();
-        let mut current_highlight: Option<usize> = None;
+        // Captures nest, e.g. an expression inside a template string. Ending an inner
+        // capture must restore the enclosing style for the remaining source text.
+        let mut highlight_stack = Vec::new();
 
         for event in highlights {
             match event {
                 Ok(HighlightEvent::Source { start, end }) => {
-                    if let Some(highlight_id) = current_highlight {
+                    if let Some(&highlight_id) = highlight_stack.last() {
                         // Coalesce with the previous span when it carries the same id and
                         // butts right up against this one — tree-sitter emits Source events
                         // token-by-token, so a run of one color arrives as many adjacent spans.
@@ -205,10 +221,10 @@ impl Highlighter {
                     }
                 }
                 Ok(HighlightEvent::HighlightStart(Highlight(id))) => {
-                    current_highlight = Some(id);
+                    highlight_stack.push(id);
                 }
                 Ok(HighlightEvent::HighlightEnd) => {
-                    current_highlight = None;
+                    highlight_stack.pop();
                 }
                 Err(_) => break,
             }
@@ -238,7 +254,77 @@ mod tests {
         assert!(highlighter.supports_language("bash"));
         assert!(highlighter.supports_language("sh"));
         assert!(highlighter.supports_language("shell"));
+        assert!(highlighter.supports_language("typescript"));
+        assert!(highlighter.supports_language("ts"));
+        assert!(highlighter.supports_language("TypeScript"));
         assert!(!highlighter.supports_language("python"));
+    }
+
+    fn assert_highlight(code: &str, spans: &[HighlightSpan], token: &str, capture: &str) {
+        let start = code.find(token).unwrap();
+        let end = start + token.len();
+        assert!(
+            spans.iter().any(|span| {
+                span.range.start <= start
+                    && span.range.end >= end
+                    && Highlighter::capture_name(span.highlight_id) == capture
+            }),
+            "expected {token:?} to have @{capture}, got {spans:?}"
+        );
+    }
+
+    #[test]
+    fn highlight_typescript_types_and_javascript_syntax() {
+        let mut highlighter = Highlighter::new();
+        let code = "// café\ninterface User { readonly name: string; }\n\
+                    function greet(user: User): string {\n\
+                    const count = 42;\nreturn \"hello\";\n}";
+        let spans = highlighter.highlight(code, "typescript");
+        for (token, capture) in [
+            ("// café", "comment"),
+            ("interface", "keyword"),
+            ("readonly", "keyword"),
+            ("User", "type"),
+            ("name", "property"),
+            ("string", "type.builtin"),
+            ("function", "keyword"),
+            ("greet", "function"),
+            ("user", "variable.parameter"),
+            ("const", "keyword"),
+            ("42", "number"),
+            ("return", "keyword"),
+            ("\"hello\"", "string"),
+        ] {
+            assert_highlight(code, &spans, token, capture);
+        }
+        for alias in ["ts", "TS", "TypeScript"] {
+            assert_eq!(highlighter.highlight(code, alias), spans);
+        }
+    }
+
+    #[test]
+    fn highlight_typescript_template_interpolation_restores_string() {
+        let mut highlighter = Highlighter::new();
+        let code = "const greeting = `héllo ${user.name}, welcome!`;";
+        let spans = highlighter.highlight(code, "ts");
+        for (token, capture) in [
+            ("héllo ", "string"),
+            ("${", "punctuation.special"),
+            ("user", "variable"),
+            ("name", "property"),
+            ("}", "punctuation.special"),
+            (", welcome!`", "string"),
+        ] {
+            assert_highlight(code, &spans, token, capture);
+        }
+        for span in &spans {
+            assert!(code.get(span.range.clone()).is_some());
+        }
+        assert!(
+            spans
+                .windows(2)
+                .all(|pair| pair[0].range.end <= pair[1].range.start)
+        );
     }
 
     #[test]

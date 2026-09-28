@@ -140,7 +140,7 @@ Tab cycles through nesting states based on tree-sitter context. On a blank line 
 
 ### Code Blocks
 
-Fenced code blocks render with syntax highlighting (currently Rust and Bash). The fence line's delimiter and language name are colored distinctly, and the code is highlighted per-grammar. Move your cursor into the block to edit.
+Fenced code blocks render with syntax highlighting for Rust, Bash, and TypeScript (`typescript` or `ts`). The fence line's delimiter and language name are colored distinctly, and the code is highlighted per-grammar. Move your cursor into the block to edit.
 
 ### Selection and Editing
 
@@ -186,6 +186,9 @@ consumer stays lean.
 `Scene` with no window, GPU device, or editor. Feed it content up front or stream it
 in with `push_str`, then paint — useful for embedding writ's renderer elsewhere, or
 for rendering LLM output as it arrives.
+
+writ 0.19 uses Vello 0.10. Consumers passing a `Scene` to writ must use the same
+Vello version.
 
 ```rust
 use vello::Scene;
@@ -243,7 +246,7 @@ and opt into only what you need:
 
 ```toml
 # render-only: pulls in none of tokio/reqwest/gix/github/winit
-writ = { version = "0.16", default-features = false }
+writ = { version = "0.19", default-features = false }
 ```
 
 | Feature | Adds |
@@ -281,7 +284,7 @@ Code blocks are highlighted using tree-sitter-highlight with language-specific g
 
 This manual extraction approach was chosen over tree-sitter's built-in injection support, which proved unreliable for our use case. Editors like Zed and Helix build their own injection handling for similar reasons. The manual approach is simpler: we find code blocks, highlight them independently, and merge the results back with buffer-relative offsets.
 
-Currently Rust and Bash are supported; adding a language requires just the grammar crate and a highlights.scm query file. Highlights are cached and only recomputed after edits.
+Rust, Bash, and TypeScript are supported through grammar crates and highlight queries. TypeScript combines its upstream query with JavaScript's shared syntax rules. Highlights are cached and only recomputed after edits.
 
 ## Limitations
 

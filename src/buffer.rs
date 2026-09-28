@@ -1118,6 +1118,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn typescript_fence_highlights_track_edits_and_undo() {
+        for language in ["typescript", "ts", "TypeScript", "TS"] {
+            let text = format!("Préface\n\n```{language}\nconst answer = 42;\n```\n\nPlain text\n");
+            let mut buffer: Buffer = text.parse().unwrap();
+            let start = text.find("42").unwrap();
+            let before = buffer.render_snapshot();
+            let before_spans = before.code_highlights_for_line(3);
+            assert!(before_spans.iter().any(|span| {
+                span.range == (start..start + 2)
+                    && Highlighter::capture_name(span.highlight_id) == "number"
+            }));
+            assert!(before.code_highlights_for_line(0).is_empty());
+            assert!(before.code_highlights_for_line(6).is_empty());
+
+            let replacement = "\"café\"";
+            buffer.replace(start..start + 2, replacement, start);
+            let after = buffer.render_snapshot();
+            assert!(after.code_highlights_for_line(3).iter().any(|span| {
+                span.range == (start..start + replacement.len())
+                    && Highlighter::capture_name(span.highlight_id) == "string"
+            }));
+            assert_eq!(before.code_highlights_for_line(3), before_spans);
+
+            buffer.undo().unwrap();
+            assert_eq!(
+                buffer.render_snapshot().code_highlights_for_line(3),
+                before_spans
+            );
+        }
+    }
+
+    #[test]
     fn byte_at_handles_multibyte_boundaries() {
         // `é` is 0xC3 0xA9; `byte_at` must return each byte without panicking (the old
         // `byte_slice(offset..offset+1)` panicked on the interior byte of a codepoint).

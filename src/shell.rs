@@ -1589,6 +1589,9 @@ impl ApplicationHandler<WritEvent> for App {
             .doc_engine
             .rebuild(size.width as f32, scale, 0, editor_h);
         self.doc_engine.doc = Some(doc);
+        // The loop parks on Wait, so the first frame must not depend on input,
+        // a resize, or an asynchronous resource finishing.
+        window.request_redraw();
         self.state = Some(ActiveSurface {
             surface,
             window,
@@ -2584,7 +2587,7 @@ impl ApplicationHandler<WritEvent> for App {
                     }
                 };
 
-                // Vello 0.9 has no render_to_surface: render into the intermediate
+                // Vello has no render_to_surface: render into the intermediate
                 // STORAGE texture, then blit that into the swapchain frame.
                 self.renderer
                     .as_mut()

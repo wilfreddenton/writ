@@ -51,7 +51,7 @@
 //! app's editor/git/GitHub/networking stack:
 //!
 //! ```toml
-//! writ = { version = "0.16", default-features = false }
+//! writ = { version = "0.19", default-features = false }
 //! ```
 //!
 //! - **(none)** — the render-only base: [`MarkdownView`], [`rasterize_scene_to_png`],
