@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use unicode_segmentation::UnicodeSegmentation;
@@ -274,6 +274,46 @@ struct ActiveSurface {
     find_bar_h: f32,
 }
 
+struct FrameRetry {
+    deadline: Option<Instant>,
+    delay: Duration,
+}
+
+impl Default for FrameRetry {
+    fn default() -> Self {
+        Self {
+            deadline: None,
+            delay: Duration::from_millis(100),
+        }
+    }
+}
+
+impl FrameRetry {
+    fn schedule(&mut self, now: Instant) {
+        self.deadline = Some(now + self.delay);
+        // Hidden windows can remain occluded indefinitely. Keep probing without
+        // rendering continuously; Wayland does not emit winit's Occluded event.
+        self.delay = (self.delay * 2).min(Duration::from_secs(1));
+    }
+
+    fn take_due(&mut self, now: Instant) -> bool {
+        if self.deadline.is_some_and(|deadline| deadline <= now) {
+            self.deadline = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn control_flow(&self, other_deadline: Option<Instant>) -> ControlFlow {
+        self.deadline
+            .into_iter()
+            .chain(other_deadline)
+            .min()
+            .map_or(ControlFlow::Wait, ControlFlow::WaitUntil)
+    }
+}
+
 impl ActiveSurface {
     /// The editor viewport in device px: (surface width, editor content height, scale).
     /// The content height excludes the bottom status-bar and find-bar strips.
@@ -361,6 +401,7 @@ struct App {
     /// Set by async completions (validation/image); the next redraw does a single
     /// rebuild, coalescing many same-frame completions into one relayout.
     pending_rebuild: bool,
+    frame_retry: FrameRetry,
     /// Where the off-thread file read drops `(content, head_base_text)` for the
     /// main-thread `apply_reload` (keeps disk IO off the render thread).
     reload_slot: Arc<Mutex<Option<ReloadData>>>,
@@ -459,6 +500,7 @@ impl App {
             last_drag_tick: None,
             drag_pending: false,
             pending_rebuild: false,
+            frame_retry: FrameRetry::default(),
             reload_slot: Arc::new(Mutex::new(None)),
             clipboard: arboard::Clipboard::new().ok(),
             title,
@@ -1609,6 +1651,7 @@ impl ApplicationHandler<WritEvent> for App {
         };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Occluded(false) => state.window.request_redraw(),
             WindowEvent::Resized(size) => {
                 self.context.resize_surface(
                     &mut state.surface,
@@ -2480,6 +2523,20 @@ impl ApplicationHandler<WritEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Acquire before building the scene so an occluded window only
+                // probes the surface. A skipped first frame must wake itself up.
+                let surface_texture = match state.surface.surface.get_current_texture() {
+                    CurrentSurfaceTexture::Success(t) | CurrentSurfaceTexture::Suboptimal(t) => t,
+                    CurrentSurfaceTexture::Occluded | CurrentSurfaceTexture::Timeout => {
+                        self.frame_retry.schedule(Instant::now());
+                        return;
+                    }
+                    other => {
+                        eprintln!("[writ] skip frame: {:?}", other);
+                        return;
+                    }
+                };
+
                 // Apply a coalesced drag move once per frame (see `drag_pending`).
                 if self.drag_pending {
                     self.drag_pending = false;
@@ -2578,15 +2635,6 @@ impl ApplicationHandler<WritEvent> for App {
                     antialiasing_method: AaConfig::Area,
                 };
 
-                // wgpu 29: get_current_texture returns an enum, not a Result.
-                let surface_texture = match state.surface.surface.get_current_texture() {
-                    CurrentSurfaceTexture::Success(t) | CurrentSurfaceTexture::Suboptimal(t) => t,
-                    other => {
-                        eprintln!("[writ] skip frame: {:?}", other);
-                        return;
-                    }
-                };
-
                 // Vello has no render_to_surface: render into the intermediate
                 // STORAGE texture, then blit that into the swapchain frame.
                 self.renderer
@@ -2617,6 +2665,7 @@ impl ApplicationHandler<WritEvent> for App {
                 dev.queue.submit([encoder.finish()]);
                 state.window.pre_present_notify();
                 surface_texture.present();
+                self.frame_retry = FrameRetry::default();
             }
             _ => {}
         }
@@ -2624,15 +2673,19 @@ impl ApplicationHandler<WritEvent> for App {
 
     /// Park the loop until the next real event. External file edits arrive as
     /// `WritEvent::FileChanged` (forwarded from the watcher thread), so there's no
-    /// need to poll on a timer — EXCEPT while a drag sits in an edge hot zone, when we
-    /// tick a short timer to keep auto-scrolling the selection even if the pointer is
-    /// held still.
+    /// need to poll except to retry a skipped frame or auto-scroll a selection while
+    /// the pointer is held still in an edge hot zone.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.mouse_down && self.drag_scroll_dy != 0.0 {
+        let now = Instant::now();
+        if self.frame_retry.take_due(now)
+            && let Some(state) = self.state.as_ref()
+        {
+            state.window.request_redraw();
+        }
+        let drag_deadline = if self.mouse_down && self.drag_scroll_dy != 0.0 {
             // Integrate velocity against real elapsed time: a first tick (no prior
             // timestamp) scrolls nothing and just starts the clock, so the amount can't
             // spike regardless of how the loop woke.
-            let now = std::time::Instant::now();
             let dt = self
                 .last_drag_tick
                 .map_or(0.0, |t| now.duration_since(t).as_secs_f32());
@@ -2645,13 +2698,12 @@ impl ApplicationHandler<WritEvent> for App {
                 drag_extend_step(&mut self.doc_engine, self.mouse_pos, dy, w, scale, editor_h);
                 window.request_redraw();
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                now + std::time::Duration::from_millis(16),
-            ));
+            Some(now + Duration::from_millis(16))
         } else {
             self.last_drag_tick = None;
-            event_loop.set_control_flow(ControlFlow::Wait);
-        }
+            None
+        };
+        event_loop.set_control_flow(self.frame_retry.control_flow(drag_deadline));
     }
 }
 
@@ -2929,6 +2981,43 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipped_frames_retry_without_input_and_back_off() {
+        let mut retry = FrameRetry::default();
+        let mut now = Instant::now();
+        assert_eq!(retry.control_flow(None), ControlFlow::Wait);
+
+        for delay_ms in [100, 200, 400, 800, 1000, 1000] {
+            retry.schedule(now);
+            let deadline = now + Duration::from_millis(delay_ms);
+            assert_eq!(retry.control_flow(None), ControlFlow::WaitUntil(deadline));
+            assert!(!retry.take_due(deadline - Duration::from_millis(1)));
+            assert!(retry.take_due(deadline));
+            assert!(!retry.take_due(deadline));
+            now = deadline;
+        }
+    }
+
+    #[test]
+    fn frame_retry_preserves_the_earliest_event_loop_deadline() {
+        let mut retry = FrameRetry::default();
+        let now = Instant::now();
+        let drag_deadline = now + Duration::from_millis(16);
+        assert_eq!(
+            retry.control_flow(Some(drag_deadline)),
+            ControlFlow::WaitUntil(drag_deadline)
+        );
+        retry.schedule(now);
+        assert_eq!(
+            retry.control_flow(Some(drag_deadline)),
+            ControlFlow::WaitUntil(drag_deadline)
+        );
+        assert_eq!(
+            retry.control_flow(Some(now + Duration::from_secs(1))),
+            ControlFlow::WaitUntil(now + Duration::from_millis(100))
+        );
+    }
 
     #[test]
     fn drag_edge_velocity_zones() {
